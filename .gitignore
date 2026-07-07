@@ -1,0 +1,8 @@
+/target
+
+# Local secrets (SIP trunk credentials, Gemini API key) — never commit
+.env
+kutsu.toml
+/logs/
+
+*.log
