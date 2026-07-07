@@ -3,10 +3,8 @@
 </p>
 
 <p align="center">
-  Outbound phone calls as an MCP tool: dial over any SIP trunk, bridge the audio to a realtime
-  voice model, let the model run the conversation.<br/>
-  One Rust binary (<code>kutsu</code>); any SIP provider or self-hosted PBX;
-  <a href="https://ai.google.dev/gemini-api/docs/live">Gemini Live</a> first, OpenAI Realtime next.
+  Phone calls as an MCP tool: any SIP trunk, a realtime voice model on the line.<br/>
+  One Rust binary. <a href="https://ai.google.dev/gemini-api/docs/live">Gemini Live</a> first, OpenAI Realtime next.
 </p>
 
 <p align="center">
@@ -107,6 +105,7 @@ Early scaffold. Nothing works yet. Build phases:
 7. In-call tool bridge: webhook out, async result callback in, `NON_BLOCKING` + `scheduling`, barge-in cancellation.
 8. Config, docs, tests.
 9. Second provider: OpenAI Realtime — validates the `RealtimeProvider` trait doesn't leak Gemini specifics.
+10. Inbound calls: `REGISTER` on the trunk, DID → scenario mapping, busy policy, webhook notification of incoming calls.
 
 ### Design decisions
 
@@ -115,6 +114,7 @@ Early scaffold. Nothing works yet. Build phases:
 - **Scope for v1**: one call at a time. No campaign/queue/DNC list — that is an explicit, separate follow-up.
 - **External actions via webhook, not built-in**: kutsu never implements email/SMS/CRM itself. Mid-call actions go through the tool bridge; the webhook receiver acks instantly and owns execution quality.
 - **Provider-agnostic voice model**: all realtime speech-to-speech APIs (Gemini Live, OpenAI Realtime, Amazon Nova Sonic) share the same shape — bidirectional session, PCM16 audio, tool calls with ids, barge-in events — so they sit behind one trait. kutsu owns the telephony; the brain is swappable. Gemini Live ships first (cheapest, proven flow); OpenAI Realtime second.
+- **Outbound first, inbound is a declared goal**: the expensive parts — audio bridge, `RealtimeProvider`, call engine, outcomes — are direction-agnostic. Inbound adds `REGISTER` on the trunk, DID → scenario routing, and a busy policy; kutsu answers autonomously with the pre-configured scenario and notifies the orchestrator over webhook (the same mechanism as the tool bridge), no polling required.
 - **Proven conversation flow**: the conversation logic (scenario tools, goal merging, dispositions, turn-taking against Gemini Live) was validated in an earlier Python prototype; kutsu ports that flow to Rust and puts a real SIP leg and MCP interface around it.
 
 ## License
