@@ -167,9 +167,9 @@ GEMINI_API_KEY=your-api-key cargo run -- live docs/examples/scenario.json
 - Output (speaker / stdout): mono PCM16, 24 kHz sample rate.
 
 **Exit codes:**
-- `0` — session completed normally.
-- `1` — network or API error.
-- `2` — invalid configuration or scenario.
+- `0` — conversation completed (end_call or clean session end).
+- `1` — session error.
+- `2` — network unusable (preflight failed; call refused).
 
 ### Design decisions
 
