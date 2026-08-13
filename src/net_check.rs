@@ -42,11 +42,11 @@ pub fn verdict(h: &NetworkHealth, cfg: &NetCheckConfig) -> Verdict {
 }
 
 /// Open a real WSS connection to the Gemini endpoint and measure ping/pong RTT.
-/// (Proxy support mirrors the session connect — wired in Task 8's connect helper;
-/// preflight reuses the same helper once it exists.)
+/// Uses the configured proxy (if any) so the probe traverses the same path the
+/// call will.
 pub async fn preflight(server: &ServerConfig) -> Result<NetworkHealth> {
     let url = endpoint_url(server);
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+    let mut ws = crate::proxy::connect_ws(server.proxy.as_ref(), &url)
         .await
         .map_err(|e| Error::Connect(format!("preflight connect: {e}")))?;
 

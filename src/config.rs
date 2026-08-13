@@ -53,7 +53,15 @@ pub struct ServerConfig {
     pub language: String,
     pub net_check: NetCheckConfig,
     pub max_concurrent_channels: usize,
+    /// Outbound greeting: if the callee produces nothing within this many ms,
+    /// the agent greets first (words come from the system prompt). `0` disables
+    /// the proactive greeting entirely (purely reactive — wait for the callee).
+    pub greet_after_silence_ms: u64,
 }
+
+/// Default wait before the agent greets a silent callee (see
+/// [`ServerConfig::greet_after_silence_ms`]).
+pub const DEFAULT_GREET_AFTER_SILENCE_MS: u64 = 4000;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ScenarioConfig {

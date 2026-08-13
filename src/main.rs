@@ -55,6 +55,10 @@ enum Command {
         /// Skip the network preflight (offline debugging only).
         #[arg(long = "no-net-check")]
         no_net_check: bool,
+        /// Wait this many ms for the callee before the agent greets first;
+        /// 0 disables the proactive greeting (purely reactive).
+        #[arg(long = "greet-after-silence-ms")]
+        greet_after_silence_ms: Option<u64>,
     },
 }
 
@@ -86,11 +90,12 @@ fn main() -> anyhow::Result<()> {
             voice,
             tail,
             no_net_check,
+            greet_after_silence_ms,
         }) => {
             let rt = tokio::runtime::Runtime::new()?;
             let code = rt.block_on(run_live(
                 scenario, audio_in, audio_out, transcript, goal_out, model, voice, tail,
-                no_net_check,
+                no_net_check, greet_after_silence_ms,
             ))?;
             std::process::exit(code);
         }
@@ -115,12 +120,20 @@ async fn run_live(
     voice: Option<String>,
     tail: u64,
     no_net_check: bool,
+    greet_after_silence_ms: Option<u64>,
 ) -> anyhow::Result<i32> {
     // 1. Load scenario + server config (env: GEMINI_API_KEY, proxy).
     let scenario: kutsu::config::ScenarioConfig =
         serde_json::from_slice(&std::fs::read(&scenario_path)?)?;
     let api_key = std::env::var("GEMINI_API_KEY")
         .map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
+    // Proxy (optional) from env: PROXY_URL [+ PROXY_USER / PROXY_PASSWORD].
+    let non_empty = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    let proxy = non_empty("PROXY_URL").map(|url| kutsu::config::Proxy {
+        url,
+        user: non_empty("PROXY_USER"),
+        password: non_empty("PROXY_PASSWORD"),
+    });
     let model = match model.as_deref() {
         Some("native") => kutsu::config::Model::NativeAudio,
         Some("half") => kutsu::config::Model::HalfCascade,
@@ -129,12 +142,14 @@ async fn run_live(
     };
     let server = kutsu::config::ServerConfig {
         api_key,
-        proxy: None,
+        proxy,
         model,
         voice: voice.unwrap_or_else(|| "Autonoe".into()),
         language: "ru-RU".into(),
         net_check: kutsu::config::NetCheckConfig::default(),
         max_concurrent_channels: 3,
+        greet_after_silence_ms: greet_after_silence_ms
+            .unwrap_or(kutsu::config::DEFAULT_GREET_AFTER_SILENCE_MS),
     };
 
     // 2. Preflight (fail closed).
@@ -159,10 +174,21 @@ async fn run_live(
     // so it stays open long enough to stream the whole input plus the tail.
     let input_len_secs = (samples.len() as u64 / 16000).max(1);
     let audio_tx = session.audio_in.clone();
+    let tail_secs = tail;
     tokio::spawn(async move {
         for chunk in samples.chunks(512) {
             if audio_tx.send(chunk.to_vec()).await.is_err() {
-                break;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(32)).await;
+        }
+        // Keep the stream continuous with trailing silence so the model's
+        // automatic VAD can detect end-of-speech and take its turn — a real
+        // phone line never stops sending. Roughly `tail` seconds of silence.
+        let silence = vec![0i16; 512];
+        for _ in 0..(tail_secs * 1000 / 32) {
+            if audio_tx.send(silence.clone()).await.is_err() {
+                return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(32)).await;
         }

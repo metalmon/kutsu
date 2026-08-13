@@ -7,10 +7,27 @@
 #[ignore = "requires GEMINI_API_KEY and network"]
 async fn short_live_session_returns_audio_and_ends() {
     let api_key = std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY");
+    // Optional proxy from env (needed where Gemini is geo-restricted):
+    // PROXY_URL [+ PROXY_USER / PROXY_PASSWORD].
+    let non_empty = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    let proxy = non_empty("PROXY_URL").map(|url| kutsu::config::Proxy {
+        url,
+        user: non_empty("PROXY_USER"),
+        password: non_empty("PROXY_PASSWORD"),
+    });
+    // Relaxed thresholds: this smoke test routes through a remote proxy (to reach
+    // geo-restricted Gemini), which adds latency/jitter well above the default
+    // direct-path limits. The point here is to reach the conversation, not to
+    // grade the proxy link; production keeps the stricter defaults.
+    let net_check = kutsu::config::NetCheckConfig {
+        max_rtt_ms: 2000, max_jitter_ms: 500, max_loss_pct: 5.0,
+        ..kutsu::config::NetCheckConfig::default()
+    };
     let server = kutsu::config::ServerConfig {
-        api_key, proxy: None, model: kutsu::config::Model::HalfCascade,
+        api_key, proxy, model: kutsu::config::Model::HalfCascade,
         voice: "Autonoe".into(), language: "ru-RU".into(),
-        net_check: kutsu::config::NetCheckConfig::default(), max_concurrent_channels: 3,
+        net_check, max_concurrent_channels: 3,
+        greet_after_silence_ms: kutsu::config::DEFAULT_GREET_AFTER_SILENCE_MS,
     };
     let scenario = kutsu::config::ScenarioConfig {
         system_prompt: "You are a friendly assistant. Greet briefly, then call end_call.".into(),
