@@ -1434,6 +1434,7 @@ dependencies = [
  "clap",
  "ezk-rtc",
  "ezk-sip-ua",
+ "futures-util",
  "hound",
  "rmcp",
  "schemars",

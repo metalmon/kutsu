@@ -1,0 +1,128 @@
+//! Fail-closed network preflight: probe the Gemini endpoint (WSS ping RTT) and
+//! decide whether the network is good enough to place a call.
+
+use std::time::{Duration, Instant};
+
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+
+use crate::config::{NetCheckConfig, ServerConfig};
+use crate::error::{Error, Result};
+use crate::proto::endpoint_url;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Ok,
+    Unusable,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NetworkHealth {
+    pub rtt_p50_ms: u32,
+    pub rtt_p95_ms: u32,
+    pub jitter_ms: u32,
+    pub loss_pct: f32,
+}
+
+impl NetworkHealth {
+    pub fn summary(&self) -> String {
+        format!(
+            "rtt_p50={}ms rtt_p95={}ms jitter={}ms loss={}%",
+            self.rtt_p50_ms, self.rtt_p95_ms, self.jitter_ms, self.loss_pct
+        )
+    }
+}
+
+pub fn verdict(h: &NetworkHealth, cfg: &NetCheckConfig) -> Verdict {
+    if h.rtt_p95_ms > cfg.max_rtt_ms || h.jitter_ms > cfg.max_jitter_ms || h.loss_pct > cfg.max_loss_pct {
+        Verdict::Unusable
+    } else {
+        Verdict::Ok
+    }
+}
+
+/// Open a real WSS connection to the Gemini endpoint and measure ping/pong RTT.
+/// (Proxy support mirrors the session connect — wired in Task 8's connect helper;
+/// preflight reuses the same helper once it exists.)
+pub async fn preflight(server: &ServerConfig) -> Result<NetworkHealth> {
+    let url = endpoint_url(server);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .map_err(|e| Error::Connect(format!("preflight connect: {e}")))?;
+
+    let mut rtts: Vec<u32> = Vec::new();
+    let mut lost = 0u32;
+    let n = server.net_check.samples.max(1);
+    for i in 0..n {
+        let payload = vec![i as u8];
+        let sent = Instant::now();
+        ws.send(Message::Ping(payload.clone().into()))
+            .await
+            .map_err(|e| Error::Connect(format!("preflight ping: {e}")))?;
+        // Wait up to max_rtt*4 for the matching pong.
+        let budget = Duration::from_millis((server.net_check.max_rtt_ms as u64) * 4);
+        match tokio::time::timeout(budget, wait_for_pong(&mut ws)).await {
+            Ok(Ok(())) => rtts.push(sent.elapsed().as_millis() as u32),
+            _ => lost += 1,
+        }
+    }
+    let _ = ws.close(None).await;
+
+    Ok(summarize(&mut rtts, lost, n))
+}
+
+async fn wait_for_pong<S>(ws: &mut S) -> Result<()>
+where
+    S: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    while let Some(msg) = ws.next().await {
+        match msg {
+            Ok(Message::Pong(_)) => return Ok(()),
+            Ok(_) => continue,
+            Err(e) => return Err(Error::Connect(format!("preflight recv: {e}"))),
+        }
+    }
+    Err(Error::Connect("preflight stream ended".into()))
+}
+
+fn summarize(rtts: &mut Vec<u32>, lost: u32, total: u32) -> NetworkHealth {
+    let loss_pct = (lost as f32 / total as f32) * 100.0;
+    if rtts.is_empty() {
+        return NetworkHealth { rtt_p50_ms: u32::MAX, rtt_p95_ms: u32::MAX, jitter_ms: u32::MAX, loss_pct };
+    }
+    rtts.sort_unstable();
+    let p = |q: f32| rtts[((rtts.len() as f32 - 1.0) * q).round() as usize];
+    let mean = rtts.iter().sum::<u32>() as f32 / rtts.len() as f32;
+    let jitter = (rtts.iter().map(|&r| (r as f32 - mean).abs()).sum::<f32>() / rtts.len() as f32) as u32;
+    NetworkHealth { rtt_p50_ms: p(0.50), rtt_p95_ms: p(0.95), jitter_ms: jitter, loss_pct }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::NetCheckConfig;
+
+    #[test]
+    fn verdict_respects_thresholds() {
+        let cfg = NetCheckConfig::default(); // 300/50/2.0
+        let good = NetworkHealth { rtt_p50_ms: 40, rtt_p95_ms: 120, jitter_ms: 15, loss_pct: 0.0 };
+        assert!(matches!(verdict(&good, &cfg), Verdict::Ok));
+
+        let high_rtt = NetworkHealth { rtt_p95_ms: 800, ..good };
+        assert!(matches!(verdict(&high_rtt, &cfg), Verdict::Unusable));
+
+        let lossy = NetworkHealth { loss_pct: 10.0, ..good };
+        assert!(matches!(verdict(&lossy, &cfg), Verdict::Unusable));
+
+        let jittery = NetworkHealth { jitter_ms: 200, ..good };
+        assert!(matches!(verdict(&jittery, &cfg), Verdict::Unusable));
+    }
+
+    #[test]
+    fn summary_is_readable() {
+        let h = NetworkHealth { rtt_p50_ms: 40, rtt_p95_ms: 120, jitter_ms: 15, loss_pct: 1.5 };
+        let s = h.summary();
+        assert!(s.contains("rtt_p95=120ms"));
+        assert!(s.contains("loss=1.5%"));
+    }
+}
