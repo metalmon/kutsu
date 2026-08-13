@@ -13,6 +13,7 @@
 pub mod bridge;
 pub mod config;
 pub mod engine;
+pub mod error;
 pub mod gemini_live;
 pub mod mcp;
 pub mod sip;
