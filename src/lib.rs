@@ -18,6 +18,7 @@ pub mod error;
 pub mod gemini_live;
 pub mod mcp;
 pub mod proto;
+pub mod reconnect;
 pub mod sip;
 pub mod state;
 
