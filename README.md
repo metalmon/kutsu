@@ -138,6 +138,39 @@ Early scaffold. Nothing works yet. Build phases:
 9. Second provider: OpenAI Realtime — validates the `RealtimeProvider` trait doesn't leak Gemini specifics.
 10. Inbound calls: `REGISTER` on the trunk, DID → scenario mapping, busy policy, webhook notification of incoming calls.
 
+### Dev harness: kutsu live
+
+The `kutsu live` command runs an end-to-end session against the real Gemini Live API, bridging a scenario script to audio I/O:
+
+```bash
+GEMINI_API_KEY=your-api-key cargo run -- live docs/examples/scenario.json
+```
+
+**Environment:**
+- `GEMINI_API_KEY` (required) — authentication token for the Gemini API.
+
+**Scenario file format** (`docs/examples/scenario.json`):
+```json
+{
+  "system_prompt": "Your system message to the model",
+  "goal_schema": {
+    "type": "object",
+    "properties": { "field": { "type": "string" } },
+    "required": ["field"]
+  },
+  "context": { "optional": "data", "passed": "to the model" }
+}
+```
+
+**Audio format:**
+- Input (microphone / stdin): mono PCM16 (signed 16-bit little-endian), 16 kHz sample rate.
+- Output (speaker / stdout): mono PCM16, 24 kHz sample rate.
+
+**Exit codes:**
+- `0` — session completed normally.
+- `1` — network or API error.
+- `2` — invalid configuration or scenario.
+
 ### Design decisions
 
 - **Telephony**: generic SIP trunk (any provider or self-hosted PBX), not a specific vendor API.
