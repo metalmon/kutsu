@@ -100,6 +100,12 @@ pub(crate) trait Transport: Send {
 /// server acknowledges `setupComplete`, so the caller can distinguish "the
 /// session was actually live" from "it never got off the ground" when a
 /// non-clean end needs to feed [`reconnect_outcome`].
+/// Kickoff cue sent as a user turn when the callee stays silent. It only hands
+/// the turn to the model — the greeting wording comes from the system prompt.
+const GREET_CUE: &str =
+    "The call has connected and the other party has not spoken yet. \
+     Greet them now and begin the conversation as instructed.";
+
 pub(crate) async fn run_session<T: Transport>(
     mut transport: T,
     server: &ServerConfig,
@@ -112,18 +118,40 @@ pub(crate) async fn run_session<T: Transport>(
 ) -> SessionEnd {
     // 1. Setup.
     let setup = proto::build_setup(server, scenario, resume_handle.as_deref());
+    tracing::debug!(model = ?server.model, "gemini: sending setup");
     if transport.send_text(setup.to_string()).await.is_err() {
         return SessionEnd::Resumable("send setup failed".into());
     }
 
+    // Hybrid greeting: on a fresh session, if neither side has produced anything
+    // within `greet_after_silence_ms`, prompt the model to greet first. A value
+    // of 0 disables the proactive greeting (purely reactive).
+    let greet_enabled = server.greet_after_silence_ms > 0;
+    let greet_at =
+        tokio::time::Instant::now() + std::time::Duration::from_millis(server.greet_after_silence_ms);
+    let mut greeted = resume_handle.is_some() || !greet_enabled; // never greet on resume or when disabled
+    let mut had_activity = false;
+
+    let mut audio_frames_sent: u64 = 0;
     loop {
         tokio::select! {
+            _ = tokio::time::sleep_until(greet_at), if !greeted && !had_activity => {
+                greeted = true;
+                tracing::info!("gemini: callee silent — sending greeting kickoff");
+                if transport.send_text(build_client_content(GREET_CUE)).await.is_err() {
+                    return SessionEnd::Resumable("send greeting failed".into());
+                }
+            }
             frame = audio_in.recv() => {
                 match frame {
                     Some(pcm) => {
                         let msg = build_realtime_input(&pcm);
                         if transport.send_text(msg).await.is_err() {
                             return SessionEnd::Resumable("send audio failed".into());
+                        }
+                        audio_frames_sent += 1;
+                        if audio_frames_sent % 100 == 0 {
+                            tracing::debug!(audio_frames_sent, "gemini: audio streaming");
                         }
                     }
                     None => return SessionEnd::Hangup, // caller dropped the sender
@@ -132,6 +160,16 @@ pub(crate) async fn run_session<T: Transport>(
             incoming = transport.recv() => {
                 match incoming {
                     Some(Ok(text)) => {
+                        if tracing::enabled!(tracing::Level::DEBUG) {
+                            // Collapse the server's pretty-printed JSON to one line
+                            // and elide the huge base64 audio blob.
+                            let compact: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                            let shown = match compact.find("\"data\"") {
+                                Some(i) => format!("{}\"data\":<+{} b elided>}}", &compact[..i], text.len()),
+                                None => compact,
+                            };
+                            tracing::debug!(len = text.len(), frame = %shown, "gemini: recv frame");
+                        }
                         let parsed = match proto::parse_server_message(&text) {
                             Ok(p) => p,
                             Err(e) => { let _ = events.send(Event::Warning(e.to_string())).await; continue; }
@@ -140,13 +178,13 @@ pub(crate) async fn run_session<T: Transport>(
                             match se {
                                 ServerEvent::SetupComplete => { *setup_ok = true; }
                                 ServerEvent::OutputAudio(pcm) =>
-                                    { let _ = events.send(Event::OutputAudio(pcm)).await; }
+                                    { had_activity = true; let _ = events.send(Event::OutputAudio(pcm)).await; }
                                 ServerEvent::Transcript { role, text, final_ } =>
-                                    { let _ = events.send(Event::Transcript { role, text, final_ }).await; }
+                                    { had_activity = true; let _ = events.send(Event::Transcript { role, text, final_ }).await; }
                                 ServerEvent::Interrupted =>
-                                    { let _ = events.send(Event::Interrupted).await; }
+                                    { had_activity = true; let _ = events.send(Event::Interrupted).await; }
                                 ServerEvent::TurnComplete =>
-                                    { let _ = events.send(Event::TurnComplete).await; }
+                                    { had_activity = true; let _ = events.send(Event::TurnComplete).await; }
                                 ServerEvent::ResumptionHandle(h) => { *latest_handle = Some(h); }
                                 ServerEvent::GoAway => return SessionEnd::Resumable("goAway".into()),
                                 ServerEvent::ToolCallEndCall { call_id, goal } => {
@@ -173,14 +211,27 @@ fn build_realtime_input(pcm: &[i16]) -> String {
     }
     let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
     serde_json::json!({
-        "realtimeInput": { "audio": { "mimeType": "audio/pcm;rate=16000", "data": data } }
+        "realtime_input": { "audio": { "mimeType": "audio/pcm;rate=16000", "data": data } }
+    })
+    .to_string()
+}
+
+/// Build a `client_content` message with a single completed user turn. Used as
+/// the greeting kickoff so the model takes the first turn when the callee is
+/// silent (the greeting wording itself comes from the system prompt).
+fn build_client_content(text: &str) -> String {
+    serde_json::json!({
+        "client_content": {
+            "turns": [ { "role": "user", "parts": [ { "text": text } ] } ],
+            "turnComplete": true
+        }
     })
     .to_string()
 }
 
 fn build_tool_response(call_id: &str) -> String {
     serde_json::json!({
-        "toolResponse": { "functionResponses": [ { "id": call_id, "response": { "ok": true } } ] }
+        "tool_response": { "functionResponses": [ { "id": call_id, "response": { "ok": true } } ] }
     })
     .to_string()
 }
@@ -218,11 +269,15 @@ impl Transport for WsTransport {
     }
     async fn recv(&mut self) -> Option<Result<String>> {
         use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
         loop {
             match self.ws.next().await? {
-                Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => return Some(Ok(t.to_string())),
-                Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => return None,
-                Ok(_) => continue, // ignore ping/pong/binary
+                // Gemini Live sends server messages as binary WS frames (JSON
+                // bytes), not text — accept both.
+                Ok(Message::Text(t)) => return Some(Ok(t.to_string())),
+                Ok(Message::Binary(b)) => return Some(Ok(String::from_utf8_lossy(&b).into_owned())),
+                Ok(Message::Close(_)) => return None,
+                Ok(_) => continue, // ignore ping/pong
                 Err(e) => return Some(Err(crate::error::Error::Connect(e.to_string()))),
             }
         }
@@ -278,14 +333,14 @@ pub async fn start(server: &ServerConfig, scenario: &ScenarioConfig) -> Result<S
 
             let url = proto::endpoint_url(&server);
             let connected = tokio::select! {
-                r = tokio_tungstenite::connect_async(&url) => r,
+                r = crate::proxy::connect_ws(server.proxy.as_ref(), &url) => r,
                 _ = hangup_rx.recv() => {
                     return CallOutcome { ended_by: EndedBy::CallerHangup, goal: None, transcript };
                 }
             };
 
             match connected {
-                Ok((ws, _)) => {
+                Ok(ws) => {
                     let transport = WsTransport { ws };
                     let prior_handle = handle.clone();
                     let mut latest = handle.clone();
@@ -398,7 +453,8 @@ mod tests {
     fn server() -> ServerConfig {
         ServerConfig { api_key: "K".into(), proxy: None, model: Model::HalfCascade,
             voice: "Autonoe".into(), language: "ru-RU".into(),
-            net_check: NetCheckConfig::default(), max_concurrent_channels: 3 }
+            net_check: NetCheckConfig::default(), max_concurrent_channels: 3,
+            greet_after_silence_ms: 0 }
     }
     fn scenario() -> ScenarioConfig {
         ScenarioConfig { system_prompt: "hi".into(),
@@ -439,7 +495,7 @@ mod tests {
         assert!(saw_end);
         assert!(matches!(end, SessionEnd::EndCall(g) if g["disposition"] == "done"));
         // We acked the tool call.
-        assert!(sent.lock().unwrap().iter().any(|s| s.contains("toolResponse")));
+        assert!(sent.lock().unwrap().iter().any(|s| s.contains("tool_response")));
     }
 
     #[tokio::test]

@@ -140,14 +140,24 @@ Early scaffold. Nothing works yet. Build phases:
 
 ### Dev harness: kutsu live
 
-The `kutsu live` command runs an end-to-end session against the real Gemini Live API, bridging a scenario script to audio I/O:
+The `kutsu live` command runs an end-to-end session against the real Gemini Live API, feeding an audio file as the callee and writing the model's audio/transcript/goal:
 
 ```bash
-GEMINI_API_KEY=your-api-key cargo run -- live docs/examples/scenario.json
+GEMINI_API_KEY=your-api-key cargo run --features vendor-openssl -- live \
+  --scenario docs/examples/scenario.json \
+  --audio-in callee.wav --audio-out out.wav \
+  --transcript out.jsonl --goal-out goal.json
 ```
 
 **Environment:**
 - `GEMINI_API_KEY` (required) — authentication token for the Gemini API.
+- `PROXY_URL` [+ `PROXY_USER` / `PROXY_PASSWORD`] (optional) — HTTP CONNECT proxy. Required where Gemini is geo-restricted (`400 "User location is not supported"`).
+
+**Key flags:**
+- `--model half|native` — override the default (half-cascade).
+- `--tail SECONDS` — how long to keep the session open after the input ends (default 8).
+- `--greet-after-silence-ms MS` — wait this long for the callee before the agent greets first; `0` disables the proactive greeting (default 4000).
+- `--no-net-check` — skip the fail-closed network preflight (offline/high-latency debugging).
 
 **Scenario file format** (`docs/examples/scenario.json`):
 ```json
@@ -163,8 +173,8 @@ GEMINI_API_KEY=your-api-key cargo run -- live docs/examples/scenario.json
 ```
 
 **Audio format:**
-- Input (microphone / stdin): mono PCM16 (signed 16-bit little-endian), 16 kHz sample rate.
-- Output (speaker / stdout): mono PCM16, 24 kHz sample rate.
+- Input (`--audio-in`): mono PCM16 (signed 16-bit little-endian) WAV or raw `.pcm`, 16 kHz.
+- Output (`--audio-out`): mono PCM16 WAV, 24 kHz.
 
 **Exit codes:**
 - `0` — conversation completed (end_call or clean session end).

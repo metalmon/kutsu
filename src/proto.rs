@@ -189,7 +189,7 @@ mod tests {
         ServerConfig {
             api_key: "KEY".into(), proxy: None, model, voice: "Autonoe".into(),
             language: "ru-RU".into(), net_check: NetCheckConfig::default(),
-            max_concurrent_channels: 3,
+            max_concurrent_channels: 3, greet_after_silence_ms: 4000,
         }
     }
     fn scenario() -> ScenarioConfig {
