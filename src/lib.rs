@@ -3,17 +3,23 @@
 //! Places real phone calls over a generic SIP trunk and bridges the call
 //! audio to Gemini Live (`BidiGenerateContent`) for a realtime conversational
 //! agent, exposed as async MCP tools (`place_call` / `get_call_status` /
-//! `get_call_transcript` / `end_call` / `list_calls`) so any MCP client can
-//! drive cold calls without blocking on call duration.
+//! `get_call_transcript` / `end_call`) so any MCP client can drive cold calls
+//! without blocking on call duration.
 //!
 //! This is an early scaffold — most modules are stubs. See the project plan
 //! for the intended build phases (SIP spike, Gemini Live client, audio
 //! bridge, call engine, MCP layer).
 
+pub mod audio_file;
 pub mod bridge;
+pub mod config;
 pub mod engine;
+pub mod error;
 pub mod gemini_live;
 pub mod mcp;
+pub mod net_check;
+pub mod proto;
+pub mod reconnect;
 pub mod sip;
 pub mod state;
 

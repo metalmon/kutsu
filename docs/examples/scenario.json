@@ -1,0 +1,13 @@
+{
+  "system_prompt": "You are an assistant calling to confirm an appointment. Be brief and polite.",
+  "goal_schema": {
+    "type": "object",
+    "properties": {
+      "confirmed": { "type": "boolean" },
+      "callback_at": { "type": "string" },
+      "disposition": { "type": "string" }
+    },
+    "required": ["disposition"]
+  },
+  "context": { "name": "Ivan", "city": "Kazan" }
+}

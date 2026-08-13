@@ -36,7 +36,39 @@ cargo build --release
 ./target/release/kutsu mcp --transport streamable-http --bind 127.0.0.1:8090
 ```
 
-On Windows, the binary is `target\release\kutsu.exe`. Building requires a system OpenSSL (needed by `ezk-srtp` for SRTP): install via vcpkg (`vcpkg install openssl:x64-windows-static-md` + set `VCPKG_ROOT`), or use the `vendor-openssl` feature (needs `perl` and `nasm` on PATH).
+### Building
+
+The SIP media stack pulls in native C code: `ezk-rtc` → `ezk-srtp` builds a bundled **libsrtp2** and needs OpenSSL's libcrypto for SRTP. That makes a few native toolchain dependencies mandatory on **every** platform, plus a choice of how OpenSSL is provided.
+
+#### 1. Base build requirements (all platforms, all paths)
+
+`ezk-srtp` compiles libsrtp2 via CMake and generates its Rust FFI with `bindgen`, so you always need:
+
+| Tool | Why |
+|------|-----|
+| A C compiler | MSVC (`cl.exe`, via VS Build Tools) on Windows; `gcc`/`clang` on Linux; Xcode CLT on macOS |
+| **CMake** | builds the bundled libsrtp2 |
+| **LLVM / libclang** | `bindgen` needs it to parse libsrtp headers — set `LIBCLANG_PATH` to LLVM's `bin` |
+
+#### 2. OpenSSL — pick one
+
+**System OpenSSL** (default `cargo build`) — fastest where a dev OpenSSL is present:
+
+- Linux: `apt install libssl-dev` (or distro equivalent).
+- macOS: `brew install openssl@3` (set `OPENSSL_DIR` if not auto-detected).
+- Windows (MSVC): vcpkg — `vcpkg install openssl:x64-windows-static-md` + set `VCPKG_ROOT`.
+
+**Vendored OpenSSL** (portable) — compiles OpenSSL from source and links it statically, so the binary needs no OpenSSL on the deploy host. Recommended for release binaries targeting multiple systems from CI:
+
+```bash
+cargo build --release --features vendor-openssl
+```
+
+This path adds two more build-host tools: **`perl`** (on Windows a *native* Windows perl — Strawberry Perl or ActivePerl, **not** the MSYS/Git-bundled perl, since it drives the `VC-WIN64A` build) and **`nasm`** on Windows for asm-optimized OpenSSL.
+
+#### Windows toolchain summary
+
+For a vendored build on Windows, the full set is: VS Build Tools (`cl.exe`) · CMake · LLVM/libclang (`LIBCLANG_PATH`) · Strawberry Perl · NASM. Install the last three via winget: `winget install NASM.NASM StrawberryPerl.StrawberryPerl LLVM.LLVM` (CMake and VS Build Tools as usual). The output binary is `target\release\kutsu.exe`; with vendored OpenSSL it is self-contained apart from the standard MSVC runtime (VC++ Redistributable).
 
 ## Architecture
 
@@ -68,7 +100,6 @@ flowchart LR
 | `get_call_status` | Poll call state (dialing, in-progress, completed, failed) |
 | `get_call_transcript` | Fetch the running or final transcript |
 | `end_call` | Force hangup |
-| `list_calls` | List known calls and their states |
 
 ## Call outcomes
 
@@ -77,10 +108,10 @@ Every completed call must yield three artifacts, not just a transcript (planned 
 | Artifact | What it is |
 |----------|------------|
 | **Transcript** | Timestamped `TranscriptEntry` list: both sides of the conversation plus tool calls the model made |
-| **Goal JSON** | A structured result filled in during the call. `place_call` accepts a goal schema (contact fields, appointment, disposition, scenario-specific flags); the model fills it via tool calls (`save_contact`, `set_appointment`, `end_call(reason)`, …), and kutsu merges those calls into the final JSON |
+| **Goal JSON** | A structured result (contact fields, appointment, disposition, scenario-specific flags) filled in during the call. `place_call` accepts a goal schema (JSON Schema); the model fills it and passes it as the arguments of a single `end_call` tool call at the end; kutsu records those arguments as the final goal JSON |
 | **Recording** | Audio of the full call (both legs), saved to disk and retrievable after hangup |
 
-How the goal JSON gets filled: the scenario declares tools and a goal schema, tool-call arguments are merged into the goal object as the call progresses, and `end_call(reason)` sets the final disposition (appointment, callback, refused, wrong contact, …).
+How the goal JSON gets filled: the scenario declares the goal schema; the model completes it over the course of the conversation; at the end, the model calls `end_call` with the filled schema as its arguments; kutsu records those arguments as the final goal JSON. The disposition (appointment, callback, refused, wrong contact, …) is a field inside the goal schema itself.
 
 ## In-call tool bridge (webhook)
 
@@ -106,6 +137,39 @@ Early scaffold. Nothing works yet. Build phases:
 8. Config, docs, tests.
 9. Second provider: OpenAI Realtime — validates the `RealtimeProvider` trait doesn't leak Gemini specifics.
 10. Inbound calls: `REGISTER` on the trunk, DID → scenario mapping, busy policy, webhook notification of incoming calls.
+
+### Dev harness: kutsu live
+
+The `kutsu live` command runs an end-to-end session against the real Gemini Live API, bridging a scenario script to audio I/O:
+
+```bash
+GEMINI_API_KEY=your-api-key cargo run -- live docs/examples/scenario.json
+```
+
+**Environment:**
+- `GEMINI_API_KEY` (required) — authentication token for the Gemini API.
+
+**Scenario file format** (`docs/examples/scenario.json`):
+```json
+{
+  "system_prompt": "Your system message to the model",
+  "goal_schema": {
+    "type": "object",
+    "properties": { "field": { "type": "string" } },
+    "required": ["field"]
+  },
+  "context": { "optional": "data", "passed": "to the model" }
+}
+```
+
+**Audio format:**
+- Input (microphone / stdin): mono PCM16 (signed 16-bit little-endian), 16 kHz sample rate.
+- Output (speaker / stdout): mono PCM16, 24 kHz sample rate.
+
+**Exit codes:**
+- `0` — conversation completed (end_call or clean session end).
+- `1` — session error.
+- `2` — network unusable (preflight failed; call refused).
 
 ### Design decisions
 
