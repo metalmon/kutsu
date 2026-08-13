@@ -1,10 +1,9 @@
 //! Gemini Live (`BidiGenerateContent`) WebSocket client.
 //!
-//! `tokio-tungstenite` client speaking the `BidiGenerateContent` protocol:
-//! setup (`systemInstruction` built from the call's prompt/lead context,
-//! fixed `tools` set: `end_call` / `save_lead` / `schedule_callback`),
-//! session resumption handle persistence and reconnect, and tool-call
-//! dispatch back into [`crate::engine`].
+//! A hand-rolled `tokio-tungstenite` client speaking the `BidiGenerateContent` protocol:
+//! streams PCM16 audio both ways in realtime, surfaces events (transcript, audio, tool calls, barge-in),
+//! handles session resumption and reconnect, and exposes a single `end_call` tool whose parameters
+//! are the scenario's dynamic goal schema.
 //!
 //! Kept free of any project-specific dependencies so it could later be
 //! shared with zeroclaw's proposed `speech_to_speech` channel

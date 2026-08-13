@@ -108,10 +108,10 @@ Every completed call must yield three artifacts, not just a transcript (planned 
 | Artifact | What it is |
 |----------|------------|
 | **Transcript** | Timestamped `TranscriptEntry` list: both sides of the conversation plus tool calls the model made |
-| **Goal JSON** | A structured result filled in during the call. `place_call` accepts a goal schema (contact fields, appointment, disposition, scenario-specific flags); the model fills it via tool calls (`save_contact`, `set_appointment`, `end_call(reason)`, …), and kutsu merges those calls into the final JSON |
+| **Goal JSON** | A structured result (contact fields, appointment, disposition, scenario-specific flags) filled in during the call. `place_call` accepts a goal schema (JSON Schema); the model fills it and passes it as the arguments of a single `end_call` tool call at the end; kutsu records those arguments as the final goal JSON |
 | **Recording** | Audio of the full call (both legs), saved to disk and retrievable after hangup |
 
-How the goal JSON gets filled: the scenario declares tools and a goal schema, tool-call arguments are merged into the goal object as the call progresses, and `end_call(reason)` sets the final disposition (appointment, callback, refused, wrong contact, …).
+How the goal JSON gets filled: the scenario declares the goal schema; the model completes it over the course of the conversation; at the end, the model calls `end_call` with the filled schema as its arguments; kutsu records those arguments as the final goal JSON. The disposition (appointment, callback, refused, wrong contact, …) is a field inside the goal schema itself.
 
 ## In-call tool bridge (webhook)
 

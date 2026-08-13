@@ -123,7 +123,9 @@ async fn run_live(
         .map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
     let model = match model.as_deref() {
         Some("native") => kutsu::config::Model::NativeAudio,
-        _ => kutsu::config::Model::HalfCascade,
+        Some("half") => kutsu::config::Model::HalfCascade,
+        Some(x) => anyhow::bail!("unknown model '{}' (expected 'half' or 'native')", x),
+        None => kutsu::config::Model::HalfCascade,
     };
     let server = kutsu::config::ServerConfig {
         api_key,
@@ -155,7 +157,7 @@ async fn run_live(
     let samples = kutsu::audio_file::read_pcm16(&audio_in, 16000)?;
     // Input is 16 kHz mono PCM16; used below to extend the session deadline
     // so it stays open long enough to stream the whole input plus the tail.
-    let input_len_secs = samples.len() as u64 / 16000;
+    let input_len_secs = (samples.len() as u64 / 16000).max(1);
     let audio_tx = session.audio_in.clone();
     tokio::spawn(async move {
         for chunk in samples.chunks(512) {
