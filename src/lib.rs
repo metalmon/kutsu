@@ -17,6 +17,7 @@ pub mod engine;
 pub mod error;
 pub mod gemini_live;
 pub mod mcp;
+pub mod proto;
 pub mod sip;
 pub mod state;
 
