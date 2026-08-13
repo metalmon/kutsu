@@ -36,6 +36,7 @@ ezk-sip-ua = "0.9"
 # self-contained builds across systems that lack one, enable `vendor-openssl`
 # (below), which compiles OpenSSL from source and links it statically. See README.
 ezk-rtc = "0.0.1"
+hound = "3"
 
 [features]
 # Build OpenSSL from source and link it statically instead of relying on a
