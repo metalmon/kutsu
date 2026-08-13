@@ -36,7 +36,39 @@ cargo build --release
 ./target/release/kutsu mcp --transport streamable-http --bind 127.0.0.1:8090
 ```
 
-On Windows, the binary is `target\release\kutsu.exe`. Building requires a system OpenSSL (needed by `ezk-srtp` for SRTP): install via vcpkg (`vcpkg install openssl:x64-windows-static-md` + set `VCPKG_ROOT`), or use the `vendor-openssl` feature (needs `perl` and `nasm` on PATH).
+### Building
+
+The SIP media stack pulls in native C code: `ezk-rtc` → `ezk-srtp` builds a bundled **libsrtp2** and needs OpenSSL's libcrypto for SRTP. That makes a few native toolchain dependencies mandatory on **every** platform, plus a choice of how OpenSSL is provided.
+
+#### 1. Base build requirements (all platforms, all paths)
+
+`ezk-srtp` compiles libsrtp2 via CMake and generates its Rust FFI with `bindgen`, so you always need:
+
+| Tool | Why |
+|------|-----|
+| A C compiler | MSVC (`cl.exe`, via VS Build Tools) on Windows; `gcc`/`clang` on Linux; Xcode CLT on macOS |
+| **CMake** | builds the bundled libsrtp2 |
+| **LLVM / libclang** | `bindgen` needs it to parse libsrtp headers — set `LIBCLANG_PATH` to LLVM's `bin` |
+
+#### 2. OpenSSL — pick one
+
+**System OpenSSL** (default `cargo build`) — fastest where a dev OpenSSL is present:
+
+- Linux: `apt install libssl-dev` (or distro equivalent).
+- macOS: `brew install openssl@3` (set `OPENSSL_DIR` if not auto-detected).
+- Windows (MSVC): vcpkg — `vcpkg install openssl:x64-windows-static-md` + set `VCPKG_ROOT`.
+
+**Vendored OpenSSL** (portable) — compiles OpenSSL from source and links it statically, so the binary needs no OpenSSL on the deploy host. Recommended for release binaries targeting multiple systems from CI:
+
+```bash
+cargo build --release --features vendor-openssl
+```
+
+This path adds two more build-host tools: **`perl`** (on Windows a *native* Windows perl — Strawberry Perl or ActivePerl, **not** the MSYS/Git-bundled perl, since it drives the `VC-WIN64A` build) and **`nasm`** on Windows for asm-optimized OpenSSL.
+
+#### Windows toolchain summary
+
+For a vendored build on Windows, the full set is: VS Build Tools (`cl.exe`) · CMake · LLVM/libclang (`LIBCLANG_PATH`) · Strawberry Perl · NASM. Install the last three via winget: `winget install NASM.NASM StrawberryPerl.StrawberryPerl LLVM.LLVM` (CMake and VS Build Tools as usual). The output binary is `target\release\kutsu.exe`; with vendored OpenSSL it is self-contained apart from the standard MSVC runtime (VC++ Redistributable).
 
 ## Architecture
 
@@ -68,7 +100,6 @@ flowchart LR
 | `get_call_status` | Poll call state (dialing, in-progress, completed, failed) |
 | `get_call_transcript` | Fetch the running or final transcript |
 | `end_call` | Force hangup |
-| `list_calls` | List known calls and their states |
 
 ## Call outcomes
 

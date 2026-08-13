@@ -1,7 +1,7 @@
 [package]
 name = "kutsu"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Outbound SIP calling MCP server, bridging real phone calls to Gemini Live"
 license = "MIT"
 
@@ -19,7 +19,7 @@ clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-rmcp = { version = "2.1", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+rmcp = { version = "3.1", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 schemars = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "net", "signal"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
@@ -30,11 +30,21 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 chrono = { version = "0.4", features = ["serde"] }
 ezk-sip-ua = "0.9"
-# Requires a system OpenSSL (ezk-rtc -> ezk-srtp needs it for SRTP). On
-# Windows, install via vcpkg (`vcpkg install openssl:x64-windows-static-md`
-# + set VCPKG_ROOT) or use the `vendor-openssl` feature instead, which needs
-# perl + nasm on PATH to build OpenSSL from source. See README.
+# SRTP (media encryption) needs OpenSSL's libcrypto: ezk-rtc -> ezk-srtp ->
+# openssl-sys. By default the build links a *system* OpenSSL. For portable,
+# self-contained builds across systems that lack one, enable `vendor-openssl`
+# (below), which compiles OpenSSL from source and links it statically. See README.
 ezk-rtc = "0.0.1"
+
+[features]
+# Build OpenSSL from source and link it statically instead of relying on a
+# system OpenSSL. Forwarded to ezk-rtc's vendored toggle; Cargo feature
+# unification makes the transitive openssl-sys (ezk-srtp) vendored too, so the
+# whole tree uses the source build. Requires perl + a C compiler on the build
+# host (+ nasm on Windows for asm-optimized OpenSSL). Use for release binaries
+# targeting multiple systems: one `cargo build --features vendor-openssl`
+# recipe yields a self-contained binary needing no OpenSSL on the deploy host.
+vendor-openssl = ["ezk-rtc/vendor-openssl"]
 
 [dev-dependencies]
 tempfile = "3"
