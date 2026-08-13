@@ -11,6 +11,7 @@
 //! bridge, call engine, MCP layer).
 
 pub mod bridge;
+pub mod config;
 pub mod engine;
 pub mod gemini_live;
 pub mod mcp;
