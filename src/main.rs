@@ -273,10 +273,16 @@ async fn run_call_cli(number: String, scenario_path: Option<std::path::PathBuf>)
         Err(e) => { eprintln!("config error: {e}"); return 1; }
     };
     let scenario = match scenario_path {
-        Some(p) => match std::fs::read_to_string(&p).ok().and_then(|s| serde_json::from_str(&s).ok()) {
-            Some(s) => s,
-            None => { eprintln!("failed to read scenario {p:?}"); return 1; }
-        },
+        Some(p) => {
+            let text = match std::fs::read_to_string(&p) {
+                Ok(t) => t,
+                Err(e) => { eprintln!("failed to read scenario {p:?}: {e}"); return 1; }
+            };
+            match serde_json::from_str(&text) {
+                Ok(s) => s,
+                Err(e) => { eprintln!("invalid scenario JSON in {p:?}: {e}"); return 1; }
+            }
+        }
         None => kutsu::main_support::default_scenario(),
     };
 
