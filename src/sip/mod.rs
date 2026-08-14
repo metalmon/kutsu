@@ -12,6 +12,13 @@
 mod call;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+
+use bytes::Bytes;
+use tokio::sync::{mpsc, oneshot};
 
 /// Errors from the SIP transport layer.
 #[derive(Debug, thiserror::Error)]
@@ -92,6 +99,189 @@ pub(crate) fn plain_rtp_g711_config() -> ezk_rtc::sdp::SdpSessionConfig {
     }
 }
 
+/// A live outbound call. All fields are Send; the ezk `Call` loop runs on the
+/// SIP runtime thread and communicates only through these channels.
+pub struct SipCall {
+    pub call_id: String,
+    events: mpsc::Receiver<SipEvent>,
+    rtp_in: mpsc::Receiver<Bytes>,
+    rtp_out: mpsc::Sender<Bytes>,
+    hangup: Option<oneshot::Sender<()>>,
+}
+
+impl SipCall {
+    /// Lifecycle events (`Ringing` / `Answered` / `Terminated`).
+    pub fn events(&mut self) -> &mut mpsc::Receiver<SipEvent> {
+        &mut self.events
+    }
+
+    /// Inbound G.711 payloads (remote → us), one RTP payload per item.
+    pub fn audio_in(&mut self) -> &mut mpsc::Receiver<Bytes> {
+        &mut self.rtp_in
+    }
+
+    /// Outbound G.711 payload sink (us → remote). Clone to share.
+    pub fn audio_out(&self) -> mpsc::Sender<Bytes> {
+        self.rtp_out.clone()
+    }
+
+    /// Hang up (send BYE) and wait for termination.
+    pub async fn hangup(mut self) {
+        if let Some(h) = self.hangup.take() {
+            let _ = h.send(());
+        }
+        while let Some(ev) = self.events.recv().await {
+            if matches!(ev, SipEvent::Terminated(_)) {
+                break;
+            }
+        }
+    }
+
+    /// Assemble a handle from channel ends (called by `run_call`, Task 5).
+    pub(crate) fn from_parts(
+        call_id: String,
+        events: mpsc::Receiver<SipEvent>,
+        rtp_in: mpsc::Receiver<Bytes>,
+        rtp_out: mpsc::Sender<Bytes>,
+        hangup: oneshot::Sender<()>,
+    ) -> Self {
+        Self { call_id, events, rtp_in, rtp_out, hangup: Some(hangup) }
+    }
+}
+
+/// Command sent from `SipTransport` to the SIP runtime thread.
+enum Cmd {
+    Place {
+        number: String,
+        reply: oneshot::Sender<Result<SipCall, SipError>>,
+    },
+    Shutdown,
+}
+
+struct Shared {
+    cmd_tx: mpsc::Sender<Cmd>,
+    active: Arc<AtomicUsize>,
+    join: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+/// Process-wide SIP transport. Cheap to clone. Owns the ezk endpoint, which
+/// lives on a dedicated single-threaded runtime so all `!Send` ezk state stays
+/// off the caller's runtime.
+#[derive(Clone)]
+pub struct SipTransport {
+    inner: Arc<Shared>,
+}
+
+impl SipTransport {
+    /// Start the SIP runtime thread, bind the UDP transport, build the endpoint.
+    pub async fn new(cfg: &crate::config::SipConfig) -> Result<Self, SipError> {
+        let server: SocketAddr = cfg
+            .server
+            .parse()
+            .map_err(|_| SipError::Config("server must be host:port"))?;
+        let local_ip = match cfg.local_ip {
+            Some(ip) => ip,
+            None => detect_local_ip(server).map_err(SipError::Bind)?,
+        };
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), SipError>>();
+        let active = Arc::new(AtomicUsize::new(0));
+
+        let cfg_owned = cfg.clone();
+        let active_thread = active.clone();
+        let join = std::thread::Builder::new()
+            .name("kutsu-sip".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build sip runtime");
+                let local = tokio::task::LocalSet::new();
+                local.block_on(
+                    &rt,
+                    sip_thread_main(cfg_owned, server, local_ip, cmd_rx, active_thread, ready_tx),
+                );
+            })
+            .map_err(SipError::Bind)?;
+
+        // Wait for the thread to report the endpoint bind result.
+        ready_rx.await.map_err(|_| SipError::RuntimeGone)??;
+
+        Ok(Self {
+            inner: Arc::new(Shared {
+                cmd_tx,
+                active,
+                join: Mutex::new(Some(join)),
+            }),
+        })
+    }
+
+    /// Number of currently active calls (for `engine` to gate the cap).
+    pub fn active_calls(&self) -> usize {
+        self.inner.active.load(Ordering::Relaxed)
+    }
+
+    /// Place an outbound call to `number`. Resolves once the dialog is
+    /// established; ringing/answer/teardown then arrive on `SipCall::events`.
+    pub async fn place_call(&self, number: &str) -> Result<SipCall, SipError> {
+        let (reply, rx) = oneshot::channel();
+        self.inner
+            .cmd_tx
+            .send(Cmd::Place {
+                number: number.to_owned(),
+                reply,
+            })
+            .await
+            .map_err(|_| SipError::RuntimeGone)?;
+        rx.await.map_err(|_| SipError::RuntimeGone)?
+    }
+
+    /// Terminate active calls and stop the runtime thread.
+    pub async fn shutdown(self) {
+        let _ = self.inner.cmd_tx.send(Cmd::Shutdown).await;
+        let handle = self.inner.join.lock().unwrap().take();
+        if let Some(h) = handle {
+            let _ = tokio::task::spawn_blocking(move || h.join()).await;
+        }
+    }
+}
+
+/// SIP runtime thread entry point: build the endpoint, then serve commands.
+async fn sip_thread_main(
+    cfg: crate::config::SipConfig,
+    server: SocketAddr,
+    local_ip: IpAddr,
+    mut cmd_rx: mpsc::Receiver<Cmd>,
+    active: Arc<AtomicUsize>,
+    ready_tx: oneshot::Sender<Result<(), SipError>>,
+) {
+    let (endpoint, bound) = match call::build_endpoint(local_ip).await {
+        Ok(pair) => {
+            let _ = ready_tx.send(Ok(()));
+            pair
+        }
+        Err(e) => {
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+    };
+
+    let mut seq: u64 = 0;
+    while let Some(cmd) = cmd_rx.recv().await {
+        match cmd {
+            Cmd::Place { number, reply } => {
+                seq += 1;
+                let call_id = format!("kutsu-{seq}");
+                // TODO(Task 5): spawn_local(run_call(...)). Placeholder keeps it compiling.
+                let _ = (server, bound, &cfg, &endpoint, &number, &call_id, &active);
+                let _ = reply.send(Err(SipError::Config("call setup not implemented")));
+            }
+            Cmd::Shutdown => break,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +315,21 @@ mod tests {
         // Loopback target -> loopback source; proves the connect() trick works.
         let ip = detect_local_ip("127.0.0.1:5060".parse().unwrap()).unwrap();
         assert!(ip.is_loopback());
+    }
+
+    #[tokio::test]
+    async fn transport_binds_loopback_and_reports_zero_calls() {
+        let cfg = crate::config::SipConfig {
+            server: "127.0.0.1:5060".into(),
+            username: "u".into(),
+            password: "p".into(),
+            from_user: None,
+            local_ip: Some("127.0.0.1".parse().unwrap()),
+            register: false,
+            transport: Default::default(),
+        };
+        let t = SipTransport::new(&cfg).await.expect("bind");
+        assert_eq!(t.active_calls(), 0);
+        t.shutdown().await;
     }
 }
