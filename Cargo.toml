@@ -57,3 +57,11 @@ live-tests = []
 
 [dev-dependencies]
 tempfile = "3"
+# Phase-1 SIP spike only (tests/sip_spike.rs). These pull the lower ezk layers
+# directly so the throwaway probe can build an Endpoint + digest auth without
+# waiting on the real sip.rs. Versions match what ezk-sip-ua/ezk-rtc already lock.
+bytes = "1"
+bytesstr = "1"
+ezk-sip-core = "0.9"
+ezk-sip-auth = "0.5"
+ezk-sip-types = "0.6"
