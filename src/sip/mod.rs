@@ -49,24 +49,33 @@ pub enum G711Kind {
 /// Codec negotiated for a call (what `bridge` needs to decode/encode).
 #[derive(Debug, Clone, Copy)]
 pub struct NegotiatedCodec {
+    /// RTP payload type negotiated for this call (0=PCMU, 8=PCMA).
     pub pt: u8,
+    /// G.711 flavour matching `pt`.
     pub kind: G711Kind,
+    /// Packetization interval in milliseconds.
     pub ptime_ms: u32,
 }
 
 /// Why a call ended.
 #[derive(Debug, Clone)]
 pub enum TermReason {
+    /// The remote party (or trunk) ended the call.
     RemoteHangup,
+    /// We ended the call via `SipCall::hangup()`.
     LocalHangup,
+    /// The call failed before or during setup/teardown; reason in the string.
     Failed(String),
 }
 
 /// Lifecycle event for a live call.
 #[derive(Debug, Clone)]
 pub enum SipEvent {
+    /// Remote is alerting (183/180-style ringing).
     Ringing,
+    /// Call was answered; carries the negotiated codec.
     Answered { codec: NegotiatedCodec },
+    /// Call has ended; carries the reason.
     Terminated(TermReason),
 }
 
@@ -237,7 +246,11 @@ impl SipTransport {
         rx.await.map_err(|_| SipError::RuntimeGone)?
     }
 
-    /// Terminate active calls and stop the runtime thread.
+    /// Stop the runtime thread. In-flight calls are dropped — ezk's `Call`
+    /// teardown makes a best-effort BYE, but graceful drain is not guaranteed
+    /// on shutdown. The engine, which owns per-call lifecycle, should
+    /// `SipCall::hangup()` each active call before calling this. (Graceful
+    /// shutdown-time BYE draining is a future enhancement.)
     pub async fn shutdown(self) {
         let _ = self.inner.cmd_tx.send(Cmd::Shutdown).await;
         let handle = self.inner.join.lock().unwrap().take();

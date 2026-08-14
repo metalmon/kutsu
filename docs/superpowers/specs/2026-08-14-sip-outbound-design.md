@@ -246,7 +246,10 @@ Wire into the crate `Error` enum: `#[error("sip error: {0}")] Sip(#[from] SipErr
 - `sip` does **not** enforce the concurrency cap (existing note: the cap is
   "enforced in phase 4/5" by `engine`). `sip` exposes an accurate active-call
   count (`SipTransport::active_calls() -> usize`) for `engine` to gate on.
-- `shutdown` terminates active calls (BYE) and joins the thread.
+- `shutdown` stops the runtime thread and joins it. In-flight calls are dropped
+  (ezk `Call` teardown attempts a best-effort BYE, not guaranteed on shutdown);
+  the engine should `hangup()` active calls first. Graceful shutdown-time BYE
+  draining is a future seam.
 
 ## 10. Testing
 

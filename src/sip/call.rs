@@ -159,33 +159,46 @@ pub(crate) async fn run_call(
     let mut sender = None;
     let mut receiver = None;
     let mut codec = None;
+    let media_deadline = tokio::time::sleep(std::time::Duration::from_secs(10));
+    tokio::pin!(media_deadline);
     while sender.is_none() || receiver.is_none() {
-        match call.run().await {
-            Ok(CallEvent::Internal(e)) => {
-                if call.handle_internal_event(e).await.is_err() {
+        tokio::select! {
+            r = call.run() => match r {
+                Ok(CallEvent::Internal(e)) => {
+                    if call.handle_internal_event(e).await.is_err() {
+                        let _ = ev_tx
+                            .send(SipEvent::Terminated(TermReason::Failed("internal".into())))
+                            .await;
+                        return;
+                    }
+                }
+                Ok(CallEvent::Media(MediaEvent::SenderAdded { sender: s, codec: c })) => {
+                    codec = Some(neg_codec(&c));
+                    sender = Some(s);
+                }
+                Ok(CallEvent::Media(MediaEvent::ReceiverAdded { receiver: r, .. })) => {
+                    receiver = Some(r);
+                }
+                Ok(CallEvent::Terminated) => {
                     let _ = ev_tx
-                        .send(SipEvent::Terminated(TermReason::Failed("internal".into())))
+                        .send(SipEvent::Terminated(TermReason::RemoteHangup))
                         .await;
                     return;
                 }
-            }
-            Ok(CallEvent::Media(MediaEvent::SenderAdded { sender: s, codec: c })) => {
-                codec = Some(neg_codec(&c));
-                sender = Some(s);
-            }
-            Ok(CallEvent::Media(MediaEvent::ReceiverAdded { receiver: r, .. })) => {
-                receiver = Some(r);
-            }
-            Ok(CallEvent::Terminated) => {
+                Err(e) => {
+                    let _ = ev_tx
+                        .send(SipEvent::Terminated(TermReason::Failed(e.to_string())))
+                        .await;
+                    return;
+                }
+            },
+            _ = &mut media_deadline => {
                 let _ = ev_tx
-                    .send(SipEvent::Terminated(TermReason::RemoteHangup))
+                    .send(SipEvent::Terminated(TermReason::Failed(
+                        "answered but media was not negotiated in time".into(),
+                    )))
                     .await;
-                return;
-            }
-            Err(e) => {
-                let _ = ev_tx
-                    .send(SipEvent::Terminated(TermReason::Failed(e.to_string())))
-                    .await;
+                let _ = call.terminate().await;
                 return;
             }
         }
