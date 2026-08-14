@@ -11,6 +11,9 @@ use clap::{Parser, Subcommand};
     about = "Outbound SIP calling MCP server, bridging phone calls to Gemini Live"
 )]
 struct Cli {
+    /// Log output format: text (dev, default) or json (machine-parseable / SIEM).
+    #[arg(long = "log-format", env = "KUTSU_LOG_FORMAT", default_value = "text", global = true)]
+    log_format: String,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -74,15 +77,15 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .try_init();
-
     let cli = Cli::parse();
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr);
+    match cli.log_format.as_str() {
+        "json" => { let _ = builder.json().try_init(); }
+        _ => { let _ = builder.try_init(); }
+    }
     match cli.command {
         Some(Command::Mcp { transport, bind, auth_token }) => {
             let rt = tokio::runtime::Runtime::new()?;
