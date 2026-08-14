@@ -31,14 +31,17 @@ async fn outbound_echo_600_bidirectional_rtp() {
         .await
         .expect("place_call");
 
-    // Wait for answer (skip ringing).
-    let codec = loop {
-        match call.events().recv().await.expect("event stream open") {
-            SipEvent::Ringing => continue,
-            SipEvent::Answered { codec } => break codec,
-            SipEvent::Terminated(r) => panic!("terminated before answer: {r:?}"),
+    // Wait for answer, bounded so a dead stand fails fast instead of hanging.
+    let codec = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            match call.events().recv().await.expect("event stream open") {
+                SipEvent::Answered { codec } => break codec,
+                SipEvent::Terminated(r) => panic!("terminated before answer: {r:?}"),
+            }
         }
-    };
+    })
+    .await
+    .expect("no answer within 15s");
     assert!(matches!(codec.kind, G711Kind::Ulaw | G711Kind::Alaw));
 
     // Send ~150 frames of G.711 silence while counting echoed frames.

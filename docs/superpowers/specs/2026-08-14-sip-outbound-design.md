@@ -129,10 +129,13 @@ impl SipCall {
 }
 
 pub enum SipEvent {
-    Ringing,                              // 0+ provisional responses (180/183)
     Answered { codec: NegotiatedCodec },  // 200 OK + ACK; codec negotiated at answer
     Terminated(TermReason),               // remote BYE / our BYE / media/transport failure
 }
+// No explicit Ringing event: ezk's high-level OutboundCall doesn't surface 18x
+// provisionals, and the state is distinguishable anyway — place_call returned
+// with no Answered yet = ringing/dialing; Err(Invite)=busy/rejected;
+// Err(NotAnswered)=timeout.
 
 pub enum TermReason { RemoteHangup, LocalHangup, Failed(String) }
 
@@ -142,12 +145,12 @@ pub enum G711Kind { Ulaw /* pt 0 */, Alaw /* pt 8 */ }
 
 Notes:
 - `place_call` resolves as soon as the INVITE is accepted into a dialog and the
-  worker is spawned; all of `Ringing` / `Answered { codec }` / `Terminated` then
-  flow through `events`. Rationale: `state` tracks a `ringing → in_progress`
-  lifecycle, and the codec is only known at answer, so answer must be an event
-  carrying the codec — not a construction-time field. The engine's flow: `let
-  call = place_call().await?;` then consume `events` until `Answered` (start
-  bridging, using `codec` to pick µ-law/a-law) or `Terminated`.
+  worker is spawned; `Answered { codec }` / `Terminated` then flow through
+  `events`. Rationale: the codec is only known at answer, so answer must be an
+  event carrying the codec — not a construction-time field. The engine's flow:
+  `let call = place_call().await?;` (this is the ringing/dialing state) then
+  consume `events` until `Answered` (start bridging, using `codec` to pick
+  µ-law/a-law) or `Terminated`.
 - Backpressure: `rtp_in`/`rtp_out` are bounded mpsc (e.g. cap 64 ≈ 1.3 s of
   20 ms frames). If `bridge` stalls, inbound frames drop (logged) rather than
   unbounded-buffer; outbound `send` awaits, naturally pacing the bridge.

@@ -69,10 +69,14 @@ pub enum TermReason {
 }
 
 /// Lifecycle event for a live call.
+///
+/// Note there is no explicit "ringing" event: ezk's high-level `OutboundCall`
+/// does not surface provisional (18x) responses, and the state is already
+/// distinguishable without one — `place_call` returning `Ok` with no `Answered`
+/// yet is the ringing/dialing state; `Answered` is in-progress; an `Err` from
+/// `place_call` is busy/rejected (`Invite`) or no-answer/timeout (`NotAnswered`).
 #[derive(Debug, Clone)]
 pub enum SipEvent {
-    /// Remote is alerting (183/180-style ringing).
-    Ringing,
     /// Call was answered; carries the negotiated codec.
     Answered { codec: NegotiatedCodec },
     /// Call has ended; carries the reason.
@@ -255,7 +259,11 @@ impl SipTransport {
         let _ = self.inner.cmd_tx.send(Cmd::Shutdown).await;
         let handle = self.inner.join.lock().unwrap().take();
         if let Some(h) = handle {
-            let _ = tokio::task::spawn_blocking(move || h.join()).await;
+            match tokio::task::spawn_blocking(move || h.join()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => tracing::error!("SIP runtime thread panicked during shutdown"),
+                Err(e) => tracing::error!(error = %e, "failed to join SIP runtime thread"),
+            }
         }
     }
 }
