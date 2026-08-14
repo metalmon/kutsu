@@ -659,26 +659,30 @@ async fn run_call(
 
     // 7. Orchestration loop.
     let mut goal = None;
-    let mut greeted = false;
+    let mut first_transcript = false;
     let deadline = tokio::time::sleep(Duration::from_secs(server.max_call_secs));
     tokio::pin!(deadline);
     let end_state = loop {
         tokio::select! {
             ev = events_out_rx.recv() => match ev {
+                // NOTE: the bridge CONSUMES OutputAudio and Interrupted (they never
+                // reach events_out); it forwards only Transcript/TurnComplete/EndCall/
+                // Warning. So the earliest agent-activity signal the engine can observe
+                // is the first Transcript (a proxy for greeting time — true audio-onset
+                // timing would need a bridge-level stamp, deferred).
                 Some(Event::Transcript { role, text, final_ }) => {
+                    if !first_transcript {
+                        first_transcript = true;
+                        tracing::info!(%call_id, first_transcript_after_answer_ms = now_ms() - answered_at, "first transcript after answer");
+                    }
                     if final_ {
                         store.append_transcript(&call_id, TranscriptEntry { role, text, ts_ms: now_ms() });
-                    }
-                }
-                Some(Event::OutputAudio(_)) => {
-                    if !greeted {
-                        greeted = true;
-                        tracing::info!(%call_id, greeting_after_answer_ms = now_ms() - answered_at, "first agent audio");
                     }
                 }
                 Some(Event::EndCall { goal: g }) => { goal = Some(g); break CallState::Completed; }
                 Some(Event::TurnComplete) => {}
                 Some(Event::Warning(w)) => tracing::warn!(%call_id, "gemini warning: {w}"),
+                Some(_) => {} // OutputAudio/Interrupted: consumed by the bridge, not forwarded
                 None => {} // bridge dropped events_out; the bridge_task arm will fire
             },
             r = sip_events.recv() => match r {
