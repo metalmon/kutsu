@@ -5,6 +5,50 @@
 //! future `place_call` per-task arguments.
 
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
+
+/// Signaling/media transport for the SIP trunk. Only `Udp` is implemented this
+/// iteration; `Tls` is a documented extension seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SipTransportKind {
+    #[default]
+    Udp,
+    Tls,
+}
+
+/// Outbound SIP trunk configuration.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SipConfig {
+    /// SIP server / trunk as `host:port`.
+    pub server: String,
+    /// Digest username (also the default caller identity).
+    pub username: String,
+    /// Digest password.
+    pub password: String,
+    /// From-header user-part. Defaults to `username` when absent.
+    #[serde(default)]
+    pub from_user: Option<String>,
+    /// Local IP to bind + advertise in SDP. Auto-detected (route toward
+    /// `server`) when absent.
+    #[serde(default)]
+    pub local_ip: Option<IpAddr>,
+
+    // --- extension seams; parsed but not yet wired ---
+    /// Send a REGISTER binding before calling. Not yet implemented.
+    #[serde(default)]
+    pub register: bool,
+    /// Transport kind. Only `Udp` implemented. Not yet wired.
+    #[serde(default)]
+    pub transport: SipTransportKind,
+}
+
+impl SipConfig {
+    /// Caller identity user-part: explicit `from_user`, else the digest username.
+    pub fn from_user(&self) -> &str {
+        self.from_user.as_deref().unwrap_or(&self.username)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -99,5 +143,23 @@ mod tests {
         assert_eq!(serde_json::to_string(&Model::NativeAudio).unwrap(), "\"native-audio\"");
         let m: Model = serde_json::from_str("\"half-cascade\"").unwrap();
         assert!(matches!(m, Model::HalfCascade));
+    }
+
+    #[test]
+    fn sip_config_parses_and_from_user_defaults_to_username() {
+        let json = r#"{"server":"192.168.88.243:5060","username":"kutsu","password":"kutsupw"}"#;
+        let c: SipConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.server, "192.168.88.243:5060");
+        assert_eq!(c.from_user(), "kutsu");
+        assert_eq!(c.transport, SipTransportKind::Udp);
+        assert!(!c.register);
+        assert!(c.local_ip.is_none());
+    }
+
+    #[test]
+    fn sip_config_from_user_override() {
+        let json = r#"{"server":"s:5060","username":"u","password":"p","from_user":"caller"}"#;
+        let c: SipConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.from_user(), "caller");
     }
 }
