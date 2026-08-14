@@ -17,10 +17,16 @@
 //! dropped `tasks/list` for the same reason.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock, CreateTaskResult,
+    GetTaskParams, GetTaskResult, ServerCapabilities, ServerInfo, UpdateTaskParams,
+};
+use rmcp::service::{RequestContext, RoleServer};
+use rmcp::task_manager::{TaskExit, TaskManager, TaskOptions};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -33,6 +39,9 @@ use crate::engine::Engine;
 #[derive(Clone)]
 pub struct KutsuServer {
     engine: Arc<Engine>,
+    /// SEP-2663 Tasks runtime, backing the `place_call` task branch and the
+    /// `tasks/get|update|cancel` handler methods. Cheap to clone (Arc-backed).
+    tasks: Arc<TaskManager>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -61,8 +70,7 @@ fn unknown_call(id: &str) -> ErrorData {
 
 /// Map a [`CallState`] to its corresponding MCP [`TaskStatus`].
 ///
-/// Used by Task 9 (place_call task branch).
-#[allow(dead_code)]
+/// Used by the `place_call` task branch.
 fn task_status_for(state: crate::state::CallState) -> rmcp::model::TaskStatus {
     use crate::state::CallState;
     use rmcp::model::TaskStatus;
@@ -76,35 +84,135 @@ fn task_status_for(state: crate::state::CallState) -> rmcp::model::TaskStatus {
 
 /// Check if a [`CallState`] is terminal (not active).
 ///
-/// Used by Task 9 (place_call task branch).
-#[allow(dead_code)]
+/// Used by the `place_call` task branch.
 fn is_terminal_state(state: crate::state::CallState) -> bool {
     use crate::state::CallState;
     !matches!(state, CallState::Queued | CallState::Ringing | CallState::InProgress)
 }
 
+/// Poll the call store until `call_id` reaches a terminal [`CallState`],
+/// returning that state.
+///
+/// Pure watcher, factored out of the `place_call` task future so it can be
+/// unit-tested directly. It contains no MCP-task glue — the framework
+/// [`TaskContext`] plumbing (status messages, cooperative cancellation) wraps
+/// this in `place_call_inner`.
+async fn watch_call_to_terminal(engine: &Engine, call_id: &str) -> crate::state::CallState {
+    loop {
+        if let Some(rec) = engine.store().get(call_id) {
+            if is_terminal_state(rec.state) {
+                return rec.state;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 #[tool_router]
 impl KutsuServer {
     pub fn new(engine: Arc<Engine>) -> Self {
-        Self { engine, tool_router: Self::tool_router() }
+        Self { engine, tasks: Arc::new(TaskManager::new()), tool_router: Self::tool_router() }
     }
 
     #[tool(description = "Place an outbound phone call and bridge it to the AI agent. \
-        Returns a call_id immediately; the call runs in the background. Poll \
-        get_call_status until the state is terminal, then read get_call_transcript.")]
+        For task-capable clients this runs as an MCP task (poll tasks/get for the \
+        transcript+goal on completion). For plain clients it returns a call_id \
+        immediately; poll get_call_status until terminal, then get_call_transcript.")]
     async fn place_call(
         &self,
         Parameters(a): Parameters<PlaceCallArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        // Branch on the *current client's* declared tasks capability — the same
+        // signal the framework enforces at the call_tool boundary
+        // (`handler/server.rs`). A direct method call (e.g. Task 6/7 tests) has
+        // no RequestContext client capabilities and takes the immediate branch.
+        let client_supports_tasks =
+            context.client_capabilities().is_some_and(|c| c.supports_tasks());
+        self.place_call_inner(a, client_supports_tasks).await
+    }
+
+    /// Core of `place_call`, factored out so the capability decision is an
+    /// explicit `bool` and both branches are directly unit-testable without a
+    /// live [`RequestContext`].
+    async fn place_call_inner(
+        &self,
+        a: PlaceCallArgs,
+        client_supports_tasks: bool,
+    ) -> Result<CallToolResponse, ErrorData> {
         let scenario = ScenarioConfig {
             system_prompt: a.system_prompt,
             goal_schema: a.goal_schema,
             context: a.context,
         };
         let call_id = self.engine.place_call(a.to_number, scenario).await;
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            serde_json::json!({ "call_id": call_id }).to_string(),
-        )]))
+
+        // Plain clients: unchanged immediate `{call_id}` result (Task 6/7).
+        if !client_supports_tasks {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                serde_json::json!({ "call_id": call_id }).to_string(),
+            )])
+            .into());
+        }
+
+        // Task-capable clients: spawn an MCP task that drives the call to a
+        // terminal state, surfacing progress via status messages and honoring
+        // cooperative cancellation (which hangs up the underlying call).
+        let engine = self.engine.clone();
+        let cid = call_id.clone();
+        let task = self.tasks.spawn(TaskOptions::default(), move |ctx| {
+            Box::pin(async move {
+                let terminal = loop {
+                    // Publish the current human-readable status before waiting.
+                    if let Some(rec) = engine.store().get(&cid) {
+                        let status = task_status_for(rec.state);
+                        let msg = match engine.store().queued_position(&cid) {
+                            Some(pos) => format!("call {cid}: {status:?} (queue position {pos})"),
+                            None => format!("call {cid}: {status:?}"),
+                        };
+                        ctx.set_status_message(msg);
+                    }
+                    tokio::select! {
+                        // Reuse the pure watcher for terminal detection.
+                        state = watch_call_to_terminal(&engine, &cid) => break state,
+                        // Cooperative cancellation: hang up, settle as cancelled.
+                        _ = ctx.cancelled() => {
+                            engine.end_call(&cid);
+                            return Err(TaskExit::Cancelled);
+                        }
+                        // Otherwise wake periodically to refresh the status.
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                    }
+                };
+
+                use crate::state::CallState;
+                match terminal {
+                    CallState::Completed | CallState::HungUp => {
+                        let body = engine
+                            .store()
+                            .get(&cid)
+                            .map(|r| serde_json::json!({ "transcript": r.transcript, "goal": r.goal }))
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        Ok(CallToolResult::success(vec![ContentBlock::text(body.to_string())]))
+                    }
+                    CallState::Failed => {
+                        let msg = engine
+                            .store()
+                            .get(&cid)
+                            .and_then(|r| r.error)
+                            .unwrap_or_else(|| "call failed".to_string());
+                        Err(TaskExit::Error(ErrorData::internal_error(msg, None)))
+                    }
+                    CallState::Cancelled => Err(TaskExit::Cancelled),
+                    // watch_call_to_terminal only returns terminal states.
+                    other => Err(TaskExit::Error(ErrorData::internal_error(
+                        format!("unexpected non-terminal state: {other:?}"),
+                        None,
+                    ))),
+                }
+            })
+        });
+        Ok(CallToolResponse::Task(CreateTaskResult::new(task)))
     }
 
     #[tool(description = "Get the current state of a call by call_id (lightweight; no transcript).")]
@@ -158,10 +266,41 @@ impl ServerHandler for KutsuServer {
         // 3.1.2, so struct-literal construction (even with
         // `..Default::default()`) is rejected outside the defining crate;
         // use its builder methods instead.
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Outbound calling: place_call → poll get_call_status → \
-             get_call_transcript; end_call to hang up.",
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_tasks().build())
+            .with_instructions(
+                "Outbound calling: place_call → poll get_call_status → \
+                 get_call_transcript; end_call to hang up. Task-capable clients \
+                 may instead auto-poll place_call as an MCP task.",
+            )
+    }
+
+    // SEP-2663 task methods. The framework has no `task_manager()` hook in
+    // rmcp 3.1.2 — the default `get_task`/`update_task`/`cancel_task` return
+    // `method_not_found`, so we override all three to delegate to our
+    // [`TaskManager`]. The `tasks/*` capability gate in `handler/server.rs`
+    // guards these before dispatch.
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, ErrorData> {
+        self.tasks.get_task(&request.task_id).map(GetTaskResult::new)
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.tasks.update_task(&request.task_id, request.input_responses)
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.tasks.cancel_task(&request.task_id)
     }
 }
 
@@ -206,6 +345,23 @@ mod tests {
         }
     }
 
+    /// Unwrap the immediate (non-task) branch of a `place_call` response.
+    fn complete(r: CallToolResponse) -> CallToolResult {
+        match r {
+            CallToolResponse::Complete(x) => x,
+            _ => panic!("expected an immediate Complete response"),
+        }
+    }
+
+    fn args(to: &str) -> PlaceCallArgs {
+        PlaceCallArgs {
+            to_number: to.into(),
+            system_prompt: "hi".into(),
+            goal_schema: serde_json::json!({ "type": "object" }),
+            context: None,
+        }
+    }
+
     #[tokio::test]
     async fn lists_exactly_four_tools() {
         let engine = test_engine(1).await;
@@ -223,15 +379,8 @@ mod tests {
         let engine = Arc::new(test_engine(1).await);
         let srv = KutsuServer::new(engine.clone());
 
-        let out = srv
-            .place_call(Parameters(PlaceCallArgs {
-                to_number: "600".into(),
-                system_prompt: "hi".into(),
-                goal_schema: serde_json::json!({"type": "object"}),
-                context: None,
-            }))
-            .await
-            .unwrap();
+        // Direct call: no client capability → immediate `{call_id}` branch.
+        let out = complete(srv.place_call_inner(args("600"), false).await.unwrap());
         let text = first_text(&out);
         let call_id =
             serde_json::from_str::<serde_json::Value>(&text).unwrap()["call_id"].as_str().unwrap().to_string();
@@ -284,5 +433,48 @@ mod tests {
         assert!(!is_terminal_state(S::Queued));
         assert!(is_terminal_state(S::Completed));
         assert!(is_terminal_state(S::Cancelled));
+    }
+
+    /// The pure watcher must return the terminal state a call settles into.
+    /// cap-0 parks the call in `Queued`; a delayed `end_call` flips it to
+    /// `Cancelled`, and the watcher must resolve with `Cancelled`.
+    #[tokio::test]
+    async fn watch_call_to_terminal_returns_cancelled() {
+        use crate::state::CallState;
+        let engine = Arc::new(test_engine(0).await);
+        let call_id = engine
+            .place_call("600".into(), ScenarioConfig {
+                system_prompt: "hi".into(),
+                goal_schema: serde_json::json!({ "type": "object" }),
+                context: None,
+            })
+            .await;
+        assert_eq!(engine.store().get(&call_id).unwrap().state, CallState::Queued);
+
+        // Cancel shortly after the watcher begins polling.
+        let e2 = engine.clone();
+        let id2 = call_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            e2.end_call(&id2);
+        });
+
+        let terminal = watch_call_to_terminal(&engine, &call_id).await;
+        assert!(matches!(terminal, CallState::Cancelled), "got {terminal:?}");
+    }
+
+    /// A task-capable branch returns a `CallToolResponse::Task` handle rather
+    /// than the immediate `{call_id}` result.
+    #[tokio::test]
+    async fn place_call_task_branch_returns_task_handle() {
+        // cap-0 parks the call in Queued so no real INVITE is attempted.
+        let engine = Arc::new(test_engine(0).await);
+        let srv = KutsuServer::new(engine);
+
+        let resp = srv.place_call_inner(args("600"), true).await.unwrap();
+        assert!(matches!(resp, CallToolResponse::Task(_)));
+
+        // Abort the background watcher task so it stops touching the engine.
+        srv.tasks.shutdown();
     }
 }
