@@ -193,6 +193,45 @@ deferred silently.
   `end_call` every active call first (SIP shutdown is abrupt/best-effort BYE —
   the engine must hang up calls before `sip.shutdown()`), then
   `engine.shutdown()`.
+
+### Security hardening (IB baseline)
+
+Distilled from an internal information-security baseline; only the low-cost
+items that touch the phase-5 surface — persisted transcripts are PII (phone
+number, full conversation, goal), so these are real gaps in what we build now,
+not future scope.
+
+- **Default bind `127.0.0.1`** (already the default) — the baseline names a
+  loopback default as the correct network posture; exposure is opt-in via
+  `--bind`.
+- **Transcript file permissions.** The `transcript_dir` JSON written by
+  `run_call` (`std::fs::write`) holds PII; write it with owner-only permissions
+  (unix `0o600` via `OpenOptions`; on Windows, rely on the directory ACL and
+  document that the operator must place `transcript_dir` outside world-readable
+  paths). Applies to the `engine.rs` persist step, not `mcp.rs`.
+- **Secret / PII logging discipline.** Never log `api_key`, `--auth-token` /
+  `KUTSU_MCP_TOKEN`, the SIP password, or transcript text at `info`. Tracing
+  stays at `info` by default (debug/trace off); the auth middleware must not log
+  the presented token. A `#[derive(Debug)]` on any struct holding a secret must
+  redact it (manual `Debug` or `secrecy`-style wrapper) — audited during
+  implementation.
+- **Bearer token on the http transport** — see `--auth-token` above; the
+  baseline frames network integrations as needing a separate limited-access
+  credential, which the token provides for the non-loopback case.
+
+### Future security scope (named, not phase-5)
+
+- Structured **security-event audit log** (categories auth / rights / accounts /
+  admin; fields type/time/source/result/subject; export to SIEM via OTLP or
+  webhook) — an observability-phase concern.
+- **OIDC / IdP integration + RBAC / per-caller authorization** — a whole future
+  subsystem; the dropped observer-profile / "service principal with a narrow
+  profile" idea belongs here.
+- **Idle-session timeout** — distinct from the existing `max_call_secs`
+  call-duration cap.
+- **Cloud egress in an on-prem contour** — kutsu reaches Gemini via proxy; in a
+  strict isolated-network deployment this is an operator/deployment flag, not
+  code.
 - **CLI:** the existing `Mcp { transport, bind }` branch (currently a stub) is
   implemented: assemble `ServerConfig` + `SipConfig` from env/config, build
   `Engine::new`, start the chosen transport, await shutdown. Add `--auth-token`.
@@ -233,7 +272,10 @@ Kept `#[ignore]` like the other live tests.
 - `src/engine.rs`: `permits` + `cancels` fields; rewrite the cap path to a
   semaphore acquire inside `run_call`; add cancel selects in both phases; remove
   `SlotGuard` (superseded by the owned permit); add `Engine::end_call`; remove
-  `EngineError::CapReached` and its cap-reject test.
+  `EngineError::CapReached` and its cap-reject test; write the transcript JSON
+  with owner-only permissions (Security hardening).
+- Logging: audit `Debug`/`tracing` sites for secret/PII leakage (Security
+  hardening) across `mcp.rs`, `main.rs`, `engine.rs`.
 - `src/mcp.rs`: implement the handler, four tools, task mapping, errors, `get_info`.
 - `src/main.rs`: implement the `Mcp` branch; add `--auth-token`.
 - `Cargo.toml`: confirm `tokio-util` (CancellationToken) availability; add if not
