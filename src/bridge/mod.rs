@@ -8,3 +8,4 @@
 
 mod g711;
 mod resample;
+mod pace;
