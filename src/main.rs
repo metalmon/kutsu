@@ -25,6 +25,9 @@ enum Command {
         /// Bind address for the `streamable-http` transport.
         #[arg(long, default_value = "127.0.0.1:8090", env = "KUTSU_MCP_BIND")]
         bind: String,
+        /// Bearer token required on the streamable-http transport (env KUTSU_MCP_TOKEN).
+        #[arg(long = "auth-token", env = "KUTSU_MCP_TOKEN")]
+        auth_token: Option<String>,
     },
     /// Run one conversation against Gemini Live from a scenario + audio file (dev harness).
     Live {
@@ -81,12 +84,9 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Mcp { transport, bind }) => {
-            let _ = (transport, bind);
-            anyhow::bail!(
-                "kutsu {} — MCP server not implemented yet (scaffold stage)",
-                kutsu::version()
-            );
+        Some(Command::Mcp { transport, bind, auth_token }) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(run_mcp(transport, bind, auth_token))
         }
         Some(Command::Live {
             scenario,
@@ -120,6 +120,68 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Run the MCP server: build the engine from env config, serve the chosen
+/// transport until it returns (client disconnect / EOF for stdio, a shutdown
+/// signal for streamable-http — see [`kutsu::mcp_http::shutdown_signal`]),
+/// then hang up any still-live calls and best-effort shut down the engine.
+async fn run_mcp(transport: String, bind: String, auth_token: Option<String>) -> anyhow::Result<()> {
+    let (server_cfg, sip_cfg) = kutsu::main_support::configs_from_env()?;
+    let engine = std::sync::Arc::new(
+        kutsu::engine::Engine::new(std::sync::Arc::new(server_cfg), &sip_cfg).await?,
+    );
+
+    match transport.as_str() {
+        "stdio" => {
+            use rmcp::{transport::io::stdio, ServiceExt};
+            let handler = kutsu::mcp::KutsuServer::new(engine.clone());
+            let service = handler.serve(stdio()).await?;
+            service.waiting().await?;
+        }
+        "streamable-http" => {
+            // rmcp's default StreamableHttpServerConfig::allowed_hosts is
+            // loopback-only, so a non-loopback --bind will have its /mcp
+            // requests Host-rejected unless something in front of it (a
+            // reverse proxy) rewrites the Host header to a loopback value.
+            // This is informational only — we still bind and serve.
+            let is_loopback =
+                bind.starts_with("127.") || bind.starts_with("localhost") || bind.starts_with("[::1]");
+            if !is_loopback {
+                tracing::warn!(
+                    %bind,
+                    "streamable-http bound to a non-loopback address; rmcp's default \
+                     allowed_hosts is loopback-only, so /mcp requests may be rejected \
+                     unless fronted by a reverse proxy that sets a loopback Host header"
+                );
+            }
+            kutsu::mcp_http::serve(engine.clone(), &bind, auth_token).await?;
+        }
+        other => anyhow::bail!("unknown transport: {other}"),
+    }
+
+    // Graceful teardown after the transport returns: hang up every live call
+    // first so callees get a BYE rather than a silently dropped RTP stream.
+    for rec in engine.store().list() {
+        engine.end_call(&rec.call_id);
+    }
+    // end_call only signals teardown (it returns immediately); give the
+    // per-call run_call task a brief moment to process the hangup before we
+    // try to reclaim the engine below.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Engine::shutdown consumes `self`, so it only runs here if this is the
+    // last surviving Arc<Engine> clone. The streamable-http path hands
+    // clones into StreamableHttpService's per-session closures, which are
+    // owned by the axum app/listener; those are dropped when `serve` above
+    // returns, but a lingering clone (e.g. an in-flight request handler that
+    // hasn't unwound yet) can make try_unwrap fail. That's fine — this is
+    // best-effort cleanup, not correctness-critical: process exit reclaims
+    // the SIP transport (sockets, tasks) regardless.
+    if let Ok(e) = std::sync::Arc::try_unwrap(engine) {
+        e.shutdown().await;
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
