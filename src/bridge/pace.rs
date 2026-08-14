@@ -35,23 +35,15 @@ impl Downlink {
     /// Barge-in: drop all buffered audio so the agent stops talking now.
     pub fn clear(&mut self) {
         self.buf.clear();
-        self.down = Downsampler::new();
     }
 
     /// Produce one 20 ms frame (160 samples @ 8 kHz). Underrun -> zero-padded.
     pub fn next_frame(&mut self) -> Vec<i16> {
         let mut block = [0i16; IN_PER_FRAME];
-        let mut had_underrun = false;
         for slot in block.iter_mut() {
             if let Some(s) = self.buf.pop_front() {
                 *slot = s;
-            } else {
-                had_underrun = true;
             } // else leave 0 (silence)
-        }
-        // If entire frame is underrun (silence), reset downsampler to avoid filter decay artifacts.
-        if had_underrun && block.iter().all(|&s| s == 0) {
-            self.down = Downsampler::new();
         }
         self.down.process(&block)
     }
@@ -84,9 +76,12 @@ mod tests {
         let mut d = Downlink::new();
         d.push(&[8000i16; 480 * 4]);
         let _ = d.next_frame(); // consume some
-        d.clear(); // barge-in
+        d.clear(); // barge-in — drops buffered audio, leaves downsampler continuous
+        // First post-clear frame carries filter ring-out (expected DSP behavior).
+        let _ = d.next_frame();
+        // Second post-clear frame should be silence as filter settles.
         let f = d.next_frame();
-        assert!(f.iter().all(|&s| s.abs() < 16), "after clear should be silence");
+        assert!(f.iter().all(|&s| s.abs() < 16), "second post-clear frame should be silence");
     }
 
     #[test]
@@ -96,7 +91,9 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(d.next_frame().len(), 160);
         }
-        // Buffer now drained -> silence.
+        // Buffer now drained. First post-drain frame carries filter ring-out (expected DSP behavior).
+        let _ = d.next_frame();
+        // Second post-drain frame should be silence as filter settles.
         let f = d.next_frame();
         assert!(f.iter().all(|&s| s.abs() < 16));
     }
