@@ -372,18 +372,20 @@ mod tests {
         let (hup_tx, mut hup_rx) = oneshot::channel();
         let call = SipCall::from_parts("c1".into(), ev_rx, in_rx, out_tx, hup_tx);
 
-        let parts = call.split();
+        let mut parts = call.split();
         assert_eq!(parts.call_id, "c1");
-        // events end works
+        // events end round-trips
         ev_tx.send(SipEvent::Answered { codec: NegotiatedCodec { pt: 0, kind: G711Kind::Ulaw, ptime_ms: 20 } }).await.unwrap();
-        // (parts.events is the receiver — drop check only; construction is the assertion)
-        // audio_out end works
+        assert!(matches!(parts.events.recv().await, Some(SipEvent::Answered { .. })));
+        // audio_in end round-trips
+        in_tx.send(bytes::Bytes::from_static(b"in")).await.unwrap();
+        assert_eq!(parts.audio_in.recv().await.as_deref(), Some(&b"in"[..]));
+        // audio_out end round-trips
         parts.audio_out.send(bytes::Bytes::from_static(b"x")).await.unwrap();
         assert!(out_rx.recv().await.is_some());
         // hangup end works
         parts.hangup.send(()).unwrap();
         assert!(hup_rx.try_recv().is_ok());
-        let _ = (parts.events, parts.audio_in, ev_tx, in_tx);
     }
 
     #[tokio::test]

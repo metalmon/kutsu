@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::bridge::{self, BridgePorts};
 use crate::config::{ScenarioConfig, ServerConfig, SipConfig};
-use crate::gemini_live::{self, Event, TranscriptEntry};
+use crate::gemini_live::{self, EndedBy, Event, TranscriptEntry};
 use crate::sip::{SipCallParts, SipEvent, SipTransport};
 use crate::state::{CallRecord, CallState, CallStore};
 
@@ -27,6 +27,16 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Releases a concurrency slot on drop — so a `run_call` panic still frees the
+/// slot instead of leaking it (the manual decrement would be skipped on unwind).
+struct SlotGuard(Arc<AtomicUsize>);
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// The call engine: owns the SIP transport, the call store, and config.
@@ -93,8 +103,9 @@ impl Engine {
         let active = self.active.clone();
         let id = call_id.clone();
         tokio::spawn(async move {
+            // The guard frees the slot on return AND on panic unwind.
+            let _slot = SlotGuard(active);
             run_call(sip, store, server, scenario, number, id).await;
-            active.fetch_sub(1, Ordering::AcqRel);
         });
 
         Ok(call_id)
@@ -170,11 +181,12 @@ async fn run_call(
     // 7. Orchestration loop.
     let mut goal = None;
     let mut first_transcript = false;
+    let mut events_open = true;
     let deadline = tokio::time::sleep(Duration::from_secs(server.max_call_secs));
     tokio::pin!(deadline);
     let end_state = loop {
         tokio::select! {
-            ev = events_out_rx.recv() => match ev {
+            ev = events_out_rx.recv(), if events_open => match ev {
                 // NOTE: the bridge CONSUMES OutputAudio and Interrupted (they never
                 // reach events_out); it forwards only Transcript/TurnComplete/EndCall/
                 // Warning. So the earliest agent-activity signal the engine can observe
@@ -193,7 +205,7 @@ async fn run_call(
                 Some(Event::TurnComplete) => {}
                 Some(Event::Warning(w)) => tracing::warn!(%call_id, "gemini warning: {w}"),
                 Some(_) => {} // OutputAudio/Interrupted: consumed by the bridge, not forwarded
-                None => {} // bridge dropped events_out; the bridge_task arm will fire
+                None => events_open = false, // bridge closed events_out; stop polling (the bridge_task arm ends the call)
             },
             r = sip_events.recv() => match r {
                 Some(SipEvent::Terminated(_)) | None => break CallState::HungUp,
@@ -214,10 +226,16 @@ async fn run_call(
     bridge_task.abort();
     let outcome = gemini_handle.join().await;
 
-    // 9. Finalize: authoritative transcript + goal (model's EndCall goal wins).
+    // 9. Finalize. Reconcile the loop's end_state with the authoritative outcome:
+    // a model-initiated end is a success even if its `EndCall` event lost the
+    // select race against `GeminiClosed` (which would otherwise read `Failed`).
+    let final_state = match outcome.ended_by {
+        EndedBy::ModelEndCall => CallState::Completed,
+        _ => end_state,
+    };
     store.set_transcript(&call_id, outcome.transcript);
     let final_goal = goal.or(outcome.goal);
-    store.finalize(&call_id, end_state, final_goal, None, now_ms());
+    store.finalize(&call_id, final_state, final_goal, None, now_ms());
 
     // 10. Persist.
     if let Some(dir) = &server.transcript_dir {
@@ -275,6 +293,28 @@ mod tests {
     #[test]
     fn now_ms_is_nonzero() {
         assert!(now_ms() > 0);
+    }
+
+    #[test]
+    fn slot_guard_releases_on_drop() {
+        let active = Arc::new(AtomicUsize::new(1));
+        {
+            let _g = SlotGuard(active.clone());
+            assert_eq!(active.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn slot_guard_releases_on_panic() {
+        let active = Arc::new(AtomicUsize::new(1));
+        let a = active.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = SlotGuard(a);
+            panic!("run_call blew up");
+        }));
+        // The guard's Drop still ran during unwind → slot freed.
+        assert_eq!(active.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
