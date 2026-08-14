@@ -13,11 +13,13 @@ use crate::gemini_live::TranscriptEntry;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CallState {
+    Queued,
     Ringing,
     InProgress,
     Completed,
     Failed,
     HungUp,
+    Cancelled,
 }
 
 /// One call's record.
@@ -153,5 +155,11 @@ mod tests {
         assert_eq!(store.list().len(), 2);
         let json = serde_json::to_string(&store.get("c1").unwrap()).unwrap();
         assert!(json.contains("\"state\":\"ringing\""));
+    }
+
+    #[test]
+    fn queued_and_cancelled_serialize_snake_case() {
+        assert_eq!(serde_json::to_string(&CallState::Queued).unwrap(), "\"queued\"");
+        assert_eq!(serde_json::to_string(&CallState::Cancelled).unwrap(), "\"cancelled\"");
     }
 }
