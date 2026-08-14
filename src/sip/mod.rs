@@ -273,9 +273,14 @@ async fn sip_thread_main(
             Cmd::Place { number, reply } => {
                 seq += 1;
                 let call_id = format!("kutsu-{seq}");
-                // TODO(Task 5): spawn_local(run_call(...)). Placeholder keeps it compiling.
-                let _ = (server, bound, &cfg, &endpoint, &number, &call_id, &active);
-                let _ = reply.send(Err(SipError::Config("call setup not implemented")));
+                let endpoint = endpoint.clone();
+                let cfg = cfg.clone();
+                let active = active.clone();
+                active.fetch_add(1, Ordering::Relaxed);
+                tokio::task::spawn_local(async move {
+                    call::run_call(endpoint, cfg, server, bound, number, call_id, reply).await;
+                    active.fetch_sub(1, Ordering::Relaxed);
+                });
             }
             Cmd::Shutdown => break,
         }
