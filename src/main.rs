@@ -1,6 +1,8 @@
 //! Kutsu CLI entrypoint and MCP server bootstrap.
 //!
-//! Scaffold only: the `mcp` subcommand is wired up but not yet implemented.
+//! The `mcp` subcommand runs the MCP server (stdio or streamable-http
+//! transport) and is fully implemented; see [`kutsu::mcp`] and
+//! [`kutsu::mcp_http`].
 
 use clap::{Parser, Subcommand};
 
@@ -11,6 +13,9 @@ use clap::{Parser, Subcommand};
     about = "Outbound SIP calling MCP server, bridging phone calls to Gemini Live"
 )]
 struct Cli {
+    /// Log output format: text (dev, default) or json (machine-parseable / SIEM).
+    #[arg(long = "log-format", env = "KUTSU_LOG_FORMAT", default_value = "text", global = true)]
+    log_format: String,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -25,6 +30,9 @@ enum Command {
         /// Bind address for the `streamable-http` transport.
         #[arg(long, default_value = "127.0.0.1:8090", env = "KUTSU_MCP_BIND")]
         bind: String,
+        /// Bearer token required on the streamable-http transport (env KUTSU_MCP_TOKEN).
+        #[arg(long = "auth-token", env = "KUTSU_MCP_TOKEN")]
+        auth_token: Option<String>,
     },
     /// Run one conversation against Gemini Live from a scenario + audio file (dev harness).
     Live {
@@ -71,22 +79,19 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .try_init();
-
     let cli = Cli::parse();
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr);
+    match cli.log_format.as_str() {
+        "json" => { let _ = builder.json().try_init(); }
+        _ => { let _ = builder.try_init(); }
+    }
     match cli.command {
-        Some(Command::Mcp { transport, bind }) => {
-            let _ = (transport, bind);
-            anyhow::bail!(
-                "kutsu {} — MCP server not implemented yet (scaffold stage)",
-                kutsu::version()
-            );
+        Some(Command::Mcp { transport, bind, auth_token }) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(run_mcp(transport, bind, auth_token))
         }
         Some(Command::Live {
             scenario,
@@ -114,12 +119,72 @@ fn main() -> anyhow::Result<()> {
         }
         None => {
             println!(
-                "kutsu {} — outbound SIP calling MCP server (scaffold, not yet functional)",
+                "kutsu {} — outbound SIP calling MCP server. Subcommands: `mcp` (run the MCP server), \
+                 `call` (place one call from the CLI), `live` (dev harness against a scenario + audio file). \
+                 Run with --help for details.",
                 kutsu::version()
             );
             Ok(())
         }
     }
+}
+
+/// Run the MCP server: build the engine from env config, serve the chosen
+/// transport until it returns (client disconnect / EOF for stdio, a shutdown
+/// signal for streamable-http — see [`kutsu::mcp_http::shutdown_signal`]),
+/// then hang up any still-live calls and best-effort shut down the engine.
+async fn run_mcp(transport: String, bind: String, auth_token: Option<String>) -> anyhow::Result<()> {
+    let (server_cfg, sip_cfg) = kutsu::main_support::configs_from_env()?;
+    if server_cfg.max_concurrent_channels == 0 {
+        tracing::warn!(
+            "max_concurrent_channels is 0 — every placed call will queue forever and never dial; \
+             raise the server config's max_concurrent_channels to enable calls"
+        );
+    }
+    let engine = std::sync::Arc::new(
+        kutsu::engine::Engine::new(std::sync::Arc::new(server_cfg), &sip_cfg).await?,
+    );
+
+    match transport.as_str() {
+        "stdio" => {
+            use rmcp::{transport::io::stdio, ServiceExt};
+            let handler = kutsu::mcp::KutsuServer::new(engine.clone());
+            let service = handler.serve(stdio()).await?;
+            service.waiting().await?;
+        }
+        "streamable-http" => {
+            // rmcp's default StreamableHttpServerConfig::allowed_hosts is
+            // loopback-only, so a non-loopback --bind will have its /mcp
+            // requests Host-rejected unless something in front of it (a
+            // reverse proxy) rewrites the Host header to a loopback value.
+            // This is informational only — we still bind and serve.
+            let is_loopback =
+                bind.starts_with("127.") || bind.starts_with("localhost") || bind.starts_with("[::1]");
+            if !is_loopback {
+                tracing::warn!(
+                    %bind,
+                    "streamable-http bound to a non-loopback address; rmcp's default \
+                     allowed_hosts is loopback-only, so /mcp requests may be rejected \
+                     unless fronted by a reverse proxy that sets a loopback Host header"
+                );
+            }
+            kutsu::mcp_http::serve(engine.clone(), &bind, auth_token).await?;
+        }
+        // The bail short-circuits before teardown runs below, but that's
+        // fine: no transport ever started serving, so no calls were placed
+        // and nothing needs a BYE — the (unused) SIP socket is reclaimed on
+        // process exit like any other early-error path.
+        other => anyhow::bail!("unknown transport: {other}"),
+    }
+
+    // Graceful teardown after the transport returns (client disconnect / EOF
+    // for stdio, a shutdown signal for streamable-http): hang up every live
+    // call, then best-effort shut the engine's SIP transport down. Extracted
+    // to `mcp_http::graceful_teardown` so it's unit-testable — see
+    // `mcp_http::tests::graceful_teardown_cancels_live_calls`.
+    kutsu::mcp_http::graceful_teardown(engine).await;
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -290,10 +355,7 @@ async fn run_call_cli(number: String, scenario_path: Option<std::path::PathBuf>)
         Ok(e) => e,
         Err(e) => { eprintln!("engine init failed: {e}"); return 1; }
     };
-    let id = match engine.place_call(number, scenario).await {
-        Ok(id) => id,
-        Err(e) => { eprintln!("place_call failed: {e}"); return 1; }
-    };
+    let id = engine.place_call(number, scenario).await;
 
     // Poll the store until terminal; print transcript lines as they grow.
     let mut printed = 0usize;
