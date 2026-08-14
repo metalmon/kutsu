@@ -1,10 +1,11 @@
 //! Call engine — drives one call's full lifecycle (dial → bridge → end → finalize).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::bridge::{self, BridgePorts};
 use crate::config::{ScenarioConfig, ServerConfig, SipConfig};
@@ -33,6 +34,7 @@ pub struct Engine {
     store: CallStore,
     server: Arc<ServerConfig>,
     permits: Arc<tokio::sync::Semaphore>,
+    cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     seq: AtomicUsize,
 }
 
@@ -41,7 +43,14 @@ impl Engine {
     pub async fn new(server: Arc<ServerConfig>, sip_cfg: &SipConfig) -> Result<Self, EngineError> {
         let sip = SipTransport::new(sip_cfg).await?;
         let permits = Arc::new(tokio::sync::Semaphore::new(server.max_concurrent_channels));
-        Ok(Self { sip, store: CallStore::new(), server, permits, seq: AtomicUsize::new(0) })
+        Ok(Self {
+            sip,
+            store: CallStore::new(),
+            server,
+            permits,
+            cancels: Arc::new(Mutex::new(HashMap::new())),
+            seq: AtomicUsize::new(0),
+        })
     }
 
     pub fn store(&self) -> &CallStore {
@@ -65,16 +74,29 @@ impl Engine {
             ended_ms: None,
         });
 
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        self.cancels.lock().unwrap().insert(call_id.clone(), cancel_tx);
+
         let sip = self.sip.clone();
         let store = self.store.clone();
         let server = self.server.clone();
         let permits = self.permits.clone();
+        let cancels = self.cancels.clone();
         let id = call_id.clone();
         tokio::spawn(async move {
-            run_call(sip, store, server, permits, scenario, number, id).await;
+            run_call(sip, store, server, permits, cancels, cancel_rx, scenario, number, id).await;
         });
 
         call_id
+    }
+
+    /// Signal a running/queued call to end. Returns true if a live signal was sent.
+    pub fn end_call(&self, call_id: &str) -> bool {
+        if let Some(tx) = self.cancels.lock().unwrap().remove(call_id) {
+            tx.send(()).is_ok()
+        } else {
+            false
+        }
     }
 
     pub async fn shutdown(self) {
@@ -88,13 +110,24 @@ async fn run_call(
     store: CallStore,
     server: Arc<ServerConfig>,
     permits: Arc<tokio::sync::Semaphore>,
+    cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    mut cancel_rx: oneshot::Receiver<()>,
     scenario: ScenarioConfig,
     number: String,
     call_id: String,
 ) {
     // Wait for a concurrency slot. Held (as an owned permit) for the whole
     // call; released on drop, including on panic unwind — replaces SlotGuard.
-    let _permit = permits.acquire_owned().await.expect("semaphore not closed");
+    // Raced against the cancel signal so a call parked in Queued (no permit
+    // available yet) can still be cancelled instead of blocking forever.
+    let _permit = tokio::select! {
+        p = permits.acquire_owned() => p.expect("semaphore not closed"),
+        _ = &mut cancel_rx => {
+            store.finalize(&call_id, CallState::Cancelled, None, None, now_ms());
+            cancels.lock().unwrap().remove(&call_id);
+            return;
+        }
+    };
     store.set_state(&call_id, CallState::Ringing);
     // 1. INVITE.
     let call = match sip.place_call(&number).await {
@@ -188,6 +221,7 @@ async fn run_call(
                 Err(_) => CallState::Failed, // bridge task panicked
             },
             _ = &mut deadline => break CallState::Completed,
+            _ = &mut cancel_rx => break CallState::Cancelled,
         }
     };
 
@@ -207,6 +241,7 @@ async fn run_call(
     store.set_transcript(&call_id, outcome.transcript);
     let final_goal = goal.or(outcome.goal);
     store.finalize(&call_id, final_state, final_goal, None, now_ms());
+    cancels.lock().unwrap().remove(&call_id);
 
     // 10. Persist.
     if let Some(dir) = &server.transcript_dir {
@@ -277,6 +312,29 @@ mod tests {
         let rec = engine.store().get(&id).unwrap();
         assert_eq!(rec.state, CallState::Queued);
         assert_eq!(engine.store().queued_position(&id), Some(1));
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn end_call_cancels_a_queued_call() {
+        let (server, sip_cfg) = test_configs(0); // cap 0 → parked in Queued
+        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
+        let id = engine.place_call("600".into(), test_scenario()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(engine.store().get(&id).unwrap().state, CallState::Queued);
+        assert!(engine.end_call(&id));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(engine.store().get(&id).unwrap().state, CallState::Cancelled);
+        // Cancel map entry cleaned up: a second end_call finds nothing live.
+        assert!(!engine.end_call(&id));
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn end_call_unknown_id_is_false() {
+        let (server, sip_cfg) = test_configs(1);
+        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
+        assert!(!engine.end_call("nope"));
         engine.shutdown().await;
     }
 }
