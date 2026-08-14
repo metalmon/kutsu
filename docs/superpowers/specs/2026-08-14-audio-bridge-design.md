@@ -74,7 +74,7 @@ gemini_events.recv():
 
 20 ms pacer tick:
   take 480 samples @24 kHz from buffer (or silence if <480 -> underrun)
-    → resample::down_24k_8k    -> [i16; 160] @ 8 kHz
+    → Downsampler::process     -> [i16; 160] @ 8 kHz  (stateful, see §6)
     → g711::encode(kind)       -> [u8; 160]
     → SipCall.audio_out.send(Bytes)
 ```
@@ -134,11 +134,15 @@ task). It does **not** hang up or join either side — the engine owns lifecycle
 - **Upsample 8→16 kHz** (`resample.rs`): linear interpolation (insert one
   interpolated sample between each pair). Adds no bandwidth (source is
   narrowband) — cheap and correct for the uplink.
-- **Downsample 24→8 kHz** (`resample.rs`): fixed windowed-sinc FIR low-pass
-  (cutoff ~3.4 kHz, telephony band) applied before ÷3 decimation, coefficients
-  in a `const` table computed once. Anti-aliasing is the point — without it the
-  agent's voice is gritty. Behind `down_24k_8k(&[i16]) -> Vec<i16>` so it can be
-  swapped for `rubato` if our ears demand it.
+- **Downsample 24→8 kHz** (`resample.rs`): a **stateful** `Downsampler` — a
+  windowed-sinc FIR low-pass (cutoff ~3.4 kHz, telephony band; coefficients
+  computed once into a `OnceLock<Vec<f32>>`, not hand-typed) applied before ÷3
+  decimation, carrying filter history across calls. Stateful because the pacer
+  feeds it one 480-sample block per 20 ms: a pure per-block filter would
+  zero-pad edges and inject a periodic ~20 ms transient into the agent's voice
+  (human-audible). `Downsampler::new()` + `process(&mut self, &[i16]) -> Vec<i16>`;
+  the whole struct is the swap point for `rubato` if our ears demand it. Anti-
+  aliasing is the point — without the low-pass the voice is gritty.
 
 ## 7. Testing
 
