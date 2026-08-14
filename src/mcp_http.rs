@@ -115,6 +115,32 @@ pub async fn shutdown_signal() {
     }
 }
 
+/// Best-effort graceful teardown after a transport loop returns: hang up every
+/// live call (so callees get a BYE via `run_call` teardown), give that a
+/// moment, then shut the SIP transport down if no other `Arc<Engine>` clone
+/// lingers (streamable-http session handlers may hold clones until the app
+/// drops; if so we skip — process exit reclaims the socket).
+pub async fn graceful_teardown(engine: Arc<Engine>) {
+    for rec in engine.store().list() {
+        engine.end_call(&rec.call_id);
+    }
+    // end_call only signals teardown (it returns immediately); give the
+    // per-call run_call task a brief moment to process the hangup before we
+    // try to reclaim the engine below.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Engine::shutdown consumes `self`, so it only runs here if this is the
+    // last surviving Arc<Engine> clone. The streamable-http path hands
+    // clones into StreamableHttpService's per-session closures, which are
+    // owned by the axum app/listener; those are dropped when `serve` above
+    // returns, but a lingering clone (e.g. an in-flight request handler that
+    // hasn't unwound yet) can make try_unwrap fail. That's fine — this is
+    // best-effort cleanup, not correctness-critical: process exit reclaims
+    // the SIP transport (sockets, tasks) regardless.
+    if let Ok(e) = Arc::try_unwrap(engine) {
+        e.shutdown().await;
+    }
+}
+
 /// Serve the `/mcp` streamable-http endpoint plus the ungated ops endpoints
 /// (`/health`, `/ready`, `/metrics`) on `bind`. When `auth_token` is
 /// `Some`, `/mcp` requires a matching `Authorization: Bearer <token>`
@@ -151,6 +177,68 @@ pub async fn serve(engine: Arc<Engine>, bind: &str, auth_token: Option<String>) 
 mod tests {
     use super::*;
     use crate::engine::MetricsSnapshot;
+
+    /// Build a valid engine for tests, bound to loopback so `SipTransport::new`
+    /// binds offline (no real trunk) — mirrors `mcp::tests::test_engine`.
+    async fn test_engine(cap: usize) -> Engine {
+        use crate::config::{Model, NetCheckConfig, ServerConfig, SipConfig};
+        let server = ServerConfig {
+            api_key: "k".into(),
+            proxy: None,
+            model: Model::HalfCascade,
+            voice: "Autonoe".into(),
+            language: "en-US".into(),
+            net_check: NetCheckConfig::default(),
+            max_concurrent_channels: cap,
+            greet_after_silence_ms: 4000,
+            transcript_dir: None,
+            max_call_secs: 600,
+        };
+        let sip = SipConfig {
+            server: "127.0.0.1:5060".into(),
+            username: "t".into(),
+            password: "t".into(),
+            from_user: None,
+            local_ip: Some("127.0.0.1".parse().unwrap()),
+            register: false,
+            transport: Default::default(),
+        };
+        Engine::new(Arc::new(server), &sip).await.unwrap()
+    }
+
+    /// Proves `graceful_teardown` (a) fires `end_call` for a still-live call,
+    /// (b) that call settles to `Cancelled`, and (c) `try_unwrap` + `shutdown`
+    /// run to completion with no panic/hang — the path never exercised by the
+    /// force-killed manual smoke, since a real Ctrl-C isn't deliverable here.
+    #[tokio::test]
+    async fn graceful_teardown_cancels_live_calls() {
+        use crate::config::ScenarioConfig;
+        use crate::state::CallState;
+
+        // cap 0 -> the call parks in Queued (no permit), so it's still "live"
+        // (non-terminal) at the moment teardown runs.
+        let engine = Arc::new(test_engine(0).await);
+        let id = engine
+            .place_call(
+                "600".into(),
+                ScenarioConfig {
+                    system_prompt: "hi".into(),
+                    goal_schema: serde_json::json!({ "type": "object" }),
+                    context: None,
+                },
+            )
+            .await;
+        let store = engine.store().clone(); // CallStore is Arc-backed; survives teardown.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(store.get(&id).unwrap().state, CallState::Queued);
+
+        // Consumes the only Arc<Engine> -> try_unwrap succeeds -> shutdown runs.
+        graceful_teardown(engine).await;
+
+        // end_call fired for the queued call -> it finalizes Cancelled;
+        // teardown returned without panic/hang.
+        assert_eq!(store.get(&id).unwrap().state, CallState::Cancelled);
+    }
 
     #[test]
     fn prometheus_has_all_series() {

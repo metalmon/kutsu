@@ -157,29 +157,19 @@ async fn run_mcp(transport: String, bind: String, auth_token: Option<String>) ->
             }
             kutsu::mcp_http::serve(engine.clone(), &bind, auth_token).await?;
         }
+        // The bail short-circuits before teardown runs below, but that's
+        // fine: no transport ever started serving, so no calls were placed
+        // and nothing needs a BYE — the (unused) SIP socket is reclaimed on
+        // process exit like any other early-error path.
         other => anyhow::bail!("unknown transport: {other}"),
     }
 
-    // Graceful teardown after the transport returns: hang up every live call
-    // first so callees get a BYE rather than a silently dropped RTP stream.
-    for rec in engine.store().list() {
-        engine.end_call(&rec.call_id);
-    }
-    // end_call only signals teardown (it returns immediately); give the
-    // per-call run_call task a brief moment to process the hangup before we
-    // try to reclaim the engine below.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    // Engine::shutdown consumes `self`, so it only runs here if this is the
-    // last surviving Arc<Engine> clone. The streamable-http path hands
-    // clones into StreamableHttpService's per-session closures, which are
-    // owned by the axum app/listener; those are dropped when `serve` above
-    // returns, but a lingering clone (e.g. an in-flight request handler that
-    // hasn't unwound yet) can make try_unwrap fail. That's fine — this is
-    // best-effort cleanup, not correctness-critical: process exit reclaims
-    // the SIP transport (sockets, tasks) regardless.
-    if let Ok(e) = std::sync::Arc::try_unwrap(engine) {
-        e.shutdown().await;
-    }
+    // Graceful teardown after the transport returns (client disconnect / EOF
+    // for stdio, a shutdown signal for streamable-http): hang up every live
+    // call, then best-effort shut the engine's SIP transport down. Extracted
+    // to `mcp_http::graceful_teardown` so it's unit-testable — see
+    // `mcp_http::tests::graceful_teardown_cancels_live_calls`.
+    kutsu::mcp_http::graceful_teardown(engine).await;
 
     Ok(())
 }
