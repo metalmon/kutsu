@@ -454,7 +454,7 @@ mod tests {
         ServerConfig { api_key: "K".into(), proxy: None, model: Model::HalfCascade,
             voice: "Autonoe".into(), language: "ru-RU".into(),
             net_check: NetCheckConfig::default(), max_concurrent_channels: 3,
-            greet_after_silence_ms: 0 }
+            greet_after_silence_ms: 0, transcript_dir: None, max_call_secs: 600 }
     }
     fn scenario() -> ScenarioConfig {
         ScenarioConfig { system_prompt: "hi".into(),

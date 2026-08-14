@@ -150,6 +150,8 @@ async fn run_live(
         max_concurrent_channels: 3,
         greet_after_silence_ms: greet_after_silence_ms
             .unwrap_or(kutsu::config::DEFAULT_GREET_AFTER_SILENCE_MS),
+        transcript_dir: None,
+        max_call_secs: 600,
     };
 
     // 2. Preflight (fail closed).

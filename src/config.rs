@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
+use std::path::PathBuf;
 
 /// Signaling/media transport for the SIP trunk. Only `Udp` is implemented this
 /// iteration; `Tls` is a documented extension seam.
@@ -101,6 +102,10 @@ pub struct ServerConfig {
     /// the agent greets first (words come from the system prompt). `0` disables
     /// the proactive greeting entirely (purely reactive — wait for the callee).
     pub greet_after_silence_ms: u64,
+    /// Directory to write finalized CallRecord JSON to; None = skip persistence.
+    pub transcript_dir: Option<PathBuf>,
+    /// Safety cap on a single call's duration (seconds).
+    pub max_call_secs: u64,
 }
 
 /// Default wait before the agent greets a silent callee (see
@@ -161,5 +166,23 @@ mod tests {
         let json = r#"{"server":"s:5060","username":"u","password":"p","from_user":"caller"}"#;
         let c: SipConfig = serde_json::from_str(json).unwrap();
         assert_eq!(c.from_user(), "caller");
+    }
+
+    #[test]
+    fn server_config_has_engine_fields() {
+        let c = ServerConfig {
+            api_key: "k".into(),
+            proxy: None,
+            model: Model::HalfCascade,
+            voice: "Autonoe".into(),
+            language: "ru-RU".into(),
+            net_check: NetCheckConfig::default(),
+            max_concurrent_channels: 3,
+            greet_after_silence_ms: DEFAULT_GREET_AFTER_SILENCE_MS,
+            transcript_dir: Some(std::path::PathBuf::from("/tmp/x")),
+            max_call_secs: 600,
+        };
+        assert_eq!(c.max_call_secs, 600);
+        assert!(c.transcript_dir.is_some());
     }
 }
