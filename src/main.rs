@@ -60,6 +60,14 @@ enum Command {
         #[arg(long = "greet-after-silence-ms")]
         greet_after_silence_ms: Option<u64>,
     },
+    /// Place one outbound call: dial <number>, bridge to Gemini, print the transcript.
+    Call {
+        /// Number/extension to dial.
+        number: String,
+        /// Optional scenario JSON file (system prompt, goal schema). Uses a default if absent.
+        #[arg(long)]
+        scenario: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -97,6 +105,11 @@ fn main() -> anyhow::Result<()> {
                 scenario, audio_in, audio_out, transcript, goal_out, model, voice, tail,
                 no_net_check, greet_after_silence_ms,
             ))?;
+            std::process::exit(code);
+        }
+        Some(Command::Call { number, scenario }) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            let code = rt.block_on(run_call_cli(number, scenario));
             std::process::exit(code);
         }
         None => {
@@ -150,6 +163,8 @@ async fn run_live(
         max_concurrent_channels: 3,
         greet_after_silence_ms: greet_after_silence_ms
             .unwrap_or(kutsu::config::DEFAULT_GREET_AFTER_SILENCE_MS),
+        transcript_dir: None,
+        max_call_secs: 600,
     };
 
     // 2. Preflight (fail closed).
@@ -250,4 +265,49 @@ async fn run_live(
         kutsu::gemini_live::EndedBy::Error => 1,
         _ => 0,
     })
+}
+
+async fn run_call_cli(number: String, scenario_path: Option<std::path::PathBuf>) -> i32 {
+    let (server, sip_cfg) = match kutsu::main_support::configs_from_env() {
+        Ok(x) => x,
+        Err(e) => { eprintln!("config error: {e}"); return 1; }
+    };
+    let scenario = match scenario_path {
+        Some(p) => match std::fs::read_to_string(&p).ok().and_then(|s| serde_json::from_str(&s).ok()) {
+            Some(s) => s,
+            None => { eprintln!("failed to read scenario {p:?}"); return 1; }
+        },
+        None => kutsu::main_support::default_scenario(),
+    };
+
+    let engine = match kutsu::engine::Engine::new(std::sync::Arc::new(server), &sip_cfg).await {
+        Ok(e) => e,
+        Err(e) => { eprintln!("engine init failed: {e}"); return 1; }
+    };
+    let id = match engine.place_call(number, scenario).await {
+        Ok(id) => id,
+        Err(e) => { eprintln!("place_call failed: {e}"); return 1; }
+    };
+
+    // Poll the store until terminal; print transcript lines as they grow.
+    let mut printed = 0usize;
+    let final_state = loop {
+        if let Some(rec) = engine.store().get(&id) {
+            for entry in rec.transcript.iter().skip(printed) {
+                println!("[{:?}] {}", entry.role, entry.text);
+            }
+            printed = rec.transcript.len();
+            if matches!(rec.state, kutsu::state::CallState::Completed | kutsu::state::CallState::Failed | kutsu::state::CallState::HungUp) {
+                break rec.state;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
+
+    println!("call ended: {final_state:?}");
+    engine.shutdown().await;
+    match final_state {
+        kutsu::state::CallState::Failed => 1,
+        _ => 0,
+    }
 }

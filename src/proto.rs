@@ -100,7 +100,8 @@ fn build_system_prompt(scenario: &ScenarioConfig) -> String {
     s
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     User,
     Model,
@@ -190,6 +191,7 @@ mod tests {
             api_key: "KEY".into(), proxy: None, model, voice: "Autonoe".into(),
             language: "ru-RU".into(), net_check: NetCheckConfig::default(),
             max_concurrent_channels: 3, greet_after_silence_ms: 4000,
+            transcript_dir: None, max_call_secs: 600,
         }
     }
     fn scenario() -> ScenarioConfig {

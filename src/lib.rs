@@ -16,6 +16,7 @@ pub mod config;
 pub mod engine;
 pub mod error;
 pub mod gemini_live;
+pub mod main_support;
 pub mod mcp;
 pub mod net_check;
 pub mod proto;

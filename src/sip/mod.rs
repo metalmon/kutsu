@@ -150,6 +150,18 @@ impl SipCall {
         }
     }
 
+    /// Decompose into owned channel ends. Consumes the call.
+    pub fn split(mut self) -> SipCallParts {
+        let hangup = self.hangup.take().expect("SipCall always has a hangup sender until split");
+        SipCallParts {
+            call_id: self.call_id,
+            events: self.events,
+            audio_in: self.rtp_in,
+            audio_out: self.rtp_out,
+            hangup,
+        }
+    }
+
     /// Assemble a handle from channel ends (called by `run_call`, Task 5).
     pub(crate) fn from_parts(
         call_id: String,
@@ -160,6 +172,15 @@ impl SipCall {
     ) -> Self {
         Self { call_id, events, rtp_in, rtp_out, hangup: Some(hangup) }
     }
+}
+
+/// Owned channel ends of a `SipCall`, for handing to the bridge.
+pub struct SipCallParts {
+    pub call_id: String,
+    pub events: mpsc::Receiver<SipEvent>,
+    pub audio_in: mpsc::Receiver<Bytes>,
+    pub audio_out: mpsc::Sender<Bytes>,
+    pub hangup: oneshot::Sender<()>,
 }
 
 /// Command sent from `SipTransport` to the SIP runtime thread.
@@ -341,6 +362,28 @@ mod tests {
         // Loopback target -> loopback source; proves the connect() trick works.
         let ip = detect_local_ip("127.0.0.1:5060".parse().unwrap()).unwrap();
         assert!(ip.is_loopback());
+    }
+
+    #[tokio::test]
+    async fn sipcall_split_yields_working_channel_ends() {
+        let (ev_tx, ev_rx) = mpsc::channel(4);
+        let (in_tx, in_rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel::<bytes::Bytes>(4);
+        let (hup_tx, mut hup_rx) = oneshot::channel();
+        let call = SipCall::from_parts("c1".into(), ev_rx, in_rx, out_tx, hup_tx);
+
+        let parts = call.split();
+        assert_eq!(parts.call_id, "c1");
+        // events end works
+        ev_tx.send(SipEvent::Answered { codec: NegotiatedCodec { pt: 0, kind: G711Kind::Ulaw, ptime_ms: 20 } }).await.unwrap();
+        // (parts.events is the receiver — drop check only; construction is the assertion)
+        // audio_out end works
+        parts.audio_out.send(bytes::Bytes::from_static(b"x")).await.unwrap();
+        assert!(out_rx.recv().await.is_some());
+        // hangup end works
+        parts.hangup.send(()).unwrap();
+        assert!(hup_rx.try_recv().is_ok());
+        let _ = (parts.events, parts.audio_in, ev_tx, in_tx);
     }
 
     #[tokio::test]

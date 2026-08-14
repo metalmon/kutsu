@@ -29,7 +29,7 @@ pub enum Event {
     Warning(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct TranscriptEntry {
     pub role: Role,
     pub text: String,
@@ -253,6 +253,34 @@ impl Session {
             ended_by: EndedBy::Error, goal: None, transcript: Vec::new(),
         })
     }
+
+    /// Decompose into a control handle + the audio sink + the event stream.
+    pub fn split(self) -> (SessionHandle, mpsc::Sender<Vec<i16>>, mpsc::Receiver<Event>) {
+        (
+            SessionHandle { join: self.join, hangup_tx: self.hangup_tx },
+            self.audio_in,
+            self.events,
+        )
+    }
+}
+
+/// Control handle for a split-off `Session`: hang up + await the outcome.
+pub struct SessionHandle {
+    join: tokio::task::JoinHandle<CallOutcome>,
+    hangup_tx: mpsc::Sender<()>,
+}
+
+impl SessionHandle {
+    pub async fn hangup(&self) {
+        let _ = self.hangup_tx.send(()).await;
+    }
+    pub async fn join(self) -> CallOutcome {
+        self.join.await.unwrap_or(CallOutcome {
+            ended_by: EndedBy::Error,
+            goal: None,
+            transcript: Vec::new(),
+        })
+    }
 }
 
 /// Real tokio-tungstenite transport.
@@ -454,11 +482,35 @@ mod tests {
         ServerConfig { api_key: "K".into(), proxy: None, model: Model::HalfCascade,
             voice: "Autonoe".into(), language: "ru-RU".into(),
             net_check: NetCheckConfig::default(), max_concurrent_channels: 3,
-            greet_after_silence_ms: 0 }
+            greet_after_silence_ms: 0, transcript_dir: None, max_call_secs: 600 }
     }
     fn scenario() -> ScenarioConfig {
         ScenarioConfig { system_prompt: "hi".into(),
             goal_schema: serde_json::json!({"type":"object"}), context: None }
+    }
+
+    #[tokio::test]
+    async fn session_split_yields_control_and_channels() {
+        let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<i16>>(4);
+        let (event_tx, event_rx) = mpsc::channel::<Event>(4);
+        let (hangup_tx, mut hangup_rx) = mpsc::channel::<()>(1);
+        let join = tokio::spawn(async {
+            CallOutcome { ended_by: EndedBy::RemoteClose, goal: None, transcript: vec![] }
+        });
+        let session = Session { audio_in: audio_tx, events: event_rx, join, hangup_tx };
+
+        let (handle, gemini_in, mut gemini_events) = session.split();
+        // gemini_in is the audio sender
+        gemini_in.send(vec![0i16; 4]).await.unwrap();
+        assert!(audio_rx.recv().await.is_some());
+        // events receiver moved out
+        event_tx.send(Event::TurnComplete).await.unwrap();
+        assert!(matches!(gemini_events.recv().await, Some(Event::TurnComplete)));
+        // handle can hang up and join
+        handle.hangup().await;
+        assert!(hangup_rx.recv().await.is_some());
+        let outcome = handle.join().await;
+        assert!(matches!(outcome.ended_by, EndedBy::RemoteClose));
     }
 
     #[tokio::test]
