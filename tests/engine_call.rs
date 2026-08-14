@@ -24,10 +24,7 @@ async fn engine_places_and_finalizes_a_call() {
     let scenario: ScenarioConfig = kutsu::main_support::default_scenario();
 
     let engine = Engine::new(Arc::new(server), &sip_cfg).await.expect("engine up");
-    let id = engine
-        .place_call(env_or("KUTSU_SIP_EXT", "600"), scenario)
-        .await
-        .expect("place_call");
+    let id = engine.place_call(env_or("KUTSU_SIP_EXT", "600"), scenario).await;
 
     // Poll until InProgress (proves answer + bridge wiring), then until terminal.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);

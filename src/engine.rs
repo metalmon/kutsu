@@ -15,8 +15,6 @@ use crate::state::{CallRecord, CallState, CallStore};
 /// Errors from placing a call.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
-    #[error("concurrency cap reached")]
-    CapReached,
     #[error(transparent)]
     Sip(#[from] crate::sip::SipError),
 }
@@ -29,22 +27,12 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Releases a concurrency slot on drop — so a `run_call` panic still frees the
-/// slot instead of leaking it (the manual decrement would be skipped on unwind).
-struct SlotGuard(Arc<AtomicUsize>);
-
-impl Drop for SlotGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 /// The call engine: owns the SIP transport, the call store, and config.
 pub struct Engine {
     sip: SipTransport,
     store: CallStore,
     server: Arc<ServerConfig>,
-    active: Arc<AtomicUsize>,
+    permits: Arc<tokio::sync::Semaphore>,
     seq: AtomicUsize,
 }
 
@@ -52,44 +40,24 @@ impl Engine {
     /// Build the engine (binds the SIP transport).
     pub async fn new(server: Arc<ServerConfig>, sip_cfg: &SipConfig) -> Result<Self, EngineError> {
         let sip = SipTransport::new(sip_cfg).await?;
-        Ok(Self {
-            sip,
-            store: CallStore::new(),
-            server,
-            active: Arc::new(AtomicUsize::new(0)),
-            seq: AtomicUsize::new(0),
-        })
+        let permits = Arc::new(tokio::sync::Semaphore::new(server.max_concurrent_channels));
+        Ok(Self { sip, store: CallStore::new(), server, permits, seq: AtomicUsize::new(0) })
     }
 
     pub fn store(&self) -> &CallStore {
         &self.store
     }
 
-    /// Place an outbound call. Cap-checks, spawns the call task, returns its id.
-    pub async fn place_call(
-        &self,
-        number: String,
-        scenario: ScenarioConfig,
-    ) -> Result<String, EngineError> {
-        // Reserve a slot atomically against the cap.
-        let cap = self.server.max_concurrent_channels;
-        let mut cur = self.active.load(Ordering::Acquire);
-        loop {
-            if cur >= cap {
-                return Err(EngineError::CapReached);
-            }
-            match self.active.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => break,
-                Err(actual) => cur = actual,
-            }
-        }
-
+    /// Place an outbound call: records it as `Queued` and spawns the call
+    /// task, which waits for a concurrency permit before dialing. Always
+    /// succeeds; SIP/other failures surface later via `CallState::Failed`.
+    pub async fn place_call(&self, number: String, scenario: ScenarioConfig) -> String {
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
         let call_id = format!("call-{n}");
         self.store.insert(CallRecord {
             call_id: call_id.clone(),
             number: number.clone(),
-            state: CallState::Ringing,
+            state: CallState::Queued,
             transcript: vec![],
             goal: None,
             error: None,
@@ -100,15 +68,13 @@ impl Engine {
         let sip = self.sip.clone();
         let store = self.store.clone();
         let server = self.server.clone();
-        let active = self.active.clone();
+        let permits = self.permits.clone();
         let id = call_id.clone();
         tokio::spawn(async move {
-            // The guard frees the slot on return AND on panic unwind.
-            let _slot = SlotGuard(active);
-            run_call(sip, store, server, scenario, number, id).await;
+            run_call(sip, store, server, permits, scenario, number, id).await;
         });
 
-        Ok(call_id)
+        call_id
     }
 
     pub async fn shutdown(self) {
@@ -121,10 +87,15 @@ async fn run_call(
     sip: SipTransport,
     store: CallStore,
     server: Arc<ServerConfig>,
+    permits: Arc<tokio::sync::Semaphore>,
     scenario: ScenarioConfig,
     number: String,
     call_id: String,
 ) {
+    // Wait for a concurrency slot. Held (as an owned permit) for the whole
+    // call; released on drop, including on panic unwind — replaces SlotGuard.
+    let _permit = permits.acquire_owned().await.expect("semaphore not closed");
+    store.set_state(&call_id, CallState::Ringing);
     // 1. INVITE.
     let call = match sip.place_call(&number).await {
         Ok(c) => c,
@@ -295,38 +266,17 @@ mod tests {
         assert!(now_ms() > 0);
     }
 
-    #[test]
-    fn slot_guard_releases_on_drop() {
-        let active = Arc::new(AtomicUsize::new(1));
-        {
-            let _g = SlotGuard(active.clone());
-            assert_eq!(active.load(Ordering::Acquire), 1);
-        }
-        assert_eq!(active.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn slot_guard_releases_on_panic() {
-        let active = Arc::new(AtomicUsize::new(1));
-        let a = active.clone();
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _g = SlotGuard(a);
-            panic!("run_call blew up");
-        }));
-        // The guard's Drop still ran during unwind → slot freed.
-        assert_eq!(active.load(Ordering::Acquire), 0);
-    }
-
     #[tokio::test]
-    async fn place_call_rejects_when_at_cap() {
-        // Build a config with max_concurrent_channels = 0 so any call is over cap.
+    async fn place_call_queues_when_at_cap() {
+        // cap = 0: every call must sit in Queued forever (no permit available).
         let (server, sip_cfg) = test_configs(0);
         let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
-        let err = engine
-            .place_call("600".into(), test_scenario())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, EngineError::CapReached));
+        let id = engine.place_call("600".into(), test_scenario()).await;
+        // No permit → the spawned run_call is parked before INVITE; state stays Queued.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let rec = engine.store().get(&id).unwrap();
+        assert_eq!(rec.state, CallState::Queued);
+        assert_eq!(engine.store().queued_position(&id), Some(1));
         engine.shutdown().await;
     }
 }

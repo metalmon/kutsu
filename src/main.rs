@@ -290,10 +290,7 @@ async fn run_call_cli(number: String, scenario_path: Option<std::path::PathBuf>)
         Ok(e) => e,
         Err(e) => { eprintln!("engine init failed: {e}"); return 1; }
     };
-    let id = match engine.place_call(number, scenario).await {
-        Ok(id) => id,
-        Err(e) => { eprintln!("place_call failed: {e}"); return 1; }
-    };
+    let id = engine.place_call(number, scenario).await;
 
     // Poll the store until terminal; print transcript lines as they grow.
     let mut printed = 0usize;
