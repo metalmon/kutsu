@@ -1,0 +1,65 @@
+;=====================================================================
+; TEMPLATE — copy to `pjsip.conf` and set your host LAN IP:
+;     cp pjsip.conf.example pjsip.conf
+; The real `pjsip.conf` is gitignored so your IP never lands in the repo.
+;
+; kutsu local SIP test PBX (chan_pjsip). Two endpoints: `kutsu` (the outbound
+; caller under test) and `callee` (a Linphone softphone). G.711 only, to match
+; kutsu's phone-side codec. Dev-only credentials — not for anything real.
+;=====================================================================
+
+[transport-udp]
+type = transport
+protocol = udp
+bind = 0.0.0.0:5060
+; Published-ports mode only: advertise the host's LAN IP so Asterisk-relayed
+; RTP reaches clients running on the host / LAN.
+; >>> REPLACE 192.0.2.10 with your machine's LAN IP (Windows: `ipconfig`,
+;     Linux/mac: `ip addr`), and the subnet below to match. <<<
+; Comment ALL THREE lines out when using `network_mode: host`.
+external_media_address = 192.0.2.10
+external_signaling_address = 192.0.2.10
+local_net = 192.0.2.0/24
+
+;--- shared templates ------------------------------------------------
+[endpoint-tpl](!)
+type = endpoint
+context = internal
+disallow = all
+allow = ulaw            ; G.711 mu-law (8 kHz) — kutsu's phone-side codec
+allow = alaw            ; G.711 a-law
+direct_media = no       ; keep Asterisk in the media path (simplest NAT)
+rtp_symmetric = yes
+force_rport = yes
+rewrite_contact = yes
+
+[auth-tpl](!)
+type = auth
+auth_type = userpass
+
+[aor-tpl](!)
+type = aor
+max_contacts = 1
+remove_existing = yes
+
+;--- kutsu: the outbound caller under test ---------------------------
+[kutsu](endpoint-tpl)
+auth = kutsu-auth
+aors = kutsu-aor
+
+[kutsu-auth](auth-tpl)
+username = kutsu
+password = kutsupw
+
+[kutsu-aor](aor-tpl)
+
+;--- callee: the Linphone softphone ----------------------------------
+[callee](endpoint-tpl)
+auth = callee-auth
+aors = callee-aor
+
+[callee-auth](auth-tpl)
+username = callee
+password = calleepw
+
+[callee-aor](aor-tpl)

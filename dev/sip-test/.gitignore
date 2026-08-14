@@ -1,0 +1,3 @@
+# Real PBX config carries this machine's LAN IP — keep it out of the repo.
+# Copy pjsip.conf.example -> pjsip.conf and set your IP (see README).
+asterisk/pjsip.conf
