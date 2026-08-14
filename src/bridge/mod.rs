@@ -5,3 +5,5 @@
 //! RTP, decodes/encodes mu-law, and resamples in both directions.
 //!
 //! Not yet implemented.
+
+mod g711;
