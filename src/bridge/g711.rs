@@ -102,14 +102,6 @@ pub fn encode(kind: G711Kind, pcm: &[i16]) -> Vec<u8> {
     }
 }
 
-/// The byte that encodes digital silence for this codec.
-pub fn silence_byte(kind: G711Kind) -> u8 {
-    match kind {
-        G711Kind::Ulaw => 0xFF,
-        G711Kind::Alaw => 0xD5,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,11 +112,9 @@ mod tests {
         // Digital silence encodes to the canonical bytes and decodes back near zero.
         assert_eq!(encode_ulaw(0), 0xFF);
         assert_eq!(decode_ulaw(0xFF), 0);
-        assert_eq!(silence_byte(G711Kind::Ulaw), 0xFF);
 
         assert_eq!(encode_alaw(0), 0xD5);
         assert!(decode_alaw(0xD5).abs() < 16); // a-law min step, ~silence
-        assert_eq!(silence_byte(G711Kind::Alaw), 0xD5);
     }
 
     #[test]

@@ -70,11 +70,14 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
     let mut downlink = pace::Downlink::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
 
-    loop {
+    // Every loop exit goes through `break` so a single `uplink.abort()` below
+    // covers every path -- dropping a JoinHandle detaches it (leak) instead of
+    // cancelling it, so we must abort explicitly rather than just `return`.
+    let end = loop {
         tokio::select! {
             _ = &mut uplink => {
                 // Uplink task ended: the phone stopped feeding us (hang-up).
-                return BridgeEnd::PhoneClosed;
+                break BridgeEnd::PhoneClosed;
             }
             ev = gemini_events.recv() => match ev {
                 Some(Event::OutputAudio(pcm24)) => downlink.push(&pcm24),
@@ -84,17 +87,21 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
                         // Engine dropped its event receiver; keep bridging audio.
                     }
                 }
-                None => return BridgeEnd::GeminiClosed,
+                None => break BridgeEnd::GeminiClosed,
             },
             _ = ticker.tick() => {
                 let pcm8 = downlink.next_frame();
                 let payload = g711::encode(codec, &pcm8);
                 if phone_out.send(Bytes::from(payload)).await.is_err() {
-                    return BridgeEnd::PhoneClosed;
+                    break BridgeEnd::PhoneClosed;
                 }
             }
         }
-    }
+    };
+    // Harmless no-op if the uplink task already finished (the `&mut uplink`
+    // branch above); required to stop it on the other two exit paths.
+    uplink.abort();
+    end
 }
 
 #[cfg(test)]
@@ -163,25 +170,54 @@ mod tests {
     async fn barge_in_silences_the_phone() {
         let (ports, mut ends) = wire(G711Kind::Ulaw);
         let h = tokio::spawn(run(ports));
-        ends.gemini_events_tx.send(Event::OutputAudio(vec![8000i16; 480 * 4])).await.unwrap();
+
+        // `tokio::time::interval`'s very first `tick()` resolves immediately (no
+        // time needs to pass), independent of any events. Force + discard that
+        // free tick now, on an empty buffer (deterministically silence), before
+        // pushing anything, so every tick from here on sits on the regular 20 ms
+        // cadence and `select!` only has one ready branch at a time below.
+        tokio::task::yield_now().await;
+        let _ = ends.phone_out_rx.recv().await.unwrap();
+
+        // Push a large burst (~400 ms) of loud audio.
+        ends.gemini_events_tx.send(Event::OutputAudio(vec![8000i16; 480 * 20])).await.unwrap();
+        // The next regular tick is a full 20 ms away (Pending) -> `select!` can
+        // only take the `gemini_events` branch, so this push is processed
+        // deterministically before any tick fires.
+        tokio::task::yield_now().await;
+
+        // Advance one tick and confirm audio is actively playing: proves the
+        // burst is really queued (buffer far from drained), not a stale/empty
+        // pacer that would be silent regardless of barge-in working.
+        tokio::time::advance(std::time::Duration::from_millis(20)).await;
+        let frame = ends.phone_out_rx.recv().await.unwrap();
+        let pcm = g711::decode(G711Kind::Ulaw, &frame);
+        assert!(pcm.iter().any(|&s| s.abs() > 1000), "expected audio to be playing before barge-in");
+
+        // Barge-in while ~18 more frames (360 ms) of loud audio remain buffered.
         ends.gemini_events_tx.send(Event::Interrupted).await.unwrap();
-        // Drain several 20 ms ticks. The `select!` picks a ready branch at random
-        // each iteration, so a single `yield_now` cannot deterministically guarantee
-        // that BOTH `OutputAudio` and `Interrupted` have been processed before the
-        // first tick fires. Instead, advance many ticks: once `Interrupted` has been
-        // processed (which it must be, eventually, since the mpsc channel is FIFO and
-        // the loop keeps running), the buffer is cleared and no further audio arrives,
-        // so every frame from that point on is deterministically silence (modulo the
-        // downsampler's ~8-sample filter ring-out). Asserting on a frame several ticks
-        // in — well past both the event processing and the ring-out — is robust
-        // regardless of event/tick interleaving order.
-        let mut last_frame = Vec::new();
-        for _ in 0..8 {
-            tokio::time::advance(std::time::Duration::from_millis(20)).await;
-            last_frame = ends.phone_out_rx.recv().await.unwrap().to_vec();
-        }
-        let pcm = g711::decode(G711Kind::Ulaw, &last_frame);
+        // Same reasoning: the next tick is a full 20 ms away, so this is
+        // processed deterministically before any further tick -- `clear()` runs
+        // before the next `next_frame()` call.
+        tokio::task::yield_now().await;
+
+        // The tick immediately after `clear()` still carries the downsampler's
+        // FIR ring-out (~8 samples of decaying signal at the head of the frame;
+        // see pace.rs's own `clear_flushes_pending_audio` test, which discards
+        // this exact frame for the same reason). Discard it, then check the next
+        // one. With no further audio queued, that second frame must be clean
+        // silence. Without a working `clear()` the buffer would still hold ~17
+        // frames of loud audio at this point, so it would still be loud --
+        // silence here is proof `clear()` actually dropped the pending audio,
+        // not a vacuous check (the buffer is nowhere near draining naturally).
+        tokio::time::advance(std::time::Duration::from_millis(20)).await;
+        let _ = ends.phone_out_rx.recv().await.unwrap(); // ring-out frame, discarded
+
+        tokio::time::advance(std::time::Duration::from_millis(20)).await;
+        let frame = ends.phone_out_rx.recv().await.unwrap();
+        let pcm = g711::decode(G711Kind::Ulaw, &frame);
         assert!(pcm.iter().all(|&s| s.abs() < 64), "expected silence after barge-in");
+
         drop(ends);
         let _ = h.await;
     }
