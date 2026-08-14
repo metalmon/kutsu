@@ -183,9 +183,24 @@ deferred silently.
 
 - **stdio:** serve `KutsuServer` over the stdio io-transport; logs to stderr.
 - **streamable-http:** `StreamableHttpService` + `LocalSessionManager`, mounted
-  at `/mcp` via axum `nest_service`, plus a `/health` route. Session factory
-  clones the handler over the shared `Arc<Engine>`. Default bind
+  at `/mcp` via axum `nest_service`, alongside the ops routes below. Session
+  factory clones the handler over the shared `Arc<Engine>`. Default bind
   `127.0.0.1:8090`.
+- **Ops endpoints (http transport only; stdio has no HTTP surface):**
+  - `/health` — liveness, always `200 OK`.
+  - `/ready` — readiness: `200` once `Engine` is built (SIP transport bound).
+    The http server starts only after `Engine::new`, so readiness ≈ started;
+    the route exists for orchestration (k8s) parity.
+  - `/metrics` — **Prometheus text exposition**, hand-rolled, **no new crate**.
+    Served from a pure `Engine::metrics_snapshot()` that reads `CallStore` +
+    the permit count: `kutsu_calls_active`, `kutsu_calls_queued`,
+    `kutsu_calls_placed_total`, `kutsu_calls_completed_total`,
+    `kutsu_calls_failed_total`, `kutsu_calls_cancelled_total`,
+    `kutsu_channels_cap`. The `/metrics` handler is only a formatter over the
+    snapshot — an OTLP push exporter (observability phase) reads the same
+    snapshot without touching call sites, and an OTel collector can scrape the
+    Prometheus format as-is. The ops endpoints are **not** gated by
+    `--auth-token` (they carry no PII — only counts); the `/mcp` route is.
 - **http auth (optional, YAGNI):** `--auth-token` / env `KUTSU_MCP_TOKEN`. If
   set, an axum middleware requires `Authorization: Bearer <token>` (else 401).
   If unset, no auth (loopback default).
@@ -223,7 +238,9 @@ not future scope.
 
 - Structured **security-event audit log** (categories auth / rights / accounts /
   admin; fields type/time/source/result/subject; export to SIEM via OTLP or
-  webhook) — an observability-phase concern.
+  webhook) — an observability-phase concern. The **OTLP metrics push exporter**
+  lands in this phase too, reading the same `metrics_snapshot` the phase-5
+  `/metrics` endpoint formats.
 - **OIDC / IdP integration + RBAC / per-caller authorization** — a whole future
   subsystem; the dropped observer-profile / "service principal with a narrow
   profile" idea belongs here.
@@ -259,6 +276,9 @@ store/queue/cancel paths exercise fully):**
   response shapes and the store path are verified).
 - Unknown `call_id` → `invalid_params` for all three id-taking tools.
 - `CallState → TaskStatus` is a pure function with a table-driven test.
+- `Engine::metrics_snapshot` reports correct active/queued/cumulative counts as
+  calls move through states (pure, no HTTP); the `/metrics` formatter emits valid
+  Prometheus text for a snapshot.
 - `task_manager` tests are written **after** the rmcp 3.1 task API is pinned
   during implementation (avoid testing an invented signature).
 
@@ -277,7 +297,12 @@ Kept `#[ignore]` like the other live tests.
 - Logging: audit `Debug`/`tracing` sites for secret/PII leakage (Security
   hardening) across `mcp.rs`, `main.rs`, `engine.rs`.
 - `src/mcp.rs`: implement the handler, four tools, task mapping, errors, `get_info`.
-- `src/main.rs`: implement the `Mcp` branch; add `--auth-token`.
+- `src/main.rs`: implement the `Mcp` branch; add `--auth-token`; mount
+  `/health`, `/ready`, `/metrics` routes (http transport).
+- `src/engine.rs`: add pure `Engine::metrics_snapshot() -> MetricsSnapshot`
+  (counts from `CallStore` + permit state); needs cumulative
+  placed/completed/failed/cancelled counters (atomics on `Engine`, incremented
+  at the finalize points in `run_call`).
 - `Cargo.toml`: confirm `tokio-util` (CancellationToken) availability; add if not
   already transitive.
 
