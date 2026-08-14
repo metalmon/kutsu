@@ -1,0 +1,19 @@
+services:
+  asterisk:
+    image: andrius/asterisk:latest   # plain Asterisk (PJSIP); any Asterisk 18/20/21 image works
+    container_name: kutsu-asterisk
+    restart: unless-stopped
+    # Published ports. NOTE: desktop Linphone squats on host UDP 5060, so we
+    # publish SIP on host 5062 -> container 5060 to avoid the clash. RTP uses a
+    # clean high range (avoids nvidia/other host UDP ports). Softphones connect
+    # to the host at :5062.
+    ports:
+      - "0.0.0.0:5062:5060/udp"
+      - "0.0.0.0:20000-20020:20000-20020/udp"
+    volumes:
+      - ./asterisk/pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ./asterisk/extensions.conf:/etc/asterisk/extensions.conf:ro
+      - ./asterisk/rtp.conf:/etc/asterisk/rtp.conf:ro
+    # --- Host networking is NOT usable on this Docker Desktop: containers land
+    #     on the internal VM subnet (192.168.65.x), unreachable from the LAN. ---
+    # network_mode: host
