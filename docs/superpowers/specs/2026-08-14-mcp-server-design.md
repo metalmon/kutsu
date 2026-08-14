@@ -237,6 +237,11 @@ not future scope.
   (unix `0o600` via `OpenOptions`; on Windows, rely on the directory ACL and
   document that the operator must place `transcript_dir` outside world-readable
   paths). Applies to the `engine.rs` persist step, not `mcp.rs`.
+- **Log format.** Selectable via `--log-format text|json` (env
+  `KUTSU_LOG_FORMAT`), default `text` for dev; `json` emits machine-parseable
+  structured lines (`tracing-subscriber` `json` feature) suitable for SIEM
+  ingest. This is the log *format* only — the structured security-audit *event*
+  schema (categories, subject/object) stays future scope.
 - **Secret / PII logging discipline.** Never log `api_key`, `--auth-token` /
   `KUTSU_MCP_TOKEN`, the SIP password, or transcript text at `info`. Tracing
   stays at `info` by default (debug/trace off); the auth middleware must not log

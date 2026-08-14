@@ -1167,9 +1167,65 @@ git add src/main.rs
 git commit -m "feat(cli): implement kutsu mcp serve (stdio + streamable-http)"
 ```
 
+### Task 12: Selectable JSON log format
+
+**Files:**
+- Modify: `Cargo.toml` (add `json` to `tracing-subscriber` features).
+- Modify: `src/main.rs` (logger init ~line 74; add `--log-format` global arg).
+
+**Interfaces:**
+- Consumes: nothing. Cross-cutting — affects all subcommands' logging.
+- Produces: `--log-format text|json` (env `KUTSU_LOG_FORMAT`, default `text`).
+
+- [ ] **Step 1: Enable the feature**
+
+In `Cargo.toml`:
+
+```toml
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+```
+
+- [ ] **Step 2: Add the global arg**
+
+On the top-level `Cli` struct in `src/main.rs`:
+
+```rust
+/// Log output format: text (dev, default) or json (machine-parseable / SIEM).
+#[arg(long = "log-format", env = "KUTSU_LOG_FORMAT", default_value = "text", global = true)]
+log_format: String,
+```
+
+- [ ] **Step 3: Branch the subscriber init**
+
+Replace the `tracing_subscriber::fmt()...try_init()` block (~line 74) with a
+branch on `cli.log_format`, keeping the existing `EnvFilter` + `stderr` writer:
+
+```rust
+let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+let builder = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr);
+match cli.log_format.as_str() {
+    "json" => { let _ = builder.json().try_init(); }
+    _ => { let _ = builder.try_init(); }
+}
+```
+
+- [ ] **Step 4: Build + manual verify**
+
+Run: `cargo build --features vendor-openssl`
+Manual: `cargo run --features vendor-openssl -- --log-format json mcp --transport streamable-http`
+Expected: startup log line is a single-line JSON object (`{"timestamp":...,"level":"INFO",...}`) on stderr; default (no flag) stays human-readable text.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add Cargo.toml src/main.rs
+git commit -m "feat(cli): selectable text/json log format (KUTSU_LOG_FORMAT)"
+```
+
 ## Component 4 — live end-to-end (optional, gated)
 
-### Task 12: `#[ignore]` in-process stdio round-trip
+### Task 13: `#[ignore]` in-process stdio round-trip
 
 **Files:**
 - Create: `tests/mcp_stdio.rs` (integration test, `#[ignore]`)
@@ -1212,8 +1268,8 @@ git commit -m "test(mcp): ignored live stdio round-trip harness"
 Cancelled states (Task 1), queued_position (Task 2), metrics_snapshot + owner-
 only transcript (Task 5), four tools (Task 6–7), task branch + status mapping
 (Task 8–9), stdio + streamable-http + /health//ready//metrics + bearer (Task
-10–11), CLI `mcp` branch + graceful shutdown (Task 11), live test (Task 12). All
-spec sections map to a task.
+10–11), CLI `mcp` branch + graceful shutdown (Task 11), selectable JSON log
+format (Task 12), live test (Task 13). All spec sections map to a task.
 
 **Known confirm-at-impl points (reconnaissance steps, not placeholders):**
 Task 7 `ContentBlock`/`ErrorData` destructuring; Task 9 the client-tasks-
