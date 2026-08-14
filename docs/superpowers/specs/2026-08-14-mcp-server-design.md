@@ -131,12 +131,17 @@ transcript / end).
 
 Each takes `Parameters<T>` and returns `Result<CallToolResult, McpError>`.
 
-- **`place_call`** — `TaskSupport::Optional`.
+- **`place_call`** — hybrid task/immediate (rmcp 3.1.2 has **no**
+  `TaskSupport` enum and no macro sugar; the tool returns
+  `CallToolResponse::{Complete, Task}` and the server rejects a `Task` result
+  if the client didn't declare the tasks capability). The handler branches on
+  the request context: a **task-capable client** gets a
+  `CallToolResponse::Task` (via `task_manager::TaskManager`) that the harness
+  auto-polls; any other client gets the immediate `{ call_id }`
+  (`CallToolResponse::Complete`). Both paths call
+  `engine.place_call(to_number, scenario)` identically.
   Args `PlaceCallArgs { to_number: String, system_prompt: String, goal_schema:
   serde_json::Value, context: Option<serde_json::Value> }`.
-  Builds `ScenarioConfig`, calls `engine.place_call(to_number, scenario)`,
-  returns `{ "call_id": … }`. As a task, the task id doubles as the `call_id`;
-  status is driven from `CallState` (see mapping).
 - **`get_call_status`** — Args `CallIdArgs { call_id }`.
   `engine.store().get(&call_id)` → `{ call_id, state, number, started_ms,
   ended_ms?, error?, queued_position? }`. Missing → `invalid_params`.
@@ -149,35 +154,43 @@ Each takes `Parameters<T>` and returns `Result<CallToolResult, McpError>`.
 
 ### ext-tasks mapping
 
-`place_call`-as-task status is derived from `CallState`:
+The task future watches `CallStore` and maps `CallState` (a pure
+`task_status_for` fn drives non-terminal `set_status_message`; terminal states
+resolve the future's return):
 
-| CallState               | TaskStatus  | message / result                       |
-|-------------------------|-------------|----------------------------------------|
-| Queued                  | working     | "queued (position N)"                  |
-| Ringing                 | working     | "ringing"                              |
-| InProgress              | working     | "in progress"                          |
-| Completed               | completed   | result: `{ transcript, goal }`         |
-| HungUp                  | completed   | result: `{ transcript, goal }`         |
-| Cancelled               | cancelled   | —                                      |
-| Failed                  | failed      | error text                             |
+| CallState  | TaskStatus (`rmcp::model::TaskStatus`) | drive                                   |
+|------------|----------------------------------------|-----------------------------------------|
+| Queued     | Working                                | `set_status_message("queued (pos N)")`  |
+| Ringing    | Working                                | `set_status_message("ringing")`         |
+| InProgress | Working                                | `set_status_message("in progress")`     |
+| Completed  | Completed                              | `Ok(CallToolResult::structured({transcript,goal}))` |
+| HungUp     | Completed                              | `Ok(CallToolResult::structured({transcript,goal}))` |
+| Cancelled  | Cancelled                              | `Err(TaskExit::Cancelled)`              |
+| Failed     | Failed                                 | `Err(TaskExit::Error(ErrorData))`       |
 
-- `tasks/get` mirrors `get_call_status` (harness auto-polls this).
-- `tasks/cancel` → `engine.end_call`.
-- The task's terminal result carries the final transcript + goal so a task-aware
-  client gets the outcome without a separate `get_call_transcript` call.
+- `tasks/get` (server-routed to `get_task`) is what the harness auto-polls;
+  `set_status_message` supplies the human-readable progress.
+- `tasks/cancel` → the future observes `ctx.cancelled()` → `engine.end_call` →
+  `Err(TaskExit::Cancelled)`.
+- The terminal `Ok(CallToolResult)` carries transcript + goal, so a task-aware
+  client gets the outcome without a separate `get_call_transcript`.
 
-**Implementation risk / spike:** the exact rmcp 3.1 `task_manager` wiring (how a
-tool registers a task, updates its status from an external state source, and
-supplies the terminal result) must be read from the rmcp 3.1 sources before
-coding this. If the 3.1 task API proves unworkable within phase-5 scope, the
-fallback is to ship the four plain tools only and document the task layer as a
-follow-up — a decision to be made and recorded during implementation, not
-deferred silently.
+**Confirmed against rmcp 3.1.2 sources** (`task_manager::{TaskManager,
+TaskContext, TaskOptions, TaskExit}`, `model::task::TaskStatus`,
+`CallToolResponse::Task`, `ServerCapabilities::builder().enable_tasks()`). The
+one item to confirm at implementation time is the exact accessor for the
+client's declared tasks capability inside a tool fn (the request-context /
+peer-info path) — the plain-tool base (Tasks 6–8) works regardless, and the
+task branch (Task 9) is isolated so it can be reviewed on its own.
 
 ### Errors
 
-`fn internal(e) -> McpError` helper (`internal_error`). Unknown `call_id` →
-`McpError::invalid_params`. No panics across the tool boundary.
+Errors use `rmcp::ErrorData` (rmcp 3.1 has no public `McpError` alias). Helper
+`fn internal(e) -> ErrorData { ErrorData::internal_error(e.to_string(), None) }`.
+Unknown `call_id` → `ErrorData::invalid_params(…, None)`. Tool results use
+`ContentBlock` (rmcp 3.1 renamed `Content` → `ContentBlock`):
+`CallToolResult::success(vec![ContentBlock::text(json)])` or `::structured(v)`.
+No panics across the tool boundary.
 
 ## Component 3 — transports, bootstrap, CLI
 
