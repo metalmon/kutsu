@@ -104,6 +104,22 @@ impl Engine {
     }
 }
 
+/// Removes a call's `cancels` map entry when dropped, on every exit path —
+/// early returns, the normal end-of-function fallthrough, and panic unwind
+/// alike. Mirrors the owned-permit drop-safety pattern used for `_permit`
+/// above. `end_call` may have already removed the entry (to send on it); a
+/// second `remove` on an absent key is a harmless no-op.
+struct CancelGuard {
+    cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    call_id: String,
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        self.cancels.lock().unwrap().remove(&self.call_id);
+    }
+}
+
 /// Drive one call to completion. Safe ordering: SIP first, answer, THEN Gemini.
 async fn run_call(
     sip: SipTransport,
@@ -116,6 +132,8 @@ async fn run_call(
     number: String,
     call_id: String,
 ) {
+    let _cancel_guard = CancelGuard { cancels: cancels.clone(), call_id: call_id.clone() };
+
     // Wait for a concurrency slot. Held (as an owned permit) for the whole
     // call; released on drop, including on panic unwind — replaces SlotGuard.
     // Raced against the cancel signal so a call parked in Queued (no permit
@@ -124,7 +142,6 @@ async fn run_call(
         p = permits.acquire_owned() => p.expect("semaphore not closed"),
         _ = &mut cancel_rx => {
             store.finalize(&call_id, CallState::Cancelled, None, None, now_ms());
-            cancels.lock().unwrap().remove(&call_id);
             return;
         }
     };
@@ -241,7 +258,6 @@ async fn run_call(
     store.set_transcript(&call_id, outcome.transcript);
     let final_goal = goal.or(outcome.goal);
     store.finalize(&call_id, final_state, final_goal, None, now_ms());
-    cancels.lock().unwrap().remove(&call_id);
 
     // 10. Persist.
     if let Some(dir) = &server.transcript_dir {
