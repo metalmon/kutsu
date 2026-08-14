@@ -107,7 +107,8 @@ impl SipTransport {
     /// cap; `sip` does not enforce it — §9).
     pub fn active_calls(&self) -> usize;
 
-    /// Graceful shutdown: terminate active calls, stop the runtime thread.
+    /// Stop the runtime thread (in-flight calls dropped, best-effort BYE only;
+    /// engine should hangup() each call first — see §9).
     pub async fn shutdown(self);
 }
 
