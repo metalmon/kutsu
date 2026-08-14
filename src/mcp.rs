@@ -146,8 +146,9 @@ mod tests {
     use super::*;
     use crate::config::{Model, NetCheckConfig, ServerConfig, SipConfig};
 
-    #[tokio::test]
-    async fn lists_exactly_four_tools() {
+    /// Build a valid engine for tests, bound to loopback so `SipTransport::new`
+    /// binds offline (no real trunk) — mirrors `engine::tests::test_configs`.
+    async fn test_engine(cap: usize) -> Engine {
         let server = ServerConfig {
             api_key: "k".into(),
             proxy: None,
@@ -155,7 +156,7 @@ mod tests {
             voice: "Autonoe".into(),
             language: "en-US".into(),
             net_check: NetCheckConfig::default(),
-            max_concurrent_channels: 1,
+            max_concurrent_channels: cap,
             greet_after_silence_ms: 4000,
             transcript_dir: None,
             max_call_secs: 600,
@@ -169,7 +170,21 @@ mod tests {
             register: false,
             transport: Default::default(),
         };
-        let engine = Engine::new(Arc::new(server), &sip).await.unwrap();
+        Engine::new(Arc::new(server), &sip).await.unwrap()
+    }
+
+    /// Destructure the first content block's text, as the MCP tools always
+    /// return a single `ContentBlock::Text` JSON body.
+    fn first_text(r: &CallToolResult) -> String {
+        match r.content.first().unwrap() {
+            ContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lists_exactly_four_tools() {
+        let engine = test_engine(1).await;
         let srv = KutsuServer::new(Arc::new(engine));
 
         let names: Vec<_> = srv.tool_router.list_all().into_iter().map(|t| t.name.to_string()).collect();
@@ -177,5 +192,57 @@ mod tests {
         for n in ["place_call", "get_call_status", "get_call_transcript", "end_call"] {
             assert!(names.contains(&n.to_string()), "missing {n}");
         }
+    }
+
+    #[tokio::test]
+    async fn place_then_status_and_transcript_roundtrip() {
+        let engine = Arc::new(test_engine(1).await);
+        let srv = KutsuServer::new(engine.clone());
+
+        let out = srv
+            .place_call(Parameters(PlaceCallArgs {
+                to_number: "600".into(),
+                system_prompt: "hi".into(),
+                goal_schema: serde_json::json!({"type": "object"}),
+                context: None,
+            }))
+            .await
+            .unwrap();
+        let text = first_text(&out);
+        let call_id =
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["call_id"].as_str().unwrap().to_string();
+        assert!(!call_id.is_empty());
+
+        let status =
+            srv.get_call_status(Parameters(CallIdArgs { call_id: call_id.clone() })).await.unwrap();
+        let status_json = serde_json::from_str::<serde_json::Value>(&first_text(&status)).unwrap();
+        assert_eq!(status_json["call_id"], call_id);
+        assert!(status_json.get("state").is_some());
+
+        let tr = srv.get_call_transcript(Parameters(CallIdArgs { call_id: call_id.clone() })).await.unwrap();
+        let tr_json = serde_json::from_str::<serde_json::Value>(&first_text(&tr)).unwrap();
+        assert_eq!(tr_json["call_id"], call_id);
+        assert!(tr_json.get("transcript").is_some());
+
+        drop(srv);
+        Arc::into_inner(engine).expect("only strong ref left").shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_call_id_is_invalid_params() {
+        let engine = Arc::new(test_engine(1).await);
+        let srv = KutsuServer::new(engine.clone());
+
+        for r in [
+            srv.get_call_status(Parameters(CallIdArgs { call_id: "x".into() })).await,
+            srv.get_call_transcript(Parameters(CallIdArgs { call_id: "x".into() })).await,
+            srv.end_call(Parameters(CallIdArgs { call_id: "x".into() })).await,
+        ] {
+            let err = r.unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        }
+
+        drop(srv);
+        Arc::into_inner(engine).expect("only strong ref left").shutdown().await;
     }
 }
