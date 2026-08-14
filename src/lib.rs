@@ -18,6 +18,7 @@ pub mod error;
 pub mod gemini_live;
 pub mod main_support;
 pub mod mcp;
+pub mod mcp_http;
 pub mod net_check;
 pub mod proto;
 pub mod proxy;
