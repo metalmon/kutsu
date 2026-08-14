@@ -1,14 +1,6 @@
-//! Call state store.
-//!
-//! Planned shape (mirroring the proven `CallRecord`/`TranscriptEntry`/
-//! `CallState` design in zeroclaw's
-//! `crates/zeroclaw-channels/src/voice_call.rs`, adapted for a SIP-only,
-//! single-server context): `Arc<Mutex<HashMap<String, CallRecord>>>` keyed
-//! by `call_id`, with call direction, remote number, lifecycle state
-//! (ringing / in_progress / completed / failed / hung_up), and a running
-//! transcript.
-//!
-//! Not yet implemented.
+//! Call state store: an in-memory `Arc<Mutex<HashMap<call_id, CallRecord>>>`
+//! recording each outbound call's lifecycle state, running transcript, and
+//! outcome. Written by the engine; read (phase 5) by the MCP layer.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

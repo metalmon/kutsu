@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kutsu::config::{ScenarioConfig, ServerConfig, SipConfig};
+use kutsu::config::ScenarioConfig;
 use kutsu::engine::Engine;
 use kutsu::state::CallState;
 
