@@ -1,6 +1,8 @@
 //! Kutsu CLI entrypoint and MCP server bootstrap.
 //!
-//! Scaffold only: the `mcp` subcommand is wired up but not yet implemented.
+//! The `mcp` subcommand runs the MCP server (stdio or streamable-http
+//! transport) and is fully implemented; see [`kutsu::mcp`] and
+//! [`kutsu::mcp_http`].
 
 use clap::{Parser, Subcommand};
 
@@ -117,7 +119,9 @@ fn main() -> anyhow::Result<()> {
         }
         None => {
             println!(
-                "kutsu {} — outbound SIP calling MCP server (scaffold, not yet functional)",
+                "kutsu {} — outbound SIP calling MCP server. Subcommands: `mcp` (run the MCP server), \
+                 `call` (place one call from the CLI), `live` (dev harness against a scenario + audio file). \
+                 Run with --help for details.",
                 kutsu::version()
             );
             Ok(())
@@ -131,6 +135,12 @@ fn main() -> anyhow::Result<()> {
 /// then hang up any still-live calls and best-effort shut down the engine.
 async fn run_mcp(transport: String, bind: String, auth_token: Option<String>) -> anyhow::Result<()> {
     let (server_cfg, sip_cfg) = kutsu::main_support::configs_from_env()?;
+    if server_cfg.max_concurrent_channels == 0 {
+        tracing::warn!(
+            "max_concurrent_channels is 0 — every placed call will queue forever and never dial; \
+             raise the server config's max_concurrent_channels to enable calls"
+        );
+    }
     let engine = std::sync::Arc::new(
         kutsu::engine::Engine::new(std::sync::Arc::new(server_cfg), &sip_cfg).await?,
     );

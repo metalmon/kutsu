@@ -40,7 +40,7 @@ struct Counters {
 }
 
 /// A point-in-time view of engine load and lifetime totals, for the
-/// (future) `/metrics` endpoint.
+/// `/metrics` endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub active: usize,

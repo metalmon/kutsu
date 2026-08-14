@@ -166,6 +166,10 @@ impl KutsuServer {
         let options = TaskOptions::default().with_ttl_ms(Some(ttl_ms));
         let engine = self.engine.clone();
         let cid = call_id.clone();
+        // If this session's `TaskManager` is dropped (e.g. an http session ends)
+        // before the task finishes, the spawned future detaches rather than
+        // aborts — but it's bounded, not a leak: it exits as soon as the call
+        // reaches a terminal state, which is guaranteed within `max_call_secs`.
         let task = self.tasks.spawn(options, move |ctx| {
             Box::pin(async move {
                 let terminal = loop {
