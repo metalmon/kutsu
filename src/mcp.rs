@@ -59,6 +59,30 @@ fn unknown_call(id: &str) -> ErrorData {
     ErrorData::invalid_params(format!("unknown call_id: {id}"), None)
 }
 
+/// Map a [`CallState`] to its corresponding MCP [`TaskStatus`].
+///
+/// Used by Task 9 (place_call task branch).
+#[allow(dead_code)]
+fn task_status_for(state: crate::state::CallState) -> rmcp::model::TaskStatus {
+    use crate::state::CallState;
+    use rmcp::model::TaskStatus;
+    match state {
+        CallState::Queued | CallState::Ringing | CallState::InProgress => TaskStatus::Working,
+        CallState::Completed | CallState::HungUp => TaskStatus::Completed,
+        CallState::Cancelled => TaskStatus::Cancelled,
+        CallState::Failed => TaskStatus::Failed,
+    }
+}
+
+/// Check if a [`CallState`] is terminal (not active).
+///
+/// Used by Task 9 (place_call task branch).
+#[allow(dead_code)]
+fn is_terminal_state(state: crate::state::CallState) -> bool {
+    use crate::state::CallState;
+    !matches!(state, CallState::Queued | CallState::Ringing | CallState::InProgress)
+}
+
 #[tool_router]
 impl KutsuServer {
     pub fn new(engine: Arc<Engine>) -> Self {
@@ -244,5 +268,21 @@ mod tests {
 
         drop(srv);
         Arc::into_inner(engine).expect("only strong ref left").shutdown().await;
+    }
+
+    #[test]
+    fn task_status_mapping() {
+        use rmcp::model::TaskStatus::*;
+        use crate::state::CallState as S;
+        assert!(matches!(task_status_for(S::Queued), Working));
+        assert!(matches!(task_status_for(S::Ringing), Working));
+        assert!(matches!(task_status_for(S::InProgress), Working));
+        assert!(matches!(task_status_for(S::Completed), Completed));
+        assert!(matches!(task_status_for(S::HungUp), Completed));
+        assert!(matches!(task_status_for(S::Cancelled), Cancelled));
+        assert!(matches!(task_status_for(S::Failed), Failed));
+        assert!(!is_terminal_state(S::Queued));
+        assert!(is_terminal_state(S::Completed));
+        assert!(is_terminal_state(S::Cancelled));
     }
 }
