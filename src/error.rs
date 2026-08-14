@@ -16,6 +16,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("sip error: {0}")]
+    Sip(#[from] crate::sip::SipError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
