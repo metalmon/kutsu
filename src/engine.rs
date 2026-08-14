@@ -199,7 +199,11 @@ async fn run_call(
                 Some(SipEvent::Terminated(_)) | None => break CallState::HungUp,
                 Some(_) => {}
             },
-            _ = &mut bridge_task => break CallState::HungUp,
+            r = &mut bridge_task => break match r {
+                Ok(crate::bridge::BridgeEnd::PhoneClosed) => CallState::HungUp,
+                Ok(crate::bridge::BridgeEnd::GeminiClosed) => CallState::Failed,
+                Err(_) => CallState::Failed, // bridge task panicked
+            },
             _ = &mut deadline => break CallState::Completed,
         }
     };
