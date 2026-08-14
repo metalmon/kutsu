@@ -29,7 +29,7 @@ pub enum Event {
     Warning(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct TranscriptEntry {
     pub role: Role,
     pub text: String,
