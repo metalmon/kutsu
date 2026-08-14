@@ -362,9 +362,10 @@ git commit -m "feat(sip): split module; add public types + pure helpers"
 - Test: `src/sip/mod.rs` (inline, offline — binds loopback UDP only)
 
 **Interfaces:**
-- Consumes: `SipConfig`, `SipError`, helpers from Task 3.
+- Consumes: `SipConfig`, `SipError`, helpers/types (`SipEvent`) from Task 3.
 - Produces:
-  - `sip::SipTransport` (`#[derive(Clone)]`), `SipTransport::new(&SipConfig) -> Result<Self, SipError>`, `SipTransport::active_calls(&self) -> usize`, `SipTransport::shutdown(self)` (async).
+  - `sip::SipCall { pub call_id: String, .. }` with `events`/`audio_in`/`audio_out`/`hangup`/`from_parts` (defined here because `Cmd`/`place_call` reference it; `from_parts` is unused until Task 5 — a `dead_code` warning here is expected and fine).
+  - `sip::SipTransport` (`#[derive(Clone)]`), `SipTransport::new(&SipConfig) -> Result<Self, SipError>`, `SipTransport::place_call(&self, &str) -> Result<SipCall, SipError>`, `SipTransport::active_calls(&self) -> usize`, `SipTransport::shutdown(self)` (async).
   - internal `Cmd` enum, `build_endpoint(IpAddr) -> Result<(ezk_sip_core::Endpoint, SocketAddr), SipError>` in `call.rs`.
   - **Placeholder** `run_call` is added in Task 5; in this task the command loop handles `Cmd::Place` by immediately replying `Err(SipError::Config("not implemented"))` so the module compiles. Task 5 replaces that arm.
 
@@ -427,7 +428,63 @@ pub(crate) async fn build_endpoint(local_ip: IpAddr) -> Result<(Endpoint, Socket
 }
 ```
 
-- [ ] **Step 4: Add the transport + thread to `src/sip/mod.rs`.** Imports: `use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}}; use tokio::sync::{mpsc, oneshot};`
+- [ ] **Step 4: Add `SipCall` + the transport + thread to `src/sip/mod.rs`.** Imports: `use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}}; use tokio::sync::{mpsc, oneshot}; use bytes::Bytes;`
+
+First the `SipCall` type (referenced by `Cmd`/`place_call` below; its channel ends are filled by `run_call` in Task 5):
+
+```rust
+/// A live outbound call. All fields are Send; the ezk `Call` loop runs on the
+/// SIP runtime thread and communicates only through these channels.
+pub struct SipCall {
+    pub call_id: String,
+    events: mpsc::Receiver<SipEvent>,
+    rtp_in: mpsc::Receiver<Bytes>,
+    rtp_out: mpsc::Sender<Bytes>,
+    hangup: Option<oneshot::Sender<()>>,
+}
+
+impl SipCall {
+    /// Lifecycle events (`Ringing` / `Answered` / `Terminated`).
+    pub fn events(&mut self) -> &mut mpsc::Receiver<SipEvent> {
+        &mut self.events
+    }
+
+    /// Inbound G.711 payloads (remote → us), one RTP payload per item.
+    pub fn audio_in(&mut self) -> &mut mpsc::Receiver<Bytes> {
+        &mut self.rtp_in
+    }
+
+    /// Outbound G.711 payload sink (us → remote). Clone to share.
+    pub fn audio_out(&self) -> mpsc::Sender<Bytes> {
+        self.rtp_out.clone()
+    }
+
+    /// Hang up (send BYE) and wait for termination.
+    pub async fn hangup(mut self) {
+        if let Some(h) = self.hangup.take() {
+            let _ = h.send(());
+        }
+        while let Some(ev) = self.events.recv().await {
+            if matches!(ev, SipEvent::Terminated(_)) {
+                break;
+            }
+        }
+    }
+
+    /// Assemble a handle from channel ends (called by `run_call`, Task 5).
+    pub(crate) fn from_parts(
+        call_id: String,
+        events: mpsc::Receiver<SipEvent>,
+        rtp_in: mpsc::Receiver<Bytes>,
+        rtp_out: mpsc::Sender<Bytes>,
+        hangup: oneshot::Sender<()>,
+    ) -> Self {
+        Self { call_id, events, rtp_in, rtp_out, hangup: Some(hangup) }
+    }
+}
+```
+
+Then the transport + thread:
 
 ```rust
 /// Command sent from `SipTransport` to the SIP runtime thread.
@@ -586,10 +643,10 @@ git commit -m "feat(sip): SipTransport runtime thread + endpoint bind"
 - Test: `tests/sip_outbound.rs` (new, `#[ignore]`, live stand)
 
 **Interfaces:**
-- Consumes: `build_endpoint` (Task 4), helpers/types (Task 3), `Cmd` (Task 4).
+- Consumes: `build_endpoint` (Task 4), helpers/types (Task 3), `Cmd` + `SipCall` (Task 4).
 - Produces:
-  - `sip::SipCall { call_id: String, .. }` with `events(&mut self) -> &mut mpsc::Receiver<SipEvent>`, `audio_in(&mut self) -> &mut mpsc::Receiver<Bytes>`, `audio_out(&self) -> mpsc::Sender<Bytes>`, `hangup(self)` (async).
-  - `call::run_call(endpoint, cfg, server, bound, number, call_id, active_guard, reply)` (async, runs on the SIP thread).
+  - `call::run_call(endpoint, cfg, server, bound, number, call_id, reply)` (async, runs on the SIP thread), plus the media/URI/auth builders and `map_make_err` in `call.rs`.
+  - The real `Cmd::Place` arm in `sip_thread_main` (replacing Task 4's placeholder).
 
 - [ ] **Step 1: Write the failing live integration test.** Create `tests/sip_outbound.rs`:
 
@@ -675,64 +732,7 @@ async fn outbound_echo_600_bidirectional_rtp() {
 Run: `cargo test --features vendor-openssl --test sip_outbound -- --ignored`
 Expected: FAIL — `SipCall` has no `events`/`audio_in`/`audio_out`/`hangup`.
 
-- [ ] **Step 3: Add `SipCall` to `src/sip/mod.rs`.** Import `use bytes::Bytes;`.
-
-```rust
-/// A live outbound call. All fields are Send; the ezk `Call` loop runs on the
-/// SIP runtime thread and communicates only through these channels.
-pub struct SipCall {
-    pub call_id: String,
-    events: mpsc::Receiver<SipEvent>,
-    rtp_in: mpsc::Receiver<Bytes>,
-    rtp_out: mpsc::Sender<Bytes>,
-    hangup: Option<oneshot::Sender<()>>,
-}
-
-impl SipCall {
-    /// Lifecycle events (`Ringing` / `Answered` / `Terminated`).
-    pub fn events(&mut self) -> &mut mpsc::Receiver<SipEvent> {
-        &mut self.events
-    }
-
-    /// Inbound G.711 payloads (remote → us), one RTP payload per item.
-    pub fn audio_in(&mut self) -> &mut mpsc::Receiver<Bytes> {
-        &mut self.rtp_in
-    }
-
-    /// Outbound G.711 payload sink (us → remote). Clone to share.
-    pub fn audio_out(&self) -> mpsc::Sender<Bytes> {
-        self.rtp_out.clone()
-    }
-
-    /// Hang up (send BYE) and wait for termination.
-    pub async fn hangup(mut self) {
-        if let Some(h) = self.hangup.take() {
-            let _ = h.send(());
-        }
-        while let Some(ev) = self.events.recv().await {
-            if matches!(ev, SipEvent::Terminated(_)) {
-                break;
-            }
-        }
-    }
-}
-```
-
-Also make the channel-end fields constructible from `call.rs`: add a `pub(crate)` constructor:
-
-```rust
-impl SipCall {
-    pub(crate) fn from_parts(
-        call_id: String,
-        events: mpsc::Receiver<SipEvent>,
-        rtp_in: mpsc::Receiver<Bytes>,
-        rtp_out: mpsc::Sender<Bytes>,
-        hangup: oneshot::Sender<()>,
-    ) -> Self {
-        Self { call_id, events, rtp_in, rtp_out, hangup: Some(hangup) }
-    }
-}
-```
+- [ ] **Step 3: Confirm `SipCall` (already defined in Task 4).** No new code: the `SipCall` struct, its `events`/`audio_in`/`audio_out`/`hangup` accessors, and the `pub(crate) from_parts` constructor were all added in Task 4 Step 4 so the module compiled. `run_call` (Step 5) calls `SipCall::from_parts(...)`. When you add the `use crate::sip::{...}` line in `call.rs` (Step 5), **consolidate it with the `use crate::sip::SipError;` that Task 4 already put at the top of `call.rs`** — a duplicate import of `SipError` (or of the `std::net` types Task 4 imported) is a compile error. There should be exactly one `use crate::sip::{...}` and one `use std::net::{...}` in `call.rs`.
 
 - [ ] **Step 4: Replace the `Cmd::Place` placeholder in `sip_thread_main`.** Swap the placeholder arm for:
 
