@@ -95,7 +95,7 @@ fn neg_codec(c: &ezk_sip_ua::Codec) -> NegotiatedCodec {
 }
 
 /// Drive one outbound call to completion. Owns all `!Send` ezk state; runs on
-/// the SIP runtime thread. Adapted from the phase-1 spike (tests/sip_spike.rs).
+/// the SIP runtime thread.
 pub(crate) async fn run_call(
     endpoint: Endpoint,
     cfg: SipConfig,
