@@ -97,6 +97,13 @@ impl Engine {
         }
     }
 
+    /// Maximum wall-clock duration of a single call, in seconds (the engine's
+    /// hard deadline). Used by the MCP task branch to size the task TTL so a
+    /// long-but-valid call is never TTL-swept mid-flight.
+    pub fn max_call_secs(&self) -> u64 {
+        self.server.max_call_secs
+    }
+
     /// Place an outbound call: records it as `Queued` and spawns the call
     /// task, which waits for a concurrency permit before dialing. Always
     /// succeeds; SIP/other failures surface later via `CallState::Failed`.

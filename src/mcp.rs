@@ -158,9 +158,15 @@ impl KutsuServer {
         // Task-capable clients: spawn an MCP task that drives the call to a
         // terminal state, surfacing progress via status messages and honoring
         // cooperative cancellation (which hangs up the underlying call).
+        // Size the task TTL from the engine's hard call deadline (+30 s for
+        // teardown and a post-call observation window) so a long-but-valid call
+        // is never swept to `failed`/aborted mid-flight by the SDK's TTL sweeper
+        // — the default 5-min TTL is shorter than `max_call_secs` (default 600).
+        let ttl_ms = self.engine.max_call_secs() * 1000 + 30_000;
+        let options = TaskOptions::default().with_ttl_ms(Some(ttl_ms));
         let engine = self.engine.clone();
         let cid = call_id.clone();
-        let task = self.tasks.spawn(TaskOptions::default(), move |ctx| {
+        let task = self.tasks.spawn(options, move |ctx| {
             Box::pin(async move {
                 let terminal = loop {
                     // Publish the current human-readable status before waiting.
@@ -472,7 +478,14 @@ mod tests {
         let srv = KutsuServer::new(engine);
 
         let resp = srv.place_call_inner(args("600"), true).await.unwrap();
-        assert!(matches!(resp, CallToolResponse::Task(_)));
+        let task = match resp {
+            CallToolResponse::Task(create) => create.task,
+            other => panic!("expected a Task response, got {other:?}"),
+        };
+        // TTL is derived from the engine's hard call deadline (600 s here) plus
+        // a 30 s teardown/observation margin, not the SDK's 5-min default — so a
+        // long-but-valid call is never TTL-swept mid-flight.
+        assert_eq!(task.ttl_ms, Some(600 * 1000 + 30_000));
 
         // Abort the background watcher task so it stops touching the engine.
         srv.tasks.shutdown();
