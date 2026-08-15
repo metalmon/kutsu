@@ -49,6 +49,20 @@ fn finalize_error(final_state: CallState, abort_reason: Option<String>) -> Optio
     if final_state == CallState::Failed { abort_reason } else { None }
 }
 
+/// Map the reconciled `final_state` of an in-call terminal finalize to a
+/// `CallOutcome`. `HungUp` is a successful connection (the caller or model
+/// ended a connected call) — same success bucket as `Completed` per
+/// `bump_counter`. `Cancelled` never got a dial outcome (call was cancelled
+/// before/without a SIP result reaching this point in-call), so `None`.
+fn finalize_outcome(final_state: CallState) -> Option<CallOutcome> {
+    match final_state {
+        CallState::Completed | CallState::HungUp => Some(CallOutcome::Completed),
+        CallState::Failed => Some(CallOutcome::Failed),
+        CallState::Cancelled => None,
+        CallState::Queued | CallState::Ringing | CallState::InProgress => None,
+    }
+}
+
 /// Errors from placing a call.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -437,8 +451,7 @@ async fn run_call(
     if error.is_some() {
         counters.quality_aborted.fetch_add(1, Ordering::Relaxed);
     }
-    let final_outcome = if final_state == CallState::Completed { CallOutcome::Completed } else { CallOutcome::Failed };
-    store.finalize(&call_id, final_state, final_goal, error, Some(final_outcome), now_ms());
+    store.finalize(&call_id, final_state, final_goal, error, finalize_outcome(final_state), now_ms());
     bump_counter(&counters, final_state);
 
     // 10. Persist. Owner-only permissions: the transcript may contain PII.
@@ -630,5 +643,16 @@ mod tests {
         assert_eq!(finalize_error(CallState::Completed, Some("boom".into())), None);
         assert_eq!(finalize_error(CallState::HungUp, Some("boom".into())), None);
         assert_eq!(finalize_error(CallState::Cancelled, Some("boom".into())), None);
+    }
+
+    #[test]
+    fn finalize_outcome_maps_hungup_to_completed() {
+        // HungUp is a successful connection (caller/model ended a connected
+        // call) — same success bucket as Completed per `bump_counter`, not a
+        // technical failure.
+        assert_eq!(finalize_outcome(CallState::Completed), Some(CallOutcome::Completed));
+        assert_eq!(finalize_outcome(CallState::HungUp), Some(CallOutcome::Completed));
+        assert_eq!(finalize_outcome(CallState::Failed), Some(CallOutcome::Failed));
+        assert_eq!(finalize_outcome(CallState::Cancelled), None);
     }
 }
