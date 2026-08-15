@@ -262,6 +262,9 @@ mod tests {
             failed_total: 5,
             cancelled_total: 6,
             channels_cap: 3,
+            underruns_total: 0,
+            starved_ms_total: 0,
+            quality_aborted_total: 0,
         };
         let s = render_prometheus(&m);
         for line in [

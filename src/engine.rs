@@ -37,6 +37,11 @@ struct Counters {
     completed: AtomicU64,
     failed: AtomicU64,
     cancelled: AtomicU64,
+    /// Cumulative audio-quality totals, added once per call at finalize (not
+    /// per tick) so a call's underruns/starved-ms are counted exactly once.
+    underruns: AtomicU64,
+    starved_ms: AtomicU64,
+    quality_aborted: AtomicU64,
 }
 
 /// A point-in-time view of engine load and lifetime totals, for the
@@ -50,6 +55,9 @@ pub struct MetricsSnapshot {
     pub failed_total: u64,
     pub cancelled_total: u64,
     pub channels_cap: usize,
+    pub underruns_total: u64,
+    pub starved_ms_total: u64,
+    pub quality_aborted_total: u64,
 }
 
 /// The call engine: owns the SIP transport, the call store, and config.
@@ -94,6 +102,9 @@ impl Engine {
             failed_total: self.counters.failed.load(Ordering::Relaxed),
             cancelled_total: self.counters.cancelled.load(Ordering::Relaxed),
             channels_cap: self.server.max_concurrent_channels,
+            underruns_total: self.counters.underruns.load(Ordering::Relaxed),
+            starved_ms_total: self.counters.starved_ms.load(Ordering::Relaxed),
+            quality_aborted_total: self.counters.quality_aborted.load(Ordering::Relaxed),
         }
     }
 
@@ -262,6 +273,7 @@ async fn run_call(
     // 5. Split the session; 6. start the bridge.
     let (gemini_handle, gemini_in, gemini_events) = session.split();
     let (events_out_tx, mut events_out_rx) = mpsc::channel::<Event>(256);
+    let quality = bridge::QualityShared::new();
     let ports = BridgePorts {
         codec: codec.kind,
         phone_in: audio_in,
@@ -269,10 +281,9 @@ async fn run_call(
         gemini_in,
         gemini_events,
         events_out: events_out_tx,
-        // TODO(task 5): source from config; publish `quality` into call state.
-        prebuffer_ms: 140,
-        resume_ms: 60,
-        quality: bridge::QualityShared::new(),
+        prebuffer_ms: server.quality.prebuffer_ms,
+        resume_ms: server.quality.resume_ms,
+        quality: quality.clone(),
     };
     let mut bridge_task = tokio::spawn(bridge::run(ports));
 
@@ -280,8 +291,10 @@ async fn run_call(
     let mut goal = None;
     let mut first_transcript = false;
     let mut events_open = true;
+    let mut abort_reason: Option<String> = None;
     let deadline = tokio::time::sleep(Duration::from_secs(server.max_call_secs));
     tokio::pin!(deadline);
+    let mut qtick = tokio::time::interval(Duration::from_secs(1));
     let end_state = loop {
         tokio::select! {
             ev = events_out_rx.recv(), if events_open => match ev {
@@ -316,6 +329,19 @@ async fn run_call(
             },
             _ = &mut deadline => break CallState::Completed,
             _ = &mut cancel_rx => break CallState::Cancelled,
+            _ = qtick.tick() => {
+                let q = quality.snapshot();
+                store.set_quality(&call_id, q);
+                let cap = server.quality.abort_underruns;
+                if cap > 0 && q.underruns >= cap as u64 {
+                    counters.quality_aborted.fetch_add(1, Ordering::Relaxed);
+                    abort_reason = Some(format!(
+                        "aborted: audio quality degraded ({} underruns, {} ms silence)",
+                        q.underruns, q.starved_ms
+                    ));
+                    break CallState::Failed;
+                }
+            }
         }
     };
 
@@ -332,9 +358,22 @@ async fn run_call(
         EndedBy::ModelEndCall => CallState::Completed,
         _ => end_state,
     };
+    // Final quality snapshot + cumulative totals, added exactly once here
+    // (not per tick, which only updates the live record + checks the abort
+    // threshold).
+    let q = quality.snapshot();
+    store.set_quality(&call_id, q);
+    counters.underruns.fetch_add(q.underruns, Ordering::Relaxed);
+    counters.starved_ms.fetch_add(q.starved_ms, Ordering::Relaxed);
+    tracing::info!(%call_id, underruns = q.underruns, starved_ms = q.starved_ms, max_gap_ms = q.max_gap_ms, "call audio quality");
+
     store.set_transcript(&call_id, outcome.transcript);
     let final_goal = goal.or(outcome.goal);
-    store.finalize(&call_id, final_state, final_goal, None, now_ms());
+    // Only attach the abort error if the reconciled outcome is still Failed —
+    // a late ModelEndCall can override end_state to Completed even after the
+    // quality-abort arm fired; don't leave a stale error on a completed call.
+    let error = if final_state == CallState::Failed { abort_reason } else { None };
+    store.finalize(&call_id, final_state, final_goal, error, now_ms());
     bump_counter(&counters, final_state);
 
     // 10. Persist. Owner-only permissions: the transcript may contain PII.
@@ -446,6 +485,17 @@ mod tests {
         let (server, sip_cfg) = test_configs(1);
         let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
         assert!(!engine.end_call("nope"));
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn metrics_snapshot_has_quality_fields() {
+        let (server, sip_cfg) = test_configs(1);
+        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
+        let m = engine.metrics_snapshot();
+        assert_eq!(m.underruns_total, 0);
+        assert_eq!(m.starved_ms_total, 0);
+        assert_eq!(m.quality_aborted_total, 0);
         engine.shutdown().await;
     }
 
