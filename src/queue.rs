@@ -44,9 +44,16 @@ impl QueueStore for MemQueue {
         self.entries.insert((entry.eligible_at_ms, entry.call_id.clone()), entry);
     }
     fn pop_eligible(&mut self, now_ms: u64) -> Option<PendingEntry> {
-        let key = self.entries.range(..=(now_ms, String::from("\u{10FFFF}")))
-            .next().map(|(k, _)| k.clone())?;
-        self.entries.remove(&key)
+        // BTreeMap is ordered by (eligible_at_ms, call_id), so the first
+        // entry is always the earliest — no sentinel/range trick needed
+        // (a prior version used a "\u{10FFFF}" upper-bound sentinel, which
+        // is not a true universal string bound: a call_id starting with
+        // U+10FFFF and having trailing chars would sort after it and be
+        // silently skipped).
+        match self.entries.first_key_value() {
+            Some((k, _)) if k.0 <= now_ms => self.entries.pop_first().map(|(_, v)| v),
+            _ => None,
+        }
     }
     fn peek_next_eligible_at(&self) -> Option<u64> {
         self.entries.keys().next().map(|(t, _)| *t)
@@ -78,6 +85,17 @@ mod tests {
         assert_eq!(q.pop_eligible(150).unwrap().call_id, "a"); // only a is eligible
         assert!(q.pop_eligible(150).is_none());          // b not yet
         assert_eq!(q.pop_eligible(250).unwrap().call_id, "b");
+    }
+    #[test]
+    fn pop_eligible_ties_break_by_call_id() {
+        let mut q = MemQueue::new();
+        q.push(entry("b", 100));
+        q.push(entry("a", 100));
+        q.push(entry("c", 100));
+        assert_eq!(q.pop_eligible(100).unwrap().call_id, "a");
+        assert_eq!(q.pop_eligible(100).unwrap().call_id, "b");
+        assert_eq!(q.pop_eligible(100).unwrap().call_id, "c");
+        assert!(q.pop_eligible(100).is_none());
     }
     #[test]
     fn peek_and_position_and_remove() {
