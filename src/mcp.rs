@@ -329,6 +329,7 @@ mod tests {
             proxy: None,
             model: Model::HalfCascade,
             voice: "Autonoe".into(),
+            voice_gender: crate::config::Gender::Female,
             language: "en-US".into(),
             net_check: NetCheckConfig::default(),
             max_concurrent_channels: cap,

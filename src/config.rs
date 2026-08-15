@@ -89,12 +89,40 @@ impl Default for NetCheckConfig {
     }
 }
 
+/// Grammatical gender the agent uses when referring to itself, matched to the
+/// configured [`ServerConfig::voice`]. Kept as an explicit setting rather than
+/// derived from the provider-specific voice name, so the prompt layer stays
+/// provider-independent (the operator sets it to match whatever voice they pick).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Gender {
+    Male,
+    #[default]
+    Female,
+    /// No grammatical-gender instruction (e.g. a genderless language or an
+    /// androgynous voice).
+    Neutral,
+}
+
+impl Gender {
+    /// Parse a config/env string (case-insensitive). Unknown/empty falls back to
+    /// `Female`, which matches the default voice (`Autonoe`).
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "male" | "m" | "man" => Gender::Male,
+            "neutral" | "none" | "n" => Gender::Neutral,
+            _ => Gender::Female,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub api_key: String,
     pub proxy: Option<Proxy>,
     pub model: Model,
     pub voice: String,
+    /// Grammatical gender the agent speaks in, matched to `voice`.
+    pub voice_gender: Gender,
     pub language: String,
     pub net_check: NetCheckConfig,
     pub max_concurrent_channels: usize,
@@ -178,7 +206,8 @@ mod tests {
             proxy: None,
             model: Model::HalfCascade,
             voice: "Autonoe".into(),
-            language: "ru-RU".into(),
+            voice_gender: crate::config::Gender::Female,
+            language: "en-US".into(),
             net_check: NetCheckConfig::default(),
             max_concurrent_channels: 3,
             greet_after_silence_ms: DEFAULT_GREET_AFTER_SILENCE_MS,

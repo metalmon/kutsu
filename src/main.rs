@@ -223,7 +223,10 @@ async fn run_live(
         proxy,
         model,
         voice: voice.unwrap_or_else(|| "Autonoe".into()),
-        language: "ru-RU".into(),
+        voice_gender: kutsu::config::Gender::parse(
+            &std::env::var("KUTSU_VOICE_GENDER").unwrap_or_default(),
+        ),
+        language: std::env::var("KUTSU_LANGUAGE").unwrap_or_else(|_| "en-US".into()),
         net_check: kutsu::config::NetCheckConfig::default(),
         max_concurrent_channels: 3,
         greet_after_silence_ms: greet_after_silence_ms

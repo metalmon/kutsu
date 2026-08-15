@@ -3,7 +3,7 @@
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-use crate::config::{Model, ScenarioConfig, ServerConfig};
+use crate::config::{Gender, Model, ScenarioConfig, ServerConfig};
 
 const HALF_MODEL: &str = "gemini-3.1-flash-live-preview";
 const NATIVE_MODEL: &str = "gemini-2.5-flash-native-audio-preview-12-2025";
@@ -73,7 +73,7 @@ pub fn build_setup(server: &ServerConfig, scenario: &ScenarioConfig, resume_hand
             "temperature": 0.8,
             "speechConfig": speech
         },
-        "systemInstruction": { "parts": [ { "text": build_system_prompt(scenario) } ] },
+        "systemInstruction": { "parts": [ { "text": build_system_prompt(scenario, server.voice_gender) } ] },
         "tools": [ { "functionDeclarations": [ end_call ] } ],
         "realtimeInputConfig": { "automaticActivityDetection": aad },
         "sessionResumption": { "handle": resume_handle },
@@ -102,15 +102,36 @@ const CLOSING_INSTRUCTION: &str = "\n\n# Ending the call\n\
     goodbye only once: the line is played in full and then the call is hung up, \
     so never add a second goodbye and do not keep talking after it.";
 
-/// Assemble the system instruction from prompt + optional context + the standard
-/// closing directive.
+/// Grammatical-gender directive matched to the configured voice, so the agent
+/// doesn't (e.g.) say a masculine «я понял» in a female voice. English by repo
+/// convention; the Russian examples anchor the gendered forms that matter.
+fn gender_instruction(gender: Gender) -> &'static str {
+    match gender {
+        Gender::Female =>
+            "\n\n# Your voice\nYou speak with a FEMALE voice. Always refer to \
+             yourself using feminine grammatical forms — verbs, adjectives, \
+             participles (in Russian: «я поняла», «была рада», «сама», «готова»). \
+             Never use masculine self-reference.",
+        Gender::Male =>
+            "\n\n# Your voice\nYou speak with a MALE voice. Always refer to \
+             yourself using masculine grammatical forms — verbs, adjectives, \
+             participles (in Russian: «я понял», «был рад», «сам», «готов»). \
+             Never use feminine self-reference.",
+        Gender::Neutral => "",
+    }
+}
+
+/// Assemble the system instruction: per-call scenario (prompt + optional
+/// context) followed by the standard call-protocol layer (voice-gender +
+/// closing directives).
 /// (Current-time block is appended by the session at connect time — see Task 8.)
-fn build_system_prompt(scenario: &ScenarioConfig) -> String {
+fn build_system_prompt(scenario: &ScenarioConfig, gender: Gender) -> String {
     let mut s = scenario.system_prompt.clone();
     if let Some(ctx) = &scenario.context {
         s.push_str("\n\n# Contact context\n");
         s.push_str(&ctx.to_string());
     }
+    s.push_str(gender_instruction(gender));
     s.push_str(CLOSING_INSTRUCTION);
     s
 }
@@ -204,7 +225,8 @@ mod tests {
     fn server(model: Model) -> ServerConfig {
         ServerConfig {
             api_key: "KEY".into(), proxy: None, model, voice: "Autonoe".into(),
-            language: "ru-RU".into(), net_check: NetCheckConfig::default(),
+            voice_gender: Gender::Female,
+            language: "en-US".into(), net_check: NetCheckConfig::default(),
             max_concurrent_channels: 3, greet_after_silence_ms: 4000,
             transcript_dir: None, max_call_secs: 600,
         }
@@ -226,11 +248,24 @@ mod tests {
 
     #[test]
     fn system_prompt_appends_closing_instruction() {
-        let p = build_system_prompt(&scenario());
+        let p = build_system_prompt(&scenario(), Gender::Female);
         assert!(p.starts_with("Be nice."));
         assert!(p.contains("end_call"), "closing must reference the tool");
         assert!(p.contains("SAME turn"), "closing must couple the goodbye to the tool");
         assert!(p.to_lowercase().contains("goodbye"));
+    }
+
+    #[test]
+    fn system_prompt_injects_voice_gender() {
+        let f = build_system_prompt(&scenario(), Gender::Female);
+        assert!(f.contains("FEMALE voice"));
+        assert!(f.contains("feminine"));
+        let m = build_system_prompt(&scenario(), Gender::Male);
+        assert!(m.contains("MALE voice"));
+        assert!(m.contains("masculine"));
+        // Neutral adds no voice-gender block.
+        let n = build_system_prompt(&scenario(), Gender::Neutral);
+        assert!(!n.contains("# Your voice"));
     }
 
     #[test]
@@ -242,7 +277,7 @@ mod tests {
         assert_eq!(setup["generationConfig"]["temperature"], 0.8);
         assert_eq!(setup["generationConfig"]["speechConfig"]["voiceConfig"]
             ["prebuiltVoiceConfig"]["voiceName"], "Autonoe");
-        assert_eq!(setup["generationConfig"]["speechConfig"]["languageCode"], "ru-RU");
+        assert_eq!(setup["generationConfig"]["speechConfig"]["languageCode"], "en-US");
         // Exactly one tool: end_call, parameters == goal_schema.
         let decl = &setup["tools"][0]["functionDeclarations"][0];
         assert_eq!(decl["name"], "end_call");

@@ -1,8 +1,8 @@
 //! Shared config construction for the `kutsu call` CLI and its integration test.
 
 use crate::config::{
-    Model, NetCheckConfig, Proxy, ScenarioConfig, ServerConfig, SipConfig, SipTransportKind,
-    DEFAULT_GREET_AFTER_SILENCE_MS,
+    Gender, Model, NetCheckConfig, Proxy, ScenarioConfig, ServerConfig, SipConfig,
+    SipTransportKind, DEFAULT_GREET_AFTER_SILENCE_MS,
 };
 
 fn env_or(k: &str, d: &str) -> String {
@@ -29,7 +29,8 @@ pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
         proxy,
         model: Model::HalfCascade,
         voice: env_or("KUTSU_VOICE", "Autonoe"),
-        language: "ru-RU".into(),
+        voice_gender: Gender::parse(&env_or("KUTSU_VOICE_GENDER", "female")),
+        language: env_or("KUTSU_LANGUAGE", "en-US"),
         net_check: NetCheckConfig::default(),
         max_concurrent_channels: 3,
         greet_after_silence_ms: DEFAULT_GREET_AFTER_SILENCE_MS,
