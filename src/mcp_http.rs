@@ -206,6 +206,7 @@ mod tests {
             max_concurrent_channels: cap,
             greet_after_silence_ms: 4000,
             transcript_dir: None,
+            dump_uplink_dir: None,
             max_call_secs: 600,
             quality: crate::config::QualityConfig::default(),
         };

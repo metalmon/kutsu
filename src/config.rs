@@ -132,6 +132,8 @@ pub struct ServerConfig {
     pub greet_after_silence_ms: u64,
     /// Directory to write finalized CallRecord JSON to; None = skip persistence.
     pub transcript_dir: Option<PathBuf>,
+    /// Directory for per-call uplink audio dumps (WAV). `None` disables it.
+    pub dump_uplink_dir: Option<std::path::PathBuf>,
     /// Safety cap on a single call's duration (seconds).
     pub max_call_secs: u64,
     /// Downlink audio-quality pacing (prebuffer/resume/abort thresholds).
@@ -241,6 +243,7 @@ mod tests {
             max_concurrent_channels: 3,
             greet_after_silence_ms: DEFAULT_GREET_AFTER_SILENCE_MS,
             transcript_dir: Some(std::path::PathBuf::from("/tmp/x")),
+            dump_uplink_dir: None,
             max_call_secs: 600,
             quality: QualityConfig::default(),
         };

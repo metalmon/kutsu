@@ -39,6 +39,7 @@ pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
         max_concurrent_channels: 3,
         greet_after_silence_ms: DEFAULT_GREET_AFTER_SILENCE_MS,
         transcript_dir: non_empty("KUTSU_TRANSCRIPT_DIR").map(std::path::PathBuf::from),
+        dump_uplink_dir: non_empty("KUTSU_DUMP_UPLINK_DIR").map(std::path::PathBuf::from),
         max_call_secs: 600,
         quality: QualityConfig {
             prebuffer_ms: env_u32("KUTSU_QUALITY_PREBUFFER_MS", 140),
