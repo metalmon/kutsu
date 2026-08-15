@@ -138,6 +138,8 @@ pub struct ServerConfig {
     pub max_call_secs: u64,
     /// Downlink audio-quality pacing (prebuffer/resume/abort thresholds).
     pub quality: QualityConfig,
+    /// Retry policy for transient dial outcomes (busy, etc).
+    pub retry: RetryConfig,
 }
 
 /// Downlink playout pacing thresholds. Tunes the tradeoff between latency
@@ -156,6 +158,21 @@ pub struct QualityConfig {
 impl Default for QualityConfig {
     fn default() -> Self {
         Self { prebuffer_ms: 140, resume_ms: 60, abort_underruns: 40 }
+    }
+}
+
+/// Retry policy for transient dial outcomes.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryConfig {
+    /// Max dial attempts for a busy number (incl. the first). Default 3.
+    pub busy_max_attempts: u32,
+    /// Delay before a busy retry, ms. Default 300_000 (5 min).
+    pub busy_retry_interval_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self { busy_max_attempts: 3, busy_retry_interval_ms: 300_000 }
     }
 }
 
@@ -246,6 +263,7 @@ mod tests {
             dump_uplink_dir: None,
             max_call_secs: 600,
             quality: QualityConfig::default(),
+            retry: RetryConfig::default(),
         };
         assert_eq!(c.max_call_secs, 600);
         assert!(c.transcript_dir.is_some());

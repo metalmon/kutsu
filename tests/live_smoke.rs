@@ -33,6 +33,7 @@ async fn short_live_session_returns_audio_and_ends() {
         dump_uplink_dir: None,
         max_call_secs: 600,
         quality: kutsu::config::QualityConfig::default(),
+        retry: kutsu::config::RetryConfig::default(),
     };
     let scenario = kutsu::config::ScenarioConfig {
         system_prompt: "You are a friendly assistant. Greet briefly, then call end_call.".into(),

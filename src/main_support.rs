@@ -1,8 +1,8 @@
 //! Shared config construction for the `kutsu call` CLI and its integration test.
 
 use crate::config::{
-    Gender, Model, NetCheckConfig, Proxy, QualityConfig, ScenarioConfig, ServerConfig, SipConfig,
-    SipTransportKind, DEFAULT_GREET_AFTER_SILENCE_MS,
+    Gender, Model, NetCheckConfig, Proxy, QualityConfig, RetryConfig, ScenarioConfig, ServerConfig,
+    SipConfig, SipTransportKind, DEFAULT_GREET_AFTER_SILENCE_MS,
 };
 
 fn env_or(k: &str, d: &str) -> String {
@@ -14,6 +14,10 @@ fn non_empty(k: &str) -> Option<String> {
 }
 
 fn env_u32(k: &str, d: u32) -> u32 {
+    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+}
+
+fn env_u64(k: &str, d: u64) -> u64 {
     std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
 }
 
@@ -45,6 +49,10 @@ pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
             prebuffer_ms: env_u32("KUTSU_QUALITY_PREBUFFER_MS", 140),
             resume_ms: env_u32("KUTSU_QUALITY_RESUME_MS", 60),
             abort_underruns: env_u32("KUTSU_QUALITY_ABORT_UNDERRUNS", 40),
+        },
+        retry: RetryConfig {
+            busy_max_attempts: env_u32("KUTSU_BUSY_MAX_ATTEMPTS", 3),
+            busy_retry_interval_ms: env_u64("KUTSU_BUSY_RETRY_INTERVAL_MS", 300_000),
         },
     };
     let sip = SipConfig {

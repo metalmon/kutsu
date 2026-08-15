@@ -235,6 +235,7 @@ async fn run_live(
         dump_uplink_dir: None,
         max_call_secs: 600,
         quality: kutsu::config::QualityConfig::default(),
+        retry: kutsu::config::RetryConfig::default(),
     };
 
     // 2. Preflight (fail closed).

@@ -541,6 +541,7 @@ mod tests {
             dump_uplink_dir: None,
             max_call_secs: 600,
             quality: crate::config::QualityConfig::default(),
+            retry: crate::config::RetryConfig::default(),
         };
         let sip_cfg = SipConfig {
             server: "127.0.0.1:5060".into(),
