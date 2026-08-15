@@ -133,7 +133,7 @@ pub struct ServerConfig {
     /// Directory to write finalized CallRecord JSON to; None = skip persistence.
     pub transcript_dir: Option<PathBuf>,
     /// Directory for per-call uplink audio dumps (WAV). `None` disables it.
-    pub dump_uplink_dir: Option<std::path::PathBuf>,
+    pub dump_uplink_dir: Option<PathBuf>,
     /// Safety cap on a single call's duration (seconds).
     pub max_call_secs: u64,
     /// Downlink audio-quality pacing (prebuffer/resume/abort thresholds).

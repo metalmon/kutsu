@@ -24,14 +24,18 @@ pub struct UplinkStats {
     first_ext: u64,
     received: u64,
     reordered: u64,
-    duplicated: u64,
 }
 
 impl UplinkStats {
     pub fn new() -> Self {
-        Self { started: false, cycles: 0, max16: 0, first_ext: 0, received: 0, reordered: 0, duplicated: 0 }
+        Self { started: false, cycles: 0, max16: 0, first_ext: 0, received: 0, reordered: 0 }
     }
 
+    /// Classifies `seq` relative to the running max via a single `0x8000`
+    /// forward/backward split (RFC 3550 §A.1-style), with no warmup and no
+    /// MAX_DROPOUT/MAX_MISORDER guard: a genuine forward jump >32768 or a
+    /// reorder as the very second packet is misclassified. Negligible at
+    /// telephony packet rates (~50 pkt/s) — acceptable for this diagnostic.
     pub fn observe(&mut self, seq: u16) {
         if !self.started {
             self.started = true;
@@ -43,7 +47,8 @@ impl UplinkStats {
         self.received += 1;
         let forward = seq.wrapping_sub(self.max16); // distance max -> seq, forward
         if forward == 0 {
-            self.duplicated += 1;
+            // Duplicate packet: already counted in `received` above; do not
+            // touch max16/cycles/reordered.
         } else if forward < 0x8000 {
             // Forward progress, possibly across a 16-bit wrap.
             if seq < self.max16 {

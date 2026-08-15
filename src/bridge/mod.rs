@@ -100,14 +100,31 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
     // Separate task so its backpressure `await` can never stall the downlink.
     let uplink = tokio::spawn(async move {
         let mut dump8 = uplink_dump.as_ref().and_then(|dir| {
-            crate::audio_file::Pcm16Writer::create(&dir.join(format!("{call_id}-uplink-8k.wav")), 8000).ok()
+            let path = dir.join(format!("{call_id}-uplink-8k.wav"));
+            match crate::audio_file::Pcm16Writer::create(&path, 8000) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to open uplink dump");
+                    None
+                }
+            }
         });
         let mut dump16 = uplink_dump.as_ref().and_then(|dir| {
-            crate::audio_file::Pcm16Writer::create(&dir.join(format!("{call_id}-uplink-16k.wav")), 16000).ok()
+            let path = dir.join(format!("{call_id}-uplink-16k.wav"));
+            match crate::audio_file::Pcm16Writer::create(&path, 16000) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to open uplink dump");
+                    None
+                }
+            }
         });
         while let Some(payload) = phone_in.recv().await {
             let pcm8 = g711::decode(codec, &payload);
             let pcm16 = resample::up_8k_16k(&pcm8);
+            // Synchronous `hound` writes on this async uplink task, between
+            // `recv` and `gemini_in.send`: negligible under normal disk I/O,
+            // and only exercised at all when dumping is enabled.
             if let Some(w) = dump8.as_mut() { let _ = w.write(&pcm8); }
             if let Some(w) = dump16.as_mut() { let _ = w.write(&pcm16); }
             if gemini_in.send(pcm16).await.is_err() {
