@@ -48,6 +48,12 @@ pub struct CallRecord {
     pub started_ms: u64,
     pub ended_ms: Option<u64>,
     pub quality: CallQuality,
+    /// Structured dial result; None while in-flight.
+    pub outcome: Option<crate::sip::CallOutcome>,
+    /// 1 for the first dial; incremented per internal busy-retry.
+    pub attempt: u32,
+    /// The prior call_id this attempt continues (busy-retry or external retry_of).
+    pub retry_of: Option<String>,
 }
 
 /// Live counts of in-flight calls.
@@ -97,12 +103,14 @@ impl CallStore {
         state: CallState,
         goal: Option<Value>,
         error: Option<String>,
+        outcome: Option<crate::sip::CallOutcome>,
         ended_ms: u64,
     ) {
         if let Some(r) = self.inner.lock().unwrap().get_mut(call_id) {
             r.state = state;
             r.goal = goal;
             r.error = error;
+            r.outcome = outcome;
             r.ended_ms = Some(ended_ms);
         }
     }
@@ -169,6 +177,9 @@ mod tests {
             started_ms: 1000,
             ended_ms: None,
             quality: CallQuality::default(),
+            outcome: None,
+            attempt: 1,
+            retry_of: None,
         }
     }
 
@@ -199,12 +210,40 @@ mod tests {
         let store = CallStore::new();
         store.insert(rec("c1"));
         store.set_transcript("c1", vec![TranscriptEntry { role: Role::User, text: "bye".into(), ts_ms: 9 }]);
-        store.finalize("c1", CallState::Completed, Some(serde_json::json!({"ok": true})), None, 2000);
+        store.finalize(
+            "c1",
+            CallState::Completed,
+            Some(serde_json::json!({"ok": true})),
+            None,
+            Some(crate::sip::CallOutcome::Completed),
+            2000,
+        );
         let got = store.get("c1").unwrap();
         assert_eq!(got.state, CallState::Completed);
         assert_eq!(got.ended_ms, Some(2000));
         assert!(got.goal.is_some());
         assert_eq!(got.transcript.len(), 1);
+        assert_eq!(got.outcome, Some(crate::sip::CallOutcome::Completed));
+    }
+
+    #[test]
+    fn finalize_sets_outcome_and_record_defaults_attempt_and_retry_of() {
+        let store = CallStore::new();
+        let r = rec("c1");
+        assert_eq!(r.attempt, 1);
+        assert_eq!(r.retry_of, None);
+        assert_eq!(r.outcome, None);
+        store.insert(r);
+        store.finalize(
+            "c1",
+            CallState::Failed,
+            None,
+            Some("busy".into()),
+            Some(crate::sip::CallOutcome::Busy),
+            3000,
+        );
+        let got = store.get("c1").unwrap();
+        assert_eq!(got.outcome, Some(crate::sip::CallOutcome::Busy));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::bridge::{self, BridgePorts};
 use crate::config::{QualityConfig, ScenarioConfig, ServerConfig, SipConfig};
 use crate::gemini_live::{self, EndedBy, Event, TranscriptEntry};
-use crate::sip::{SipCallParts, SipEvent, SipTransport};
+use crate::sip::{CallOutcome, SipCallParts, SipEvent, SipTransport};
 use crate::state::{CallQuality, CallRecord, CallState, CallStore};
 
 /// Quality-abort gate: should a call in progress be aborted for degraded
@@ -175,6 +175,9 @@ impl Engine {
             started_ms: now_ms(),
             ended_ms: None,
             quality: CallQuality::default(),
+            outcome: None,
+            attempt: 1,
+            retry_of: None,
         });
         self.counters.placed.fetch_add(1, Ordering::Relaxed);
 
@@ -264,7 +267,7 @@ async fn run_call(
     let _permit = tokio::select! {
         p = permits.acquire_owned() => p.expect("semaphore not closed"),
         _ = &mut cancel_rx => {
-            store.finalize(&call_id, CallState::Cancelled, None, None, now_ms());
+            store.finalize(&call_id, CallState::Cancelled, None, None, None, now_ms());
             bump_counter(&counters, CallState::Cancelled);
             return;
         }
@@ -274,7 +277,7 @@ async fn run_call(
     let call = match sip.place_call(&number).await {
         Ok(c) => c,
         Err(e) => {
-            store.finalize(&call_id, CallState::Failed, None, Some(e.to_string()), now_ms());
+            store.finalize(&call_id, CallState::Failed, None, Some(e.to_string()), Some(CallOutcome::Failed), now_ms());
             bump_counter(&counters, CallState::Failed);
             return;
         }
@@ -287,12 +290,17 @@ async fn run_call(
         match sip_events.recv().await {
             Some(SipEvent::Answered { codec }) => break codec,
             Some(SipEvent::Terminated(reason)) => {
-                store.finalize(&call_id, CallState::Failed, None, Some(format!("no answer: {reason:?}")), now_ms());
+                let (outcome, detail) = match reason {
+                    crate::sip::TermReason::Failed { outcome, detail } => (outcome, detail),
+                    // Remote/local hangup before answer is effectively no-answer.
+                    _ => (CallOutcome::NoAnswer, format!("{reason:?}")),
+                };
+                store.finalize(&call_id, CallState::Failed, None, Some(detail), Some(outcome), now_ms());
                 bump_counter(&counters, CallState::Failed);
                 return;
             }
             None => {
-                store.finalize(&call_id, CallState::Failed, None, Some("sip closed before answer".into()), now_ms());
+                store.finalize(&call_id, CallState::Failed, None, Some("sip closed before answer".into()), Some(CallOutcome::Failed), now_ms());
                 bump_counter(&counters, CallState::Failed);
                 return;
             }
@@ -306,7 +314,7 @@ async fn run_call(
         Ok(s) => s,
         Err(e) => {
             let _ = sip_hangup.send(());
-            store.finalize(&call_id, CallState::Failed, None, Some(format!("gemini connect: {e}")), now_ms());
+            store.finalize(&call_id, CallState::Failed, None, Some(format!("gemini connect: {e}")), Some(CallOutcome::Failed), now_ms());
             bump_counter(&counters, CallState::Failed);
             return;
         }
@@ -429,7 +437,8 @@ async fn run_call(
     if error.is_some() {
         counters.quality_aborted.fetch_add(1, Ordering::Relaxed);
     }
-    store.finalize(&call_id, final_state, final_goal, error, now_ms());
+    let final_outcome = if final_state == CallState::Completed { CallOutcome::Completed } else { CallOutcome::Failed };
+    store.finalize(&call_id, final_state, final_goal, error, Some(final_outcome), now_ms());
     bump_counter(&counters, final_state);
 
     // 10. Persist. Owner-only permissions: the transcript may contain PII.
