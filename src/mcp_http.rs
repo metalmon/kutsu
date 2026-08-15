@@ -269,6 +269,8 @@ mod tests {
             underruns_total: 0,
             starved_ms_total: 0,
             quality_aborted_total: 0,
+            uplink_received_total: 0,
+            uplink_lost_total: 0,
         };
         let s = render_prometheus(&m);
         for line in [
@@ -291,6 +293,7 @@ mod tests {
             active: 0, queued: 0, placed_total: 0, completed_total: 0, failed_total: 0,
             cancelled_total: 0, channels_cap: 3,
             underruns_total: 7, starved_ms_total: 140, quality_aborted_total: 2,
+            uplink_received_total: 0, uplink_lost_total: 0,
         };
         let s = render_prometheus(&m);
         for line in ["kutsu_audio_underruns_total 7", "kutsu_audio_starved_ms_total 140", "kutsu_calls_quality_aborted_total 2"] {
