@@ -109,8 +109,11 @@ pub struct ServerConfig {
 }
 
 /// Default wait before the agent greets a silent callee (see
-/// [`ServerConfig::greet_after_silence_ms`]).
-pub const DEFAULT_GREET_AFTER_SILENCE_MS: u64 = 4000;
+/// [`ServerConfig::greet_after_silence_ms`]). Tuned for OUTBOUND calls: the
+/// callee answers expecting the caller to speak, so a long silence reads as a
+/// dead line. Empirically ~4 s felt like an awkward gap after "Алло?"; ~1.5 s
+/// lets the media path settle yet greets promptly.
+pub const DEFAULT_GREET_AFTER_SILENCE_MS: u64 = 1500;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ScenarioConfig {
