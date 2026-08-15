@@ -36,6 +36,47 @@ pub struct TranscriptEntry {
     pub ts_ms: u64,
 }
 
+/// Accumulates streaming transcription deltas per role.
+///
+/// Gemini streams `outputTranscription`/`inputTranscription` as incremental
+/// text pieces with no per-piece "finished" flag; a turn's full transcript is
+/// the concatenation of its deltas, emitted at `TurnComplete` (this mirrors the
+/// proven voice-cloud client, which appends deltas to per-role buffers and
+/// joins them on `turn_complete`). Relying on a `finished` flag drops
+/// everything, since real messages never set it.
+#[derive(Default)]
+struct TranscriptAccumulator {
+    user: String,
+    model: String,
+}
+
+impl TranscriptAccumulator {
+    fn on_delta(&mut self, role: Role, text: &str) {
+        match role {
+            Role::User => self.user.push_str(text),
+            Role::Model => self.model.push_str(text),
+        }
+    }
+
+    /// Emit the completed turn's entries (user first, then model) and reset the
+    /// buffers. Call on `TurnComplete`, and once more at session end to capture a
+    /// turn cut short by end_call/hangup. Whitespace-only buffers yield nothing.
+    fn flush(&mut self, ts_ms: u64) -> Vec<TranscriptEntry> {
+        let mut out = Vec::new();
+        let u = self.user.trim();
+        if !u.is_empty() {
+            out.push(TranscriptEntry { role: Role::User, text: u.to_string(), ts_ms });
+        }
+        let m = self.model.trim();
+        if !m.is_empty() {
+            out.push(TranscriptEntry { role: Role::Model, text: m.to_string(), ts_ms });
+        }
+        self.user.clear();
+        self.model.clear();
+        out
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndedBy {
     ModelEndCall,
@@ -316,10 +357,10 @@ impl Transport for WsTransport {
 ///
 /// The transcript is accumulated here (not inside `run_session`) by tapping the
 /// event channel with a small forwarding task: every `Event` produced by a
-/// session attempt passes through unchanged to the caller, and finished
-/// `Transcript` events are additionally copied into the outcome's transcript
-/// buffer. This keeps `run_session`'s signature/tests focused purely on
-/// protocol behavior.
+/// session attempt passes through unchanged to the caller, while transcription
+/// deltas are accumulated per role and folded into the outcome's transcript one
+/// turn at a time (on `TurnComplete`). This keeps `run_session`'s
+/// signature/tests focused purely on protocol behavior.
 ///
 /// `hangup()` must interrupt an in-progress call, not just be checked between
 /// attempts: every wait point in this loop — the pre-connect gap, the connect
@@ -374,8 +415,10 @@ pub async fn start(server: &ServerConfig, scenario: &ScenarioConfig) -> Result<S
                     let mut latest = handle.clone();
                     let mut setup_ok = false;
 
-                    // Tap: forward every event to the caller unchanged, while also
-                    // copying finished transcript entries into the local accumulator.
+                    // Tap: forward every event to the caller unchanged, while
+                    // accumulating transcription deltas per role and flushing a
+                    // turn's transcript into the local buffer on TurnComplete
+                    // (Gemini streams deltas with no per-piece "finished" flag).
                     let (tap_tx, mut tap_rx) = mpsc::channel::<Event>(256);
                     let out_tx = event_tx.clone();
                     let ts_base = clock;
@@ -383,18 +426,29 @@ pub async fn start(server: &ServerConfig, scenario: &ScenarioConfig) -> Result<S
                         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
                     let tap_transcript_writer = tap_transcript.clone();
                     let forward = tokio::spawn(async move {
+                        let mut acc = TranscriptAccumulator::default();
                         while let Some(ev) = tap_rx.recv().await {
-                            if let Event::Transcript { role, ref text, final_ } = ev {
-                                if final_ {
+                            match &ev {
+                                Event::Transcript { role, text, .. } => acc.on_delta(*role, text),
+                                Event::TurnComplete => {
                                     let ts_ms = ts_base.elapsed().as_millis() as u64;
-                                    tap_transcript_writer.lock().unwrap().push(TranscriptEntry {
-                                        role, text: text.clone(), ts_ms,
-                                    });
+                                    let entries = acc.flush(ts_ms);
+                                    if !entries.is_empty() {
+                                        tap_transcript_writer.lock().unwrap().extend(entries);
+                                    }
                                 }
+                                _ => {}
                             }
                             if out_tx.send(ev).await.is_err() {
                                 break;
                             }
+                        }
+                        // Session ended (possibly mid-turn via end_call/hangup):
+                        // flush whatever the last, unterminated turn accumulated.
+                        let ts_ms = ts_base.elapsed().as_millis() as u64;
+                        let entries = acc.flush(ts_ms);
+                        if !entries.is_empty() {
+                            tap_transcript_writer.lock().unwrap().extend(entries);
                         }
                     });
 
@@ -511,6 +565,30 @@ mod tests {
         assert!(hangup_rx.recv().await.is_some());
         let outcome = handle.join().await;
         assert!(matches!(outcome.ended_by, EndedBy::RemoteClose));
+    }
+
+    #[test]
+    fn transcript_accumulator_concatenates_deltas_and_flushes_per_turn() {
+        let mut acc = TranscriptAccumulator::default();
+        // Turn 1: user speaks in deltas, model replies in deltas.
+        acc.on_delta(Role::User, "Да");
+        acc.on_delta(Role::User, ", удобно");
+        acc.on_delta(Role::Model, "Здравствуй");
+        acc.on_delta(Role::Model, "те!");
+        let t1 = acc.flush(100);
+        assert_eq!(t1.len(), 2);
+        assert_eq!(t1[0].role, Role::User);
+        assert_eq!(t1[0].text, "Да, удобно");
+        assert_eq!(t1[1].role, Role::Model);
+        assert_eq!(t1[1].text, "Здравствуйте!");
+        // Buffers reset after a flush -> an empty flush yields nothing.
+        assert!(acc.flush(200).is_empty());
+        // Turn 2: model only.
+        acc.on_delta(Role::Model, "До свидания");
+        let t2 = acc.flush(300);
+        assert_eq!(t2.len(), 1);
+        assert_eq!(t2[0].role, Role::Model);
+        assert_eq!(t2[0].text, "До свидания");
     }
 
     #[tokio::test]
