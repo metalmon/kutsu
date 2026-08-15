@@ -359,7 +359,11 @@ async fn run_call(
                 let q = quality.snapshot();
                 store.set_quality(&call_id, q);
                 if should_abort(&server.quality, q.underruns) {
-                    counters.quality_aborted.fetch_add(1, Ordering::Relaxed);
+                    // NOTE: don't bump `quality_aborted` here — the abort is not
+                    // authoritative yet. A model `EndCall` racing this tick can
+                    // reconcile `final_state` back to Completed (see finalize),
+                    // in which case this was not a quality abort. Count it at
+                    // finalize, gated on the surviving abort error.
                     abort_reason = Some(format!(
                         "aborted: audio quality degraded ({} underruns, {} ms silence)",
                         q.underruns, q.starved_ms
@@ -391,6 +395,12 @@ async fn run_call(
     store.set_transcript(&call_id, outcome.transcript);
     let final_goal = goal.or(outcome.goal);
     let error = finalize_error(final_state, abort_reason);
+    // Count the quality abort exactly once here, only if it survived reconcile
+    // (a racing model EndCall can flip Failed -> Completed and clear the error).
+    // `error` is Some iff this was an abort that stuck as Failed.
+    if error.is_some() {
+        counters.quality_aborted.fetch_add(1, Ordering::Relaxed);
+    }
     store.finalize(&call_id, final_state, final_goal, error, now_ms());
     bump_counter(&counters, final_state);
 
