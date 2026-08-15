@@ -22,6 +22,14 @@ pub enum CallState {
     Cancelled,
 }
 
+/// Audio quality metrics for a call.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct CallQuality {
+    pub underruns: u64,
+    pub starved_ms: u64,
+    pub max_gap_ms: u64,
+}
+
 /// One call's record.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct CallRecord {
@@ -33,6 +41,7 @@ pub struct CallRecord {
     pub error: Option<String>,
     pub started_ms: u64,
     pub ended_ms: Option<u64>,
+    pub quality: CallQuality,
 }
 
 /// Live counts of in-flight calls.
@@ -92,6 +101,12 @@ impl CallStore {
         }
     }
 
+    pub fn set_quality(&self, call_id: &str, q: CallQuality) {
+        if let Some(r) = self.inner.lock().unwrap().get_mut(call_id) {
+            r.quality = q;
+        }
+    }
+
     pub fn get(&self, call_id: &str) -> Option<CallRecord> {
         self.inner.lock().unwrap().get(call_id).cloned()
     }
@@ -147,6 +162,7 @@ mod tests {
             error: None,
             started_ms: 1000,
             ended_ms: None,
+            quality: CallQuality::default(),
         }
     }
 
@@ -215,5 +231,16 @@ mod tests {
         let counts = store.counts();
         assert_eq!(counts.queued, 2);
         assert_eq!(counts.active, 1);
+    }
+
+    #[test]
+    fn set_quality_updates_record() {
+        let store = CallStore::new();
+        store.insert(rec("c1"));
+        store.set_quality("c1", CallQuality { underruns: 3, starved_ms: 60, max_gap_ms: 220 });
+        let got = store.get("c1").unwrap();
+        assert_eq!(got.quality.underruns, 3);
+        assert_eq!(got.quality.starved_ms, 60);
+        assert_eq!(got.quality.max_gap_ms, 220);
     }
 }

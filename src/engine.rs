@@ -11,7 +11,7 @@ use crate::bridge::{self, BridgePorts};
 use crate::config::{ScenarioConfig, ServerConfig, SipConfig};
 use crate::gemini_live::{self, EndedBy, Event, TranscriptEntry};
 use crate::sip::{SipCallParts, SipEvent, SipTransport};
-use crate::state::{CallRecord, CallState, CallStore};
+use crate::state::{CallQuality, CallRecord, CallState, CallStore};
 
 /// Errors from placing a call.
 #[derive(Debug, thiserror::Error)]
@@ -119,6 +119,7 @@ impl Engine {
             error: None,
             started_ms: now_ms(),
             ended_ms: None,
+            quality: CallQuality::default(),
         });
         self.counters.placed.fetch_add(1, Ordering::Relaxed);
 
