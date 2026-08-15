@@ -203,40 +203,24 @@ async fn run_live(
     // 1. Load scenario + server config (env: GEMINI_API_KEY, proxy).
     let scenario: kutsu::config::ScenarioConfig =
         serde_json::from_slice(&std::fs::read(&scenario_path)?)?;
-    let api_key = std::env::var("GEMINI_API_KEY")
-        .map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
-    // Proxy (optional) from env: PROXY_URL [+ PROXY_USER / PROXY_PASSWORD].
-    let non_empty = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
-    let proxy = non_empty("PROXY_URL").map(|url| kutsu::config::Proxy {
-        url,
-        user: non_empty("PROXY_USER"),
-        password: non_empty("PROXY_PASSWORD"),
-    });
-    let model = match model.as_deref() {
-        Some("native") => kutsu::config::Model::NativeAudio,
-        Some("half") => kutsu::config::Model::HalfCascade,
-        Some(x) => anyhow::bail!("unknown model '{}' (expected 'half' or 'native')", x),
-        None => kutsu::config::Model::HalfCascade,
-    };
-    let server = kutsu::config::ServerConfig {
-        api_key,
-        proxy,
-        model,
-        voice: voice.unwrap_or_else(|| "Autonoe".into()),
-        voice_gender: kutsu::config::Gender::parse(
-            &std::env::var("KUTSU_VOICE_GENDER").unwrap_or_default(),
-        ),
-        language: std::env::var("KUTSU_LANGUAGE").unwrap_or_else(|_| "en-US".into()),
-        net_check: kutsu::config::NetCheckConfig::default(),
-        max_concurrent_channels: 3,
-        greet_after_silence_ms: greet_after_silence_ms
-            .unwrap_or(kutsu::config::DEFAULT_GREET_AFTER_SILENCE_MS),
-        transcript_dir: None,
-        dump_uplink_dir: None,
-        max_call_secs: 600,
-        quality: kutsu::config::QualityConfig::default(),
-        retry: kutsu::config::RetryConfig::default(),
-    };
+    // Server config comes from the single env source (`configs_from_env`), so
+    // every KUTSU_* knob (quality, retry, transcript/dump dirs, voice, ...)
+    // takes effect here too. The CLI args below override only what this
+    // subcommand sets explicitly; the SipConfig is unused on this path.
+    let (mut server, _sip) = kutsu::main_support::configs_from_env()?;
+    if let Some(m) = model.as_deref() {
+        server.model = match m {
+            "native" => kutsu::config::Model::NativeAudio,
+            "half" => kutsu::config::Model::HalfCascade,
+            x => anyhow::bail!("unknown model '{}' (expected 'half' or 'native')", x),
+        };
+    }
+    if let Some(v) = voice {
+        server.voice = v;
+    }
+    if let Some(ms) = greet_after_silence_ms {
+        server.greet_after_silence_ms = ms;
+    }
 
     // 2. Preflight (fail closed).
     if !no_net_check {
