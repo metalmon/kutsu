@@ -5,12 +5,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::bridge::{self, BridgePorts};
 use crate::config::{QualityConfig, ScenarioConfig, ServerConfig, SipConfig};
 use crate::gemini_live::{self, EndedBy, Event, TranscriptEntry};
-use crate::sip::{SipCallParts, SipEvent, SipTransport};
+use crate::queue::{MemQueue, PendingEntry, QueueStore};
+use crate::sip::{CallOutcome, SipCallParts, SipEvent, SipTransport};
 use crate::state::{CallQuality, CallRecord, CallState, CallStore};
 
 /// Quality-abort gate: should a call in progress be aborted for degraded
@@ -31,6 +32,14 @@ fn merge_quality(mut q: CallQuality, u: crate::sip::UplinkQuality) -> CallQualit
     q
 }
 
+/// Should a busy dial attempt be retried? `attempt` is the 1-based attempt
+/// number of the call that just finalized Busy; retry is allowed as long as
+/// it hasn't yet reached the configured cap. Pure, unit-tested independent of
+/// any live call.
+fn should_retry_busy(attempt: u32, cfg: &crate::config::RetryConfig) -> bool {
+    attempt < cfg.busy_max_attempts
+}
+
 /// Reconcile the select loop's `end_state` with the authoritative outcome
 /// from the Gemini session: a model-initiated end is a success even if its
 /// `EndCall` event lost the select race against e.g. `GeminiClosed` (which
@@ -47,6 +56,20 @@ fn reconcile_final_state(end_state: CallState, ended_by: EndedBy) -> CallState {
 /// the quality-abort arm fired; don't leave a stale error on a completed call.
 fn finalize_error(final_state: CallState, abort_reason: Option<String>) -> Option<String> {
     if final_state == CallState::Failed { abort_reason } else { None }
+}
+
+/// Map the reconciled `final_state` of an in-call terminal finalize to a
+/// `CallOutcome`. `HungUp` is a successful connection (the caller or model
+/// ended a connected call) — same success bucket as `Completed` per
+/// `bump_counter`. `Cancelled` never got a dial outcome (call was cancelled
+/// before/without a SIP result reaching this point in-call), so `None`.
+fn finalize_outcome(final_state: CallState) -> Option<CallOutcome> {
+    match final_state {
+        CallState::Completed | CallState::HungUp => Some(CallOutcome::Completed),
+        CallState::Failed => Some(CallOutcome::Failed),
+        CallState::Cancelled => None,
+        CallState::Queued | CallState::Ringing | CallState::InProgress => None,
+    }
 }
 
 /// Errors from placing a call.
@@ -73,6 +96,14 @@ struct Counters {
     completed: AtomicU64,
     failed: AtomicU64,
     cancelled: AtomicU64,
+    /// Per-outcome cumulative totals for the dial-failure outcomes.
+    /// `bump_counter_outcome` maps `CallOutcome::Completed`/`Failed` onto
+    /// `completed`/`failed` above and the rest onto these.
+    busy: AtomicU64,
+    no_answer: AtomicU64,
+    rejected: AtomicU64,
+    not_found: AtomicU64,
+    unavailable: AtomicU64,
     /// Cumulative audio-quality totals, added once per call at finalize (not
     /// per tick) so a call's underruns/starved-ms are counted exactly once.
     underruns: AtomicU64,
@@ -100,69 +131,40 @@ pub struct MetricsSnapshot {
     pub quality_aborted_total: u64,
     pub uplink_received_total: u64,
     pub uplink_lost_total: u64,
+    pub busy_total: u64,
+    pub no_answer_total: u64,
+    pub rejected_total: u64,
+    pub not_found_total: u64,
+    pub unavailable_total: u64,
 }
 
-/// The call engine: owns the SIP transport, the call store, and config.
-pub struct Engine {
-    sip: SipTransport,
+/// Everything needed to enqueue a new call (`place_call_at`'s body), bundled
+/// so it can be handed to `run_call` — which has no `&Engine` — for Task 8's
+/// busy-retry requeue. Cloning is cheap (all fields are `Arc`/already-`Clone`
+/// handles), matching the clones the dispatcher already threads into
+/// `run_call`.
+#[derive(Clone)]
+struct Enqueuer {
+    seq: Arc<AtomicUsize>,
     store: CallStore,
-    server: Arc<ServerConfig>,
-    permits: Arc<tokio::sync::Semaphore>,
-    cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
-    seq: AtomicUsize,
+    queue: Arc<Mutex<Box<dyn QueueStore>>>,
+    wake: Arc<Notify>,
     counters: Arc<Counters>,
 }
 
-impl Engine {
-    /// Build the engine (binds the SIP transport).
-    pub async fn new(server: Arc<ServerConfig>, sip_cfg: &SipConfig) -> Result<Self, EngineError> {
-        let sip = SipTransport::new(sip_cfg).await?;
-        let permits = Arc::new(tokio::sync::Semaphore::new(server.max_concurrent_channels));
-        Ok(Self {
-            sip,
-            store: CallStore::new(),
-            server,
-            permits,
-            cancels: Arc::new(Mutex::new(HashMap::new())),
-            seq: AtomicUsize::new(0),
-            counters: Arc::new(Counters::default()),
-        })
-    }
-
-    pub fn store(&self) -> &CallStore {
-        &self.store
-    }
-
-    /// Live load (from the `CallStore`) plus lifetime cumulative totals.
-    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
-        let counts = self.store.counts();
-        MetricsSnapshot {
-            active: counts.active,
-            queued: counts.queued,
-            placed_total: self.counters.placed.load(Ordering::Relaxed),
-            completed_total: self.counters.completed.load(Ordering::Relaxed),
-            failed_total: self.counters.failed.load(Ordering::Relaxed),
-            cancelled_total: self.counters.cancelled.load(Ordering::Relaxed),
-            channels_cap: self.server.max_concurrent_channels,
-            underruns_total: self.counters.underruns.load(Ordering::Relaxed),
-            starved_ms_total: self.counters.starved_ms.load(Ordering::Relaxed),
-            quality_aborted_total: self.counters.quality_aborted.load(Ordering::Relaxed),
-            uplink_received_total: self.counters.uplink_received.load(Ordering::Relaxed),
-            uplink_lost_total: self.counters.uplink_lost.load(Ordering::Relaxed),
-        }
-    }
-
-    /// Maximum wall-clock duration of a single call, in seconds (the engine's
-    /// hard deadline). Used by the MCP task branch to size the task TTL so a
-    /// long-but-valid call is never TTL-swept mid-flight.
-    pub fn max_call_secs(&self) -> u64 {
-        self.server.max_call_secs
-    }
-
-    /// Place an outbound call: records it as `Queued` and spawns the call
-    /// task, which waits for a concurrency permit before dialing. Always
-    /// succeeds; SIP/other failures surface later via `CallState::Failed`.
-    pub async fn place_call(&self, number: String, scenario: ScenarioConfig) -> String {
+impl Enqueuer {
+    /// Enqueue an outbound call eligible for dispatch at `eligible_at_ms`.
+    /// Records the call `Queued`, pushes a `PendingEntry`, and notifies the
+    /// dispatcher. Returns the new call_id. Shared body for
+    /// `Engine::place_call_at` and `run_call`'s busy-retry requeue.
+    async fn place_call_at(
+        &self,
+        number: String,
+        scenario: ScenarioConfig,
+        eligible_at_ms: u64,
+        attempt: u32,
+        retry_of: Option<String>,
+    ) -> String {
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
         let call_id = format!("call-{n}");
         self.store.insert(CallRecord {
@@ -175,44 +177,273 @@ impl Engine {
             started_ms: now_ms(),
             ended_ms: None,
             quality: CallQuality::default(),
+            outcome: None,
+            attempt,
+            retry_of: retry_of.clone(),
         });
         self.counters.placed.fetch_add(1, Ordering::Relaxed);
-
-        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-        self.cancels.lock().unwrap().insert(call_id.clone(), cancel_tx);
-
-        let sip = self.sip.clone();
-        let store = self.store.clone();
-        let server = self.server.clone();
-        let permits = self.permits.clone();
-        let cancels = self.cancels.clone();
-        let counters = self.counters.clone();
-        let id = call_id.clone();
-        tokio::spawn(async move {
-            run_call(sip, store, server, permits, cancels, counters, cancel_rx, scenario, number, id).await;
+        self.queue.lock().unwrap().push(PendingEntry {
+            call_id: call_id.clone(),
+            number,
+            scenario,
+            eligible_at_ms,
+            attempt,
+            retry_of,
         });
-
+        // Wake the dispatcher so an immediate call dispatches without waiting
+        // for its eligibility timer, and a scheduled call re-arms the timer.
+        self.wake.notify_one();
         call_id
     }
+}
 
-    /// Signal a running/queued call to end. Returns true if a live signal was sent.
+/// The call engine: owns the SIP transport, the call store, config, and the
+/// pending-call queue driven by a central dispatcher task (replaces the old
+/// spawn-and-park-on-a-semaphore model).
+pub struct Engine {
+    sip: SipTransport,
+    store: CallStore,
+    server: Arc<ServerConfig>,
+    /// Pending (not-yet-dispatched) calls, ordered by (eligible_at_ms, call_id).
+    queue: Arc<Mutex<Box<dyn QueueStore>>>,
+    /// Count of dispatched-but-not-yet-finalized calls; the concurrency gate
+    /// (`running < max_concurrent_channels`) that the semaphore used to enforce.
+    running: Arc<AtomicUsize>,
+    cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    counters: Arc<Counters>,
+    /// Bundles the id sequence + store/queue/wake/counters handles needed to
+    /// enqueue a call; also cloned into every `run_call` task so Task 8's
+    /// busy-retry can requeue without needing `&Engine`.
+    enqueuer: Enqueuer,
+    /// The central dispatcher task; aborted on `shutdown`.
+    dispatcher: tokio::task::JoinHandle<()>,
+}
+
+impl Engine {
+    /// Build the engine (binds the SIP transport) and spawn the dispatcher.
+    pub async fn new(server: Arc<ServerConfig>, sip_cfg: &SipConfig) -> Result<Self, EngineError> {
+        let sip = SipTransport::new(sip_cfg).await?;
+        let store = CallStore::new();
+        let queue: Arc<Mutex<Box<dyn QueueStore>>> = Arc::new(Mutex::new(Box::new(MemQueue::new())));
+        let running = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::new(Notify::new());
+        let cancels = Arc::new(Mutex::new(HashMap::new()));
+        let counters = Arc::new(Counters::default());
+        let seq = Arc::new(AtomicUsize::new(0));
+        let enqueuer = Enqueuer {
+            seq,
+            store: store.clone(),
+            queue: queue.clone(),
+            wake: wake.clone(),
+            counters: counters.clone(),
+        };
+        let dispatcher = tokio::spawn(dispatcher(
+            sip.clone(),
+            store.clone(),
+            server.clone(),
+            queue.clone(),
+            running.clone(),
+            wake.clone(),
+            cancels.clone(),
+            counters.clone(),
+            enqueuer.clone(),
+        ));
+        Ok(Self {
+            sip,
+            store,
+            server,
+            queue,
+            running,
+            cancels,
+            counters,
+            enqueuer,
+            dispatcher,
+        })
+    }
+
+    pub fn store(&self) -> &CallStore {
+        &self.store
+    }
+
+    /// Live load (dispatched count + pending-queue depth) plus lifetime
+    /// cumulative totals.
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            active: self.running.load(Ordering::Relaxed),
+            queued: self.queue.lock().unwrap().len(),
+            placed_total: self.counters.placed.load(Ordering::Relaxed),
+            completed_total: self.counters.completed.load(Ordering::Relaxed),
+            failed_total: self.counters.failed.load(Ordering::Relaxed),
+            cancelled_total: self.counters.cancelled.load(Ordering::Relaxed),
+            channels_cap: self.server.max_concurrent_channels,
+            underruns_total: self.counters.underruns.load(Ordering::Relaxed),
+            starved_ms_total: self.counters.starved_ms.load(Ordering::Relaxed),
+            quality_aborted_total: self.counters.quality_aborted.load(Ordering::Relaxed),
+            uplink_received_total: self.counters.uplink_received.load(Ordering::Relaxed),
+            uplink_lost_total: self.counters.uplink_lost.load(Ordering::Relaxed),
+            busy_total: self.counters.busy.load(Ordering::Relaxed),
+            no_answer_total: self.counters.no_answer.load(Ordering::Relaxed),
+            rejected_total: self.counters.rejected.load(Ordering::Relaxed),
+            not_found_total: self.counters.not_found.load(Ordering::Relaxed),
+            unavailable_total: self.counters.unavailable.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Maximum wall-clock duration of a single call, in seconds (the engine's
+    /// hard deadline). Used by the MCP task branch to size the task TTL so a
+    /// long-but-valid call is never TTL-swept mid-flight.
+    pub fn max_call_secs(&self) -> u64 {
+        self.server.max_call_secs
+    }
+
+    /// Place an outbound call now: enqueues it as `Queued` (attempt 1, no
+    /// `retry_of`) and wakes the dispatcher. Always succeeds; SIP/other
+    /// failures surface later via `CallState::Failed`.
+    pub async fn place_call(&self, number: String, scenario: ScenarioConfig) -> String {
+        self.place_call_at(number, scenario, now_ms(), 1, None).await
+    }
+
+    /// Enqueue an outbound call eligible for dispatch at `eligible_at_ms`
+    /// (immediate callers pass `now_ms()`; scheduled/retry callers pass a
+    /// future time). `attempt` is 1 for a first dial; Task 8's busy-retry
+    /// passes the incremented attempt with the prior call's id as `retry_of`.
+    /// Records the call `Queued`, pushes a `PendingEntry`, and notifies the
+    /// dispatcher. Returns the new call_id.
+    pub async fn place_call_at(
+        &self,
+        number: String,
+        scenario: ScenarioConfig,
+        eligible_at_ms: u64,
+        attempt: u32,
+        retry_of: Option<String>,
+    ) -> String {
+        self.enqueuer.place_call_at(number, scenario, eligible_at_ms, attempt, retry_of).await
+    }
+
+    /// 1-based position of a pending call in real dispatch order
+    /// (`queue.position`). `None` once it has been dispatched or was never
+    /// queued. Reflects `eligible_at_ms` ordering, so a future-scheduled call
+    /// ranks behind sooner-eligible ones.
+    pub fn queued_position(&self, call_id: &str) -> Option<usize> {
+        self.queue.lock().unwrap().position(call_id)
+    }
+
+    /// Cancel a call. A still-`Queued` call is removed from the queue and
+    /// finalized `Cancelled` immediately (it was never dispatched); a
+    /// dispatched call is signalled through its cancel channel as before.
+    /// Returns true if a queued call was cancelled or a live signal was sent.
+    ///
+    /// The queue lock is held across the `cancels` lookup so a call racing
+    /// from queued to dispatched is caught in exactly one path: the dispatcher
+    /// pops it and registers its cancel channel under the same queue lock.
+    /// Lock order is always queue → cancels (never reversed), so no deadlock.
     pub fn end_call(&self, call_id: &str) -> bool {
-        if let Some(tx) = self.cancels.lock().unwrap().remove(call_id) {
-            tx.send(()).is_ok()
-        } else {
-            false
+        let mut q = self.queue.lock().unwrap();
+        if q.remove(call_id).is_some() {
+            drop(q);
+            self.store.finalize(call_id, CallState::Cancelled, None, None, None, now_ms());
+            bump_counter(&self.counters, CallState::Cancelled);
+            return true;
+        }
+        let tx = self.cancels.lock().unwrap().remove(call_id);
+        drop(q);
+        match tx {
+            Some(tx) => tx.send(()).is_ok(),
+            None => false,
         }
     }
 
     pub async fn shutdown(self) {
+        self.dispatcher.abort();
         self.sip.shutdown().await;
+    }
+}
+
+/// Central dispatcher: the single task that turns eligible pending entries
+/// into running calls, enforcing the `max_concurrent_channels` cap via the
+/// `running` counter. Spawned once in `Engine::new`; holds `Arc` clones of the
+/// engine's shared state. Never busy-spins: when nothing is dispatchable it
+/// parks on `wake` (enqueue / freed slot) or a timer to the next eligibility.
+#[allow(clippy::too_many_arguments)]
+async fn dispatcher(
+    sip: SipTransport,
+    store: CallStore,
+    server: Arc<ServerConfig>,
+    queue: Arc<Mutex<Box<dyn QueueStore>>>,
+    running: Arc<AtomicUsize>,
+    wake: Arc<Notify>,
+    cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    counters: Arc<Counters>,
+    enqueuer: Enqueuer,
+) {
+    let cap = server.max_concurrent_channels;
+    loop {
+        // Drain every currently-eligible entry until the cap is hit or nothing
+        // is eligible. Each iteration takes the queue lock only briefly.
+        loop {
+            let mut q = queue.lock().unwrap();
+            if running.load(Ordering::Relaxed) >= cap {
+                break;
+            }
+            let entry = match q.pop_eligible(now_ms()) {
+                Some(e) => e,
+                None => break,
+            };
+            // Register the cancel channel and claim the slot while still
+            // holding the queue lock, so `end_call` observes this call in
+            // exactly one place (queue OR cancels), never neither.
+            let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+            cancels.lock().unwrap().insert(entry.call_id.clone(), cancel_tx);
+            running.fetch_add(1, Ordering::Relaxed);
+            // Panic-safe slot release: the guard's Drop does the paired
+            // `running -= 1` + `wake.notify_one()` on both normal completion and
+            // panic unwind, so a `run_call` panic can never leak capacity.
+            let slot = RunningGuard { running: running.clone(), wake: wake.clone() };
+            drop(q);
+
+            store.set_state(&entry.call_id, CallState::Ringing);
+
+            let sip = sip.clone();
+            let store = store.clone();
+            let server = server.clone();
+            let cancels = cancels.clone();
+            let counters = counters.clone();
+            let enqueuer = enqueuer.clone();
+            let PendingEntry { call_id, number, scenario, attempt, retry_of, .. } = entry;
+            tokio::spawn(async move {
+                let _slot = slot; // released (decrement + wake) on task exit / panic
+                run_call(
+                    sip, store, server, cancels, counters, enqueuer, cancel_rx, scenario, number,
+                    call_id, attempt, retry_of,
+                )
+                .await;
+            });
+        }
+
+        // Nothing more to dispatch right now. Park until woken (a new enqueue
+        // or a freed slot) or — if we have spare capacity and a future-eligible
+        // entry exists — until that entry becomes eligible.
+        let sleep_until = if running.load(Ordering::Relaxed) < cap {
+            queue.lock().unwrap().peek_next_eligible_at()
+        } else {
+            None
+        };
+        match sleep_until {
+            Some(t) => {
+                let dur = Duration::from_millis(t.saturating_sub(now_ms()));
+                tokio::select! {
+                    _ = wake.notified() => {}
+                    _ = tokio::time::sleep(dur) => {}
+                }
+            }
+            None => wake.notified().await,
+        }
     }
 }
 
 /// Removes a call's `cancels` map entry when dropped, on every exit path —
 /// early returns, the normal end-of-function fallthrough, and panic unwind
-/// alike. Mirrors the owned-permit drop-safety pattern used for `_permit`
-/// above. `end_call` may have already removed the entry (to send on it); a
+/// alike. `end_call` may have already removed the entry (to send on it); a
 /// second `remove` on an absent key is a harmless no-op.
 struct CancelGuard {
     cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
@@ -222,6 +453,26 @@ struct CancelGuard {
 impl Drop for CancelGuard {
     fn drop(&mut self) {
         self.cancels.lock().unwrap().remove(&self.call_id);
+    }
+}
+
+/// Releases a dispatched call's concurrency slot (`running -= 1`) and wakes the
+/// dispatcher to backfill it, on EVERY exit path of the spawned call task —
+/// normal completion AND panic unwind. Constructed right after the dispatcher
+/// claims the slot (`running += 1`) and moved into the task, so the decrement
+/// happens exactly once. This restores the panic-safety the old owned-permit
+/// model got from `Semaphore` permit-Drop: without it, a panic inside
+/// `run_call` would leak the slot and never wake the dispatcher, permanently
+/// lowering capacity.
+struct RunningGuard {
+    running: Arc<AtomicUsize>,
+    wake: Arc<Notify>,
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.running.fetch_sub(1, Ordering::Relaxed);
+        self.wake.notify_one();
     }
 }
 
@@ -242,40 +493,51 @@ fn bump_counter(counters: &Counters, state: CallState) {
     }
 }
 
+/// Bump the cumulative counter matching a `CallOutcome`, for finalize sites
+/// that carry one (i.e. everywhere `bump_counter` would otherwise be told
+/// `CallState::Failed`, which loses the dial-outcome detail).
+fn bump_counter_outcome(counters: &Counters, outcome: CallOutcome) {
+    match outcome {
+        CallOutcome::Completed => counters.completed.fetch_add(1, Ordering::Relaxed),
+        CallOutcome::Busy => counters.busy.fetch_add(1, Ordering::Relaxed),
+        CallOutcome::NoAnswer => counters.no_answer.fetch_add(1, Ordering::Relaxed),
+        CallOutcome::Rejected => counters.rejected.fetch_add(1, Ordering::Relaxed),
+        CallOutcome::NotFound => counters.not_found.fetch_add(1, Ordering::Relaxed),
+        CallOutcome::Unavailable => counters.unavailable.fetch_add(1, Ordering::Relaxed),
+        CallOutcome::Failed => counters.failed.fetch_add(1, Ordering::Relaxed),
+    };
+}
+
 /// Drive one call to completion. Safe ordering: SIP first, answer, THEN Gemini.
+///
+/// The concurrency slot is now claimed by the dispatcher (which set this call
+/// `Ringing` and incremented `running` before spawning us), so there is no
+/// permit to acquire and no cancel-before-permit race — a still-`Queued` call
+/// is cancelled by `end_call` removing it from the queue before it ever
+/// reaches here. `attempt`/`retry_of` are carried for Task 8's busy-retry.
+#[allow(clippy::too_many_arguments)]
 async fn run_call(
     sip: SipTransport,
     store: CallStore,
     server: Arc<ServerConfig>,
-    permits: Arc<tokio::sync::Semaphore>,
     cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     counters: Arc<Counters>,
+    enqueuer: Enqueuer,
     mut cancel_rx: oneshot::Receiver<()>,
     scenario: ScenarioConfig,
     number: String,
     call_id: String,
+    attempt: u32,
+    retry_of: Option<String>,
 ) {
     let _cancel_guard = CancelGuard { cancels: cancels.clone(), call_id: call_id.clone() };
-
-    // Wait for a concurrency slot. Held (as an owned permit) for the whole
-    // call; released on drop, including on panic unwind — replaces SlotGuard.
-    // Raced against the cancel signal so a call parked in Queued (no permit
-    // available yet) can still be cancelled instead of blocking forever.
-    let _permit = tokio::select! {
-        p = permits.acquire_owned() => p.expect("semaphore not closed"),
-        _ = &mut cancel_rx => {
-            store.finalize(&call_id, CallState::Cancelled, None, None, now_ms());
-            bump_counter(&counters, CallState::Cancelled);
-            return;
-        }
-    };
-    store.set_state(&call_id, CallState::Ringing);
+    tracing::info!(%call_id, attempt, retry_of = ?retry_of, "dispatching call");
     // 1. INVITE.
     let call = match sip.place_call(&number).await {
         Ok(c) => c,
         Err(e) => {
-            store.finalize(&call_id, CallState::Failed, None, Some(e.to_string()), now_ms());
-            bump_counter(&counters, CallState::Failed);
+            store.finalize(&call_id, CallState::Failed, None, Some(e.to_string()), Some(CallOutcome::Failed), now_ms());
+            bump_counter_outcome(&counters, CallOutcome::Failed);
             return;
         }
     };
@@ -287,13 +549,34 @@ async fn run_call(
         match sip_events.recv().await {
             Some(SipEvent::Answered { codec }) => break codec,
             Some(SipEvent::Terminated(reason)) => {
-                store.finalize(&call_id, CallState::Failed, None, Some(format!("no answer: {reason:?}")), now_ms());
-                bump_counter(&counters, CallState::Failed);
+                let (outcome, detail) = match reason {
+                    crate::sip::TermReason::Failed { outcome, detail } => (outcome, detail),
+                    // Remote/local hangup before answer is effectively no-answer.
+                    _ => (CallOutcome::NoAnswer, format!("{reason:?}")),
+                };
+                store.finalize(&call_id, CallState::Failed, None, Some(detail), Some(outcome), now_ms());
+                bump_counter_outcome(&counters, outcome);
+                // Busy is the only auto-retried outcome (NoAnswer and all
+                // others finalize terminally here). The finalized record above
+                // is linked forward by the follow-up's `retry_of`; the
+                // follow-up gets a fresh call_id from `place_call_at`, so this
+                // record is never re-finalized (no double-finalize).
+                if outcome == CallOutcome::Busy && should_retry_busy(attempt, &server.retry) {
+                    enqueuer
+                        .place_call_at(
+                            number.clone(),
+                            scenario.clone(),
+                            now_ms() + server.retry.busy_retry_interval_ms,
+                            attempt + 1,
+                            Some(call_id.clone()),
+                        )
+                        .await;
+                }
                 return;
             }
             None => {
-                store.finalize(&call_id, CallState::Failed, None, Some("sip closed before answer".into()), now_ms());
-                bump_counter(&counters, CallState::Failed);
+                store.finalize(&call_id, CallState::Failed, None, Some("sip closed before answer".into()), Some(CallOutcome::Failed), now_ms());
+                bump_counter_outcome(&counters, CallOutcome::Failed);
                 return;
             }
         }
@@ -306,8 +589,8 @@ async fn run_call(
         Ok(s) => s,
         Err(e) => {
             let _ = sip_hangup.send(());
-            store.finalize(&call_id, CallState::Failed, None, Some(format!("gemini connect: {e}")), now_ms());
-            bump_counter(&counters, CallState::Failed);
+            store.finalize(&call_id, CallState::Failed, None, Some(format!("gemini connect: {e}")), Some(CallOutcome::Failed), now_ms());
+            bump_counter_outcome(&counters, CallOutcome::Failed);
             return;
         }
     };
@@ -429,8 +712,12 @@ async fn run_call(
     if error.is_some() {
         counters.quality_aborted.fetch_add(1, Ordering::Relaxed);
     }
-    store.finalize(&call_id, final_state, final_goal, error, now_ms());
-    bump_counter(&counters, final_state);
+    let outcome = finalize_outcome(final_state);
+    store.finalize(&call_id, final_state, final_goal, error, outcome, now_ms());
+    match outcome {
+        Some(o) => bump_counter_outcome(&counters, o),
+        None => bump_counter(&counters, CallState::Cancelled),
+    }
 
     // 10. Persist. Owner-only permissions: the transcript may contain PII.
     if let Some(dir) = &server.transcript_dir {
@@ -482,6 +769,7 @@ mod tests {
             dump_uplink_dir: None,
             max_call_secs: 600,
             quality: crate::config::QualityConfig::default(),
+            retry: crate::config::RetryConfig::default(),
         };
         let sip_cfg = SipConfig {
             server: "127.0.0.1:5060".into(),
@@ -509,6 +797,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduler_respects_cap_and_eligibility() {
+        // Part A — cap: with cap = 1, the dispatcher must NEVER run more than
+        // `max_concurrent_channels` calls at once, and must account for every
+        // placed call (nothing silently lost). We assert those invariants
+        // rather than a specific transient (Ringing==1 / Queued==1), which
+        // would be OS-timing-fragile: on a platform where the loopback INVITE
+        // fast-fails (ICMP port-unreachable → quick error) the dispatched call
+        // finalizes Failed and `b` dispatches, flipping a transient snapshot.
+        // The cap invariant holds regardless of how fast a call fails.
+        let cap = 1usize;
+        let (server, sip_cfg) = test_configs(cap);
+        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
+        let a = engine.place_call("600".into(), test_scenario()).await;
+        let b = engine.place_call("601".into(), test_scenario()).await;
+        // Sample the invariants repeatedly across the settling window, using
+        // ONLY observable store state for the cap check (the `running` counter
+        // and the store are not updated atomically — a call is finalized in the
+        // store just before its slot guard drops — so mixing them would race).
+        //   1. `running` never exceeds the cap (gate held under the queue lock).
+        //   2. The count of dispatched-not-finalized calls (store Ringing|
+        //      InProgress) never exceeds the cap.
+        //   3. Both placed calls always exist in the store (nothing lost).
+        for _ in 0..20 {
+            let m = engine.metrics_snapshot();
+            assert!(m.active <= cap, "running {} must never exceed cap {cap}", m.active);
+            let store_active = [&a, &b]
+                .iter()
+                .filter(|id| {
+                    matches!(
+                        engine.store().get(id).unwrap().state,
+                        CallState::Ringing | CallState::InProgress
+                    )
+                })
+                .count();
+            assert!(store_active <= cap, "dispatched calls {store_active} must never exceed cap {cap}");
+            assert!(
+                engine.store().get(&a).is_some() && engine.store().get(&b).is_some(),
+                "both placed calls remain accounted for in the store"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Both calls were counted as placed regardless of their live disposition.
+        assert_eq!(engine.metrics_snapshot().placed_total, 2);
+        engine.shutdown().await;
+
+        // Part B — eligibility: a future-eligible enqueue stays Queued until its
+        // time, even with free capacity. Uses real (wall-clock) durations, not
+        // tokio::time::pause(): eligibility is driven by `now_ms()` (SystemTime,
+        // per Task 6's queue), which pause() does not advance — pausing would
+        // decouple the dispatcher's timer from `now_ms()` and never fire.
+        let (server2, sip_cfg2) = test_configs(3);
+        let engine2 = Engine::new(std::sync::Arc::new(server2), &sip_cfg2).await.unwrap();
+        let future_ms = now_ms() + 200;
+        let c = engine2
+            .place_call_at("602".into(), test_scenario(), future_ms, 1, None)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert_eq!(
+            engine2.store().get(&c).unwrap().state,
+            CallState::Queued,
+            "not-yet-eligible call must stay Queued despite free capacity"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_ne!(
+            engine2.store().get(&c).unwrap().state,
+            CallState::Queued,
+            "call must be dispatched once its eligibility time passes"
+        );
+        engine2.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn place_call_queues_when_at_cap() {
         // cap = 0: every call must sit in Queued forever (no permit available).
         let (server, sip_cfg) = test_configs(0);
@@ -518,7 +878,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let rec = engine.store().get(&id).unwrap();
         assert_eq!(rec.state, CallState::Queued);
-        assert_eq!(engine.store().queued_position(&id), Some(1));
+        assert_eq!(engine.queued_position(&id), Some(1));
         engine.shutdown().await;
     }
 
@@ -621,5 +981,24 @@ mod tests {
         assert_eq!(finalize_error(CallState::Completed, Some("boom".into())), None);
         assert_eq!(finalize_error(CallState::HungUp, Some("boom".into())), None);
         assert_eq!(finalize_error(CallState::Cancelled, Some("boom".into())), None);
+    }
+
+    #[test]
+    fn should_retry_busy_stops_at_max() {
+        let cfg = crate::config::RetryConfig { busy_max_attempts: 3, busy_retry_interval_ms: 1000 };
+        assert!(should_retry_busy(1, &cfg));
+        assert!(should_retry_busy(2, &cfg));
+        assert!(!should_retry_busy(3, &cfg)); // 3rd attempt is the last; no 4th
+    }
+
+    #[test]
+    fn finalize_outcome_maps_hungup_to_completed() {
+        // HungUp is a successful connection (caller/model ended a connected
+        // call) — same success bucket as Completed per `bump_counter`, not a
+        // technical failure.
+        assert_eq!(finalize_outcome(CallState::Completed), Some(CallOutcome::Completed));
+        assert_eq!(finalize_outcome(CallState::HungUp), Some(CallOutcome::Completed));
+        assert_eq!(finalize_outcome(CallState::Failed), Some(CallOutcome::Failed));
+        assert_eq!(finalize_outcome(CallState::Cancelled), None);
     }
 }

@@ -19,8 +19,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::SipConfig;
 use crate::sip::{
-    g711_kind_from_pt, plain_rtp_g711_config, G711Kind, NegotiatedCodec, SipCall, SipError,
-    SipEvent, TermReason, UplinkQualityShared, UplinkStats,
+    g711_kind_from_pt, plain_rtp_g711_config, CallOutcome, G711Kind, NegotiatedCodec, SipCall,
+    SipError, SipEvent, TermReason, UplinkQualityShared, UplinkStats,
 };
 
 /// Build the shared endpoint with one UDP transport. `add_allow` is MANDATORY —
@@ -140,8 +140,9 @@ pub(crate) async fn run_call(
     let unacked = match outbound.wait_for_completion().await {
         Ok(u) => u,
         Err(e) => {
+            let (outcome, detail) = classify_completion_err(&e);
             let _ = ev_tx
-                .send(SipEvent::Terminated(TermReason::Failed(e.to_string())))
+                .send(SipEvent::Terminated(TermReason::Failed { outcome, detail }))
                 .await;
             return;
         }
@@ -149,13 +150,19 @@ pub(crate) async fn run_call(
     let mut call = match unacked.finish().await {
         Ok(c) => c,
         Err(e) => {
+            let (outcome, detail) = classify_completion_err(&e);
             let _ = ev_tx
-                .send(SipEvent::Terminated(TermReason::Failed(e.to_string())))
+                .send(SipEvent::Terminated(TermReason::Failed { outcome, detail }))
                 .await;
             return;
         }
     };
 
+    // From here on the INVITE has already completed successfully (200 OK), so every
+    // TermReason::Failed { outcome: CallOutcome::Failed, .. } below is post-answer.
+    // Busy/NoAnswer are pre-answer INVITE outcomes only (see classify_completion_err
+    // above); a connected call that drops is classified Failed here. If this ever
+    // needs to emit Busy, the engine busy-retry wiring (engine.rs) must be revisited.
     // Capture the RTP sender/receiver + codec from the first media events.
     let mut sender = None;
     let mut receiver = None;
@@ -168,7 +175,10 @@ pub(crate) async fn run_call(
                 Ok(CallEvent::Internal(e)) => {
                     if call.handle_internal_event(e).await.is_err() {
                         let _ = ev_tx
-                            .send(SipEvent::Terminated(TermReason::Failed("internal".into())))
+                            .send(SipEvent::Terminated(TermReason::Failed {
+                                outcome: CallOutcome::Failed,
+                                detail: "internal".into(),
+                            }))
                             .await;
                         return;
                     }
@@ -188,16 +198,20 @@ pub(crate) async fn run_call(
                 }
                 Err(e) => {
                     let _ = ev_tx
-                        .send(SipEvent::Terminated(TermReason::Failed(e.to_string())))
+                        .send(SipEvent::Terminated(TermReason::Failed {
+                            outcome: CallOutcome::Failed,
+                            detail: e.to_string(),
+                        }))
                         .await;
                     return;
                 }
             },
             _ = &mut media_deadline => {
                 let _ = ev_tx
-                    .send(SipEvent::Terminated(TermReason::Failed(
-                        "answered but media was not negotiated in time".into(),
-                    )))
+                    .send(SipEvent::Terminated(TermReason::Failed {
+                        outcome: CallOutcome::Failed,
+                        detail: "answered but media was not negotiated in time".into(),
+                    }))
                     .await;
                 let _ = call.terminate().await;
                 return;
@@ -232,12 +246,18 @@ pub(crate) async fn run_call(
             r = call.run() => match r {
                 Ok(CallEvent::Internal(e)) => {
                     if call.handle_internal_event(e).await.is_err() {
-                        break TermReason::Failed("internal".into());
+                        break TermReason::Failed {
+                            outcome: CallOutcome::Failed,
+                            detail: "internal".into(),
+                        };
                     }
                 }
                 Ok(CallEvent::Media(_)) => {}
                 Ok(CallEvent::Terminated) => break TermReason::RemoteHangup,
-                Err(e) => break TermReason::Failed(e.to_string()),
+                Err(e) => break TermReason::Failed {
+                    outcome: CallOutcome::Failed,
+                    detail: e.to_string(),
+                },
             },
             Some(rtp) = receiver.recv() => {
                 uplink_stats.observe(rtp.sequence_number.0);
@@ -263,5 +283,27 @@ fn map_make_err<A: std::fmt::Debug, M: std::fmt::Debug>(
         MakeCallError::Failed(line) => SipError::Invite(format!("{line:?}")),
         MakeCallError::Core(ezk_sip_core::Error::RequestTimedOut) => SipError::NotAnswered,
         other => SipError::Media(format!("{other:?}")),
+    }
+}
+
+/// Classify a post-INVITE completion failure (`OutboundCall::wait_for_completion`
+/// / `UnacknowledgedCall::finish`) into a `CallOutcome`. Note this is a distinct
+/// error type from `MakeCallError` above (`MakeCallCompletionError` has no `Auth`
+/// variant and adds `MissingSdpInResponse`), even though both carry a `StatusLine`
+/// on the same-shaped `Failed` variant.
+fn classify_completion_err<M: std::fmt::Debug>(
+    e: &ezk_sip_ua::MakeCallCompletionError<M>,
+) -> (CallOutcome, String) {
+    use crate::sip::outcome_from_status;
+    use ezk_sip_ua::MakeCallCompletionError;
+    match e {
+        MakeCallCompletionError::Failed(line) => {
+            let code = line.code.into_u16();
+            (outcome_from_status(code), format!("{line:?}"))
+        }
+        MakeCallCompletionError::Core(ezk_sip_core::Error::RequestTimedOut) => {
+            (CallOutcome::NoAnswer, "request timed out".into())
+        }
+        other => (CallOutcome::Failed, format!("{other:?}")),
     }
 }

@@ -10,8 +10,10 @@
 //! before building anything on top of this.
 
 mod call;
+mod outcome;
 mod uplink;
 
+pub use outcome::{outcome_from_status, CallOutcome};
 pub use uplink::{UplinkQuality, UplinkQualityShared, UplinkStats};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -67,8 +69,9 @@ pub enum TermReason {
     RemoteHangup,
     /// We ended the call via `SipCall::hangup()`.
     LocalHangup,
-    /// The call failed before or during setup/teardown; reason in the string.
-    Failed(String),
+    /// The call failed before or during setup/teardown. `outcome` is the
+    /// classified SIP result; `detail` is the human-readable status line.
+    Failed { outcome: CallOutcome, detail: String },
 }
 
 /// Lifecycle event for a live call.

@@ -22,6 +22,7 @@ pub mod mcp_http;
 pub mod net_check;
 pub mod proto;
 pub mod proxy;
+pub mod queue;
 pub mod reconnect;
 pub mod sip;
 pub mod state;
