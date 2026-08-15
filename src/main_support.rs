@@ -21,9 +21,11 @@ fn env_u64(k: &str, d: u64) -> u64 {
     std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
 }
 
-/// Build (ServerConfig, SipConfig) from environment (mirrors `run_live`'s
-/// ServerConfig construction). Errors if GEMINI_API_KEY is unset. SIP fields
-/// come from KUTSU_SIP_*.
+/// Build (ServerConfig, SipConfig) from environment. This is the single
+/// source of env -> config for every entry point (`kutsu call`, its
+/// integration test, and `run_live`, which starts from this and overrides
+/// only its CLI args). Errors if GEMINI_API_KEY is unset. SIP fields come
+/// from KUTSU_SIP_*.
 pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
     let api_key =
         std::env::var("GEMINI_API_KEY").map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
