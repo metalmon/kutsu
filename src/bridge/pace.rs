@@ -66,10 +66,8 @@ impl Downlink {
 
     /// Arm/disarm underrun accounting for an active model turn. A rising edge
     /// (false -> true) re-arms a fresh prefill so each turn's audio is buffered
-    /// before playout (absorbs Gemini-path jitter within the turn).
-    // Not yet called from `bridge::run` — wired in a later task alongside the
-    // prebuffer/resume config; exercised directly by this module's unit tests.
-    #[allow(dead_code)]
+    /// before playout (absorbs Gemini-path jitter within the turn). Called from
+    /// `bridge::run` as the engine tracks whether a model turn is in flight.
     pub fn set_expecting(&mut self, expecting: bool) {
         if expecting && !self.expecting {
             self.playing = false;
@@ -78,12 +76,19 @@ impl Downlink {
         self.expecting = expecting;
     }
 
-    #[allow(dead_code)]
+    /// Count of mid-turn underruns (buffer ran dry after playout had started).
+    /// This is the metric used for the abort gate — see `starved_ms` for why
+    /// it, not this count, includes the per-turn prefill hold.
     pub fn underruns(&self) -> u64 {
         self.underruns
     }
 
-    #[allow(dead_code)]
+    /// Total silence (ms) inserted while a turn was expected — this includes
+    /// the intentional per-turn prefill hold (~`prebuffer_ms` at the start of
+    /// each turn, and ~`resume_ms` after a mid-turn underrun), not only true
+    /// dropout silence. It's therefore an upper bound on lost audio, not a
+    /// precise dropout measure; for gating/alerting on real dropouts use
+    /// `underruns` (the count), not this.
     pub fn starved_ms(&self) -> u64 {
         self.starved_ms
     }

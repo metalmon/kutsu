@@ -8,10 +8,36 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::bridge::{self, BridgePorts};
-use crate::config::{ScenarioConfig, ServerConfig, SipConfig};
+use crate::config::{QualityConfig, ScenarioConfig, ServerConfig, SipConfig};
 use crate::gemini_live::{self, EndedBy, Event, TranscriptEntry};
 use crate::sip::{SipCallParts, SipEvent, SipTransport};
 use crate::state::{CallQuality, CallRecord, CallState, CallStore};
+
+/// Quality-abort gate: should a call in progress be aborted for degraded
+/// audio? `abort_underruns == 0` disables the gate (never abort). Pure
+/// decision, extracted from the `qtick` arm of `run_call`'s select loop so
+/// it's unit-testable without a live call.
+fn should_abort(cfg: &QualityConfig, underruns: u64) -> bool {
+    cfg.abort_underruns > 0 && underruns >= cfg.abort_underruns as u64
+}
+
+/// Reconcile the select loop's `end_state` with the authoritative outcome
+/// from the Gemini session: a model-initiated end is a success even if its
+/// `EndCall` event lost the select race against e.g. `GeminiClosed` (which
+/// would otherwise read `Failed`).
+fn reconcile_final_state(end_state: CallState, ended_by: EndedBy) -> CallState {
+    match ended_by {
+        EndedBy::ModelEndCall => CallState::Completed,
+        _ => end_state,
+    }
+}
+
+/// Only attach the abort error if the reconciled outcome is still `Failed` —
+/// a late `ModelEndCall` can override `end_state` to `Completed` even after
+/// the quality-abort arm fired; don't leave a stale error on a completed call.
+fn finalize_error(final_state: CallState, abort_reason: Option<String>) -> Option<String> {
+    if final_state == CallState::Failed { abort_reason } else { None }
+}
 
 /// Errors from placing a call.
 #[derive(Debug, thiserror::Error)]
@@ -332,8 +358,7 @@ async fn run_call(
             _ = qtick.tick() => {
                 let q = quality.snapshot();
                 store.set_quality(&call_id, q);
-                let cap = server.quality.abort_underruns;
-                if cap > 0 && q.underruns >= cap as u64 {
+                if should_abort(&server.quality, q.underruns) {
                     counters.quality_aborted.fetch_add(1, Ordering::Relaxed);
                     abort_reason = Some(format!(
                         "aborted: audio quality degraded ({} underruns, {} ms silence)",
@@ -351,13 +376,9 @@ async fn run_call(
     bridge_task.abort();
     let outcome = gemini_handle.join().await;
 
-    // 9. Finalize. Reconcile the loop's end_state with the authoritative outcome:
-    // a model-initiated end is a success even if its `EndCall` event lost the
-    // select race against `GeminiClosed` (which would otherwise read `Failed`).
-    let final_state = match outcome.ended_by {
-        EndedBy::ModelEndCall => CallState::Completed,
-        _ => end_state,
-    };
+    // 9. Finalize. Reconcile the loop's end_state with the authoritative outcome
+    // (see `reconcile_final_state`).
+    let final_state = reconcile_final_state(end_state, outcome.ended_by);
     // Final quality snapshot + cumulative totals, added exactly once here
     // (not per tick, which only updates the live record + checks the abort
     // threshold).
@@ -369,10 +390,7 @@ async fn run_call(
 
     store.set_transcript(&call_id, outcome.transcript);
     let final_goal = goal.or(outcome.goal);
-    // Only attach the abort error if the reconciled outcome is still Failed —
-    // a late ModelEndCall can override end_state to Completed even after the
-    // quality-abort arm fired; don't leave a stale error on a completed call.
-    let error = if final_state == CallState::Failed { abort_reason } else { None };
+    let error = finalize_error(final_state, abort_reason);
     store.finalize(&call_id, final_state, final_goal, error, now_ms());
     bump_counter(&counters, final_state);
 
@@ -512,5 +530,47 @@ mod tests {
         assert_eq!(m.active, 0);
         assert_eq!(m.channels_cap, 0);
         engine.shutdown().await;
+    }
+
+    #[test]
+    fn should_abort_disabled_never_aborts() {
+        let cfg = crate::config::QualityConfig { abort_underruns: 0, ..crate::config::QualityConfig::default() };
+        assert!(!should_abort(&cfg, 0));
+        assert!(!should_abort(&cfg, 1_000_000));
+    }
+
+    #[test]
+    fn should_abort_trips_at_threshold_not_before() {
+        let cfg = crate::config::QualityConfig { abort_underruns: 40, ..crate::config::QualityConfig::default() };
+        assert!(!should_abort(&cfg, 0));
+        assert!(!should_abort(&cfg, 39));
+        assert!(should_abort(&cfg, 40));
+        assert!(should_abort(&cfg, 41));
+    }
+
+    #[test]
+    fn reconcile_final_state_table() {
+        // A model-initiated end always wins as Completed, regardless of what
+        // the select loop landed on (it may have raced GeminiClosed -> Failed).
+        for end_state in [CallState::Failed, CallState::HungUp, CallState::Completed, CallState::Cancelled] {
+            assert_eq!(reconcile_final_state(end_state, EndedBy::ModelEndCall), CallState::Completed);
+        }
+        // Any other ended_by leaves end_state untouched.
+        for ended_by in [EndedBy::CallerHangup, EndedBy::RemoteClose, EndedBy::Error] {
+            for end_state in [CallState::Failed, CallState::HungUp, CallState::Completed, CallState::Cancelled] {
+                assert_eq!(reconcile_final_state(end_state, ended_by), end_state);
+            }
+        }
+    }
+
+    #[test]
+    fn finalize_error_only_attached_when_failed() {
+        assert_eq!(finalize_error(CallState::Failed, Some("boom".into())), Some("boom".into()));
+        assert_eq!(finalize_error(CallState::Failed, None), None);
+        // A reconciled Completed (e.g. late ModelEndCall overriding an aborted
+        // end_state) must not carry a stale abort error.
+        assert_eq!(finalize_error(CallState::Completed, Some("boom".into())), None);
+        assert_eq!(finalize_error(CallState::HungUp, Some("boom".into())), None);
+        assert_eq!(finalize_error(CallState::Cancelled, Some("boom".into())), None);
     }
 }
