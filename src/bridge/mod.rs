@@ -67,7 +67,8 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
     tokio::pin!(uplink);
 
     // Downlink: 24 kHz buffer + 20 ms pacer + barge-in, on this task.
-    let mut downlink = pace::Downlink::new();
+    // TODO(task 4): wire real prebuffer/resume config; prefill disabled (0, 0) for now.
+    let mut downlink = pace::Downlink::new(0, 0);
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
 
     // Every loop exit goes through `break` so a single `uplink.abort()` below
