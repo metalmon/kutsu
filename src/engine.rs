@@ -32,6 +32,14 @@ fn merge_quality(mut q: CallQuality, u: crate::sip::UplinkQuality) -> CallQualit
     q
 }
 
+/// Should a busy dial attempt be retried? `attempt` is the 1-based attempt
+/// number of the call that just finalized Busy; retry is allowed as long as
+/// it hasn't yet reached the configured cap. Pure, unit-tested independent of
+/// any live call.
+fn should_retry_busy(attempt: u32, cfg: &crate::config::RetryConfig) -> bool {
+    attempt < cfg.busy_max_attempts
+}
+
 /// Reconcile the select loop's `end_state` with the authoritative outcome
 /// from the Gemini session: a model-initiated end is a success even if its
 /// `EndCall` event lost the select race against e.g. `GeminiClosed` (which
@@ -130,6 +138,65 @@ pub struct MetricsSnapshot {
     pub unavailable_total: u64,
 }
 
+/// Everything needed to enqueue a new call (`place_call_at`'s body), bundled
+/// so it can be handed to `run_call` — which has no `&Engine` — for Task 8's
+/// busy-retry requeue. Cloning is cheap (all fields are `Arc`/already-`Clone`
+/// handles), matching the clones the dispatcher already threads into
+/// `run_call`.
+#[derive(Clone)]
+struct Enqueuer {
+    seq: Arc<AtomicUsize>,
+    store: CallStore,
+    queue: Arc<Mutex<Box<dyn QueueStore>>>,
+    wake: Arc<Notify>,
+    counters: Arc<Counters>,
+}
+
+impl Enqueuer {
+    /// Enqueue an outbound call eligible for dispatch at `eligible_at_ms`.
+    /// Records the call `Queued`, pushes a `PendingEntry`, and notifies the
+    /// dispatcher. Returns the new call_id. Shared body for
+    /// `Engine::place_call_at` and `run_call`'s busy-retry requeue.
+    async fn place_call_at(
+        &self,
+        number: String,
+        scenario: ScenarioConfig,
+        eligible_at_ms: u64,
+        attempt: u32,
+        retry_of: Option<String>,
+    ) -> String {
+        let n = self.seq.fetch_add(1, Ordering::Relaxed);
+        let call_id = format!("call-{n}");
+        self.store.insert(CallRecord {
+            call_id: call_id.clone(),
+            number: number.clone(),
+            state: CallState::Queued,
+            transcript: vec![],
+            goal: None,
+            error: None,
+            started_ms: now_ms(),
+            ended_ms: None,
+            quality: CallQuality::default(),
+            outcome: None,
+            attempt,
+            retry_of: retry_of.clone(),
+        });
+        self.counters.placed.fetch_add(1, Ordering::Relaxed);
+        self.queue.lock().unwrap().push(PendingEntry {
+            call_id: call_id.clone(),
+            number,
+            scenario,
+            eligible_at_ms,
+            attempt,
+            retry_of,
+        });
+        // Wake the dispatcher so an immediate call dispatches without waiting
+        // for its eligibility timer, and a scheduled call re-arms the timer.
+        self.wake.notify_one();
+        call_id
+    }
+}
+
 /// The call engine: owns the SIP transport, the call store, config, and the
 /// pending-call queue driven by a central dispatcher task (replaces the old
 /// spawn-and-park-on-a-semaphore model).
@@ -142,12 +209,12 @@ pub struct Engine {
     /// Count of dispatched-but-not-yet-finalized calls; the concurrency gate
     /// (`running < max_concurrent_channels`) that the semaphore used to enforce.
     running: Arc<AtomicUsize>,
-    /// Woken on every enqueue and on every freed slot so the dispatcher never
-    /// busy-spins.
-    wake: Arc<Notify>,
     cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
-    seq: AtomicUsize,
     counters: Arc<Counters>,
+    /// Bundles the id sequence + store/queue/wake/counters handles needed to
+    /// enqueue a call; also cloned into every `run_call` task so Task 8's
+    /// busy-retry can requeue without needing `&Engine`.
+    enqueuer: Enqueuer,
     /// The central dispatcher task; aborted on `shutdown`.
     dispatcher: tokio::task::JoinHandle<()>,
 }
@@ -162,6 +229,14 @@ impl Engine {
         let wake = Arc::new(Notify::new());
         let cancels = Arc::new(Mutex::new(HashMap::new()));
         let counters = Arc::new(Counters::default());
+        let seq = Arc::new(AtomicUsize::new(0));
+        let enqueuer = Enqueuer {
+            seq,
+            store: store.clone(),
+            queue: queue.clone(),
+            wake: wake.clone(),
+            counters: counters.clone(),
+        };
         let dispatcher = tokio::spawn(dispatcher(
             sip.clone(),
             store.clone(),
@@ -171,6 +246,7 @@ impl Engine {
             wake.clone(),
             cancels.clone(),
             counters.clone(),
+            enqueuer.clone(),
         ));
         Ok(Self {
             sip,
@@ -178,10 +254,9 @@ impl Engine {
             server,
             queue,
             running,
-            wake,
             cancels,
-            seq: AtomicUsize::new(0),
             counters,
+            enqueuer,
             dispatcher,
         })
     }
@@ -242,35 +317,7 @@ impl Engine {
         attempt: u32,
         retry_of: Option<String>,
     ) -> String {
-        let n = self.seq.fetch_add(1, Ordering::Relaxed);
-        let call_id = format!("call-{n}");
-        self.store.insert(CallRecord {
-            call_id: call_id.clone(),
-            number: number.clone(),
-            state: CallState::Queued,
-            transcript: vec![],
-            goal: None,
-            error: None,
-            started_ms: now_ms(),
-            ended_ms: None,
-            quality: CallQuality::default(),
-            outcome: None,
-            attempt,
-            retry_of: retry_of.clone(),
-        });
-        self.counters.placed.fetch_add(1, Ordering::Relaxed);
-        self.queue.lock().unwrap().push(PendingEntry {
-            call_id: call_id.clone(),
-            number,
-            scenario,
-            eligible_at_ms,
-            attempt,
-            retry_of,
-        });
-        // Wake the dispatcher so an immediate call dispatches without waiting
-        // for its eligibility timer, and a scheduled call re-arms the timer.
-        self.wake.notify_one();
-        call_id
+        self.enqueuer.place_call_at(number, scenario, eligible_at_ms, attempt, retry_of).await
     }
 
     /// 1-based position of a pending call in real dispatch order
@@ -327,6 +374,7 @@ async fn dispatcher(
     wake: Arc<Notify>,
     cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     counters: Arc<Counters>,
+    enqueuer: Enqueuer,
 ) {
     let cap = server.max_concurrent_channels;
     loop {
@@ -360,12 +408,13 @@ async fn dispatcher(
             let server = server.clone();
             let cancels = cancels.clone();
             let counters = counters.clone();
+            let enqueuer = enqueuer.clone();
             let PendingEntry { call_id, number, scenario, attempt, retry_of, .. } = entry;
             tokio::spawn(async move {
                 let _slot = slot; // released (decrement + wake) on task exit / panic
                 run_call(
-                    sip, store, server, cancels, counters, cancel_rx, scenario, number, call_id,
-                    attempt, retry_of,
+                    sip, store, server, cancels, counters, enqueuer, cancel_rx, scenario, number,
+                    call_id, attempt, retry_of,
                 )
                 .await;
             });
@@ -473,6 +522,7 @@ async fn run_call(
     server: Arc<ServerConfig>,
     cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     counters: Arc<Counters>,
+    enqueuer: Enqueuer,
     mut cancel_rx: oneshot::Receiver<()>,
     scenario: ScenarioConfig,
     number: String,
@@ -506,6 +556,22 @@ async fn run_call(
                 };
                 store.finalize(&call_id, CallState::Failed, None, Some(detail), Some(outcome), now_ms());
                 bump_counter_outcome(&counters, outcome);
+                // Busy is the only auto-retried outcome (NoAnswer and all
+                // others finalize terminally here). The finalized record above
+                // is linked forward by the follow-up's `retry_of`; the
+                // follow-up gets a fresh call_id from `place_call_at`, so this
+                // record is never re-finalized (no double-finalize).
+                if outcome == CallOutcome::Busy && should_retry_busy(attempt, &server.retry) {
+                    enqueuer
+                        .place_call_at(
+                            number.clone(),
+                            scenario.clone(),
+                            now_ms() + server.retry.busy_retry_interval_ms,
+                            attempt + 1,
+                            Some(call_id.clone()),
+                        )
+                        .await;
+                }
                 return;
             }
             None => {
@@ -915,6 +981,14 @@ mod tests {
         assert_eq!(finalize_error(CallState::Completed, Some("boom".into())), None);
         assert_eq!(finalize_error(CallState::HungUp, Some("boom".into())), None);
         assert_eq!(finalize_error(CallState::Cancelled, Some("boom".into())), None);
+    }
+
+    #[test]
+    fn should_retry_busy_stops_at_max() {
+        let cfg = crate::config::RetryConfig { busy_max_attempts: 3, busy_retry_interval_ms: 1000 };
+        assert!(should_retry_busy(1, &cfg));
+        assert!(should_retry_busy(2, &cfg));
+        assert!(!should_retry_busy(3, &cfg)); // 3rd attempt is the last; no 4th
     }
 
     #[test]
