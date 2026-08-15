@@ -9,6 +9,8 @@
 
 use std::sync::Arc;
 
+use subtle::ConstantTimeEq;
+
 use axum::{
     Router,
     extract::{Request, State},
@@ -76,10 +78,18 @@ async fn metrics(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
     )
 }
 
+/// Constant-time comparison of a presented bearer token against the
+/// configured one, so response timing can't be used to recover the token
+/// byte-by-byte. A length difference short-circuits — acceptable, since a
+/// token's length is not the secret.
+fn token_matches(presented: &str, expected: &str) -> bool {
+    presented.as_bytes().ct_eq(expected.as_bytes()).into()
+}
+
 /// Bearer-token guard for `/mcp`. Compares the `Authorization: Bearer
-/// <token>` header against the configured token; responds `401` on a
-/// missing or mismatched header. The presented token is never logged, only
-/// whether the check passed.
+/// <token>` header against the configured token in constant time; responds
+/// `401` on a missing or mismatched header. The presented token is never
+/// logged, only whether the check passed.
 async fn bearer_guard(token: Arc<str>, req: Request, next: Next) -> Response {
     let presented = req
         .headers()
@@ -87,7 +97,7 @@ async fn bearer_guard(token: Arc<str>, req: Request, next: Next) -> Response {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     match presented {
-        Some(p) if p == token.as_ref() => next.run(req).await,
+        Some(p) if token_matches(p, token.as_ref()) => next.run(req).await,
         _ => (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
     }
 }
@@ -264,5 +274,15 @@ mod tests {
             assert!(s.contains(line), "missing: {line}");
         }
         assert!(s.contains("# TYPE kutsu_calls_placed_total counter"));
+    }
+
+    #[test]
+    fn token_matches_accepts_only_the_exact_token() {
+        assert!(token_matches("s3cret-token", "s3cret-token"));
+        assert!(token_matches("", ""));
+        assert!(!token_matches("s3cret-token", "s3cret-tokeN")); // last byte differs
+        assert!(!token_matches("s3cret-token", "s3cret-toke")); // shorter
+        assert!(!token_matches("s3cret-token", "s3cret-tokenX")); // longer
+        assert!(!token_matches("", "x"));
     }
 }
