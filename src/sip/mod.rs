@@ -123,6 +123,7 @@ pub struct SipCall {
     rtp_in: mpsc::Receiver<Bytes>,
     rtp_out: mpsc::Sender<Bytes>,
     hangup: Option<oneshot::Sender<()>>,
+    uplink_quality: std::sync::Arc<UplinkQualityShared>,
 }
 
 impl SipCall {
@@ -162,6 +163,7 @@ impl SipCall {
             audio_in: self.rtp_in,
             audio_out: self.rtp_out,
             hangup,
+            uplink_quality: self.uplink_quality,
         }
     }
 
@@ -172,8 +174,9 @@ impl SipCall {
         rtp_in: mpsc::Receiver<Bytes>,
         rtp_out: mpsc::Sender<Bytes>,
         hangup: oneshot::Sender<()>,
+        uplink_quality: std::sync::Arc<UplinkQualityShared>,
     ) -> Self {
-        Self { call_id, events, rtp_in, rtp_out, hangup: Some(hangup) }
+        Self { call_id, events, rtp_in, rtp_out, hangup: Some(hangup), uplink_quality }
     }
 }
 
@@ -184,6 +187,7 @@ pub struct SipCallParts {
     pub audio_in: mpsc::Receiver<Bytes>,
     pub audio_out: mpsc::Sender<Bytes>,
     pub hangup: oneshot::Sender<()>,
+    pub uplink_quality: std::sync::Arc<UplinkQualityShared>,
 }
 
 /// Command sent from `SipTransport` to the SIP runtime thread.
@@ -373,7 +377,7 @@ mod tests {
         let (in_tx, in_rx) = mpsc::channel(4);
         let (out_tx, mut out_rx) = mpsc::channel::<bytes::Bytes>(4);
         let (hup_tx, mut hup_rx) = oneshot::channel();
-        let call = SipCall::from_parts("c1".into(), ev_rx, in_rx, out_tx, hup_tx);
+        let call = SipCall::from_parts("c1".into(), ev_rx, in_rx, out_tx, hup_tx, UplinkQualityShared::new());
 
         let mut parts = call.split();
         assert_eq!(parts.call_id, "c1");
