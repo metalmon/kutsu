@@ -536,7 +536,7 @@ mod tests {
         ServerConfig { api_key: "K".into(), proxy: None, model: Model::HalfCascade,
             voice: "Autonoe".into(), voice_gender: crate::config::Gender::Female, language: "en-US".into(),
             net_check: NetCheckConfig::default(), max_concurrent_channels: 3,
-            greet_after_silence_ms: 0, transcript_dir: None, max_call_secs: 600,
+            greet_after_silence_ms: 0, transcript_dir: None, dump_uplink_dir: None, max_call_secs: 600,
             quality: crate::config::QualityConfig::default() }
     }
     fn scenario() -> ScenarioConfig {

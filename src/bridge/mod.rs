@@ -39,6 +39,7 @@ impl QualityShared {
             underruns: self.underruns.load(Ordering::Relaxed),
             starved_ms: self.starved_ms.load(Ordering::Relaxed),
             max_gap_ms: self.max_gap_ms.load(Ordering::Relaxed),
+            ..Default::default()
         }
     }
 }
@@ -63,6 +64,10 @@ pub struct BridgePorts {
     pub resume_ms: u32,
     /// Shared call-quality counters, published once per pacer tick.
     pub quality: Arc<QualityShared>,
+    /// Call id, used to name uplink dump files.
+    pub call_id: String,
+    /// If set, directory to write per-call uplink WAV dumps into.
+    pub uplink_dump: Option<std::path::PathBuf>,
 }
 
 /// Why the bridge stopped.
@@ -87,18 +92,47 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
         prebuffer_ms,
         resume_ms,
         quality,
+        call_id,
+        uplink_dump,
     } = ports;
 
     // Uplink: transparent, continuous, never-manipulated forward (spec §2).
     // Separate task so its backpressure `await` can never stall the downlink.
     let uplink = tokio::spawn(async move {
+        let mut dump8 = uplink_dump.as_ref().and_then(|dir| {
+            let path = dir.join(format!("{call_id}-uplink-8k.wav"));
+            match crate::audio_file::Pcm16Writer::create(&path, 8000) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to open uplink dump");
+                    None
+                }
+            }
+        });
+        let mut dump16 = uplink_dump.as_ref().and_then(|dir| {
+            let path = dir.join(format!("{call_id}-uplink-16k.wav"));
+            match crate::audio_file::Pcm16Writer::create(&path, 16000) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to open uplink dump");
+                    None
+                }
+            }
+        });
         while let Some(payload) = phone_in.recv().await {
             let pcm8 = g711::decode(codec, &payload);
             let pcm16 = resample::up_8k_16k(&pcm8);
+            // Synchronous `hound` writes on this async uplink task, between
+            // `recv` and `gemini_in.send`: negligible under normal disk I/O,
+            // and only exercised at all when dumping is enabled.
+            if let Some(w) = dump8.as_mut() { let _ = w.write(&pcm8); }
+            if let Some(w) = dump16.as_mut() { let _ = w.write(&pcm16); }
             if gemini_in.send(pcm16).await.is_err() {
                 break; // gemini sink closed
             }
         }
+        if let Some(w) = dump8.take() { let _ = w.finalize(); }
+        if let Some(w) = dump16.take() { let _ = w.finalize(); }
     });
     tokio::pin!(uplink);
 
@@ -204,6 +238,8 @@ mod tests {
                 prebuffer_ms: 140,
                 resume_ms: 60,
                 quality: QualityShared::new(),
+                call_id: "c1".to_string(),
+                uplink_dump: None,
             },
             Ends { phone_in_tx, phone_out_rx, gemini_in_rx, gemini_events_tx, events_out_rx },
         )
@@ -344,6 +380,36 @@ mod tests {
         assert!(q.snapshot().underruns >= 1, "expected underruns recorded while expecting");
         drop(ends);
         let _ = h.await;
+    }
+
+    #[tokio::test]
+    async fn uplink_dump_writes_both_wavs() {
+        let dir = std::env::temp_dir().join(format!("kutsu-uplink-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (mut ports, ends) = wire(G711Kind::Ulaw);
+        ports.call_id = "c1".to_string();
+        ports.uplink_dump = Some(dir.clone());
+        let h = tokio::spawn(run(ports));
+
+        for _ in 0..5 {
+            ends.phone_in_tx.send(Bytes::from(vec![0xFFu8; 160])).await.unwrap();
+        }
+        // Close only the phone side; the uplink task drains the buffered
+        // frames, finalizes both WAV writers, and ends -- which the bridge
+        // observes as `PhoneClosed` and returns. Keep `gemini_events_tx`
+        // (inside `ends`) alive until then so the bridge doesn't race to a
+        // `GeminiClosed` exit first and abort the uplink task mid-drain.
+        drop(ends.phone_in_tx);
+        let _ = h.await;
+
+        let eight = dir.join("c1-uplink-8k.wav");
+        let sixteen = dir.join("c1-uplink-16k.wav");
+        assert!(eight.exists(), "8k dump missing");
+        assert!(sixteen.exists(), "16k dump missing");
+        assert!(!crate::audio_file::read_pcm16(&eight, 8000).unwrap().is_empty());
+        assert!(!crate::audio_file::read_pcm16(&sixteen, 16000).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(start_paused = true)]

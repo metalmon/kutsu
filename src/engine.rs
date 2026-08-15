@@ -21,6 +21,16 @@ fn should_abort(cfg: &QualityConfig, underruns: u64) -> bool {
     cfg.abort_underruns > 0 && underruns >= cfg.abort_underruns as u64
 }
 
+/// Merge a downlink `CallQuality` snapshot with the uplink (phone→bridge)
+/// snapshot, so both directions are reported through the one `CallQuality`
+/// record. Kept in one place, used by both the `qtick` arm and finalize.
+fn merge_quality(mut q: CallQuality, u: crate::sip::UplinkQuality) -> CallQuality {
+    q.uplink_received = u.received;
+    q.uplink_lost = u.lost;
+    q.uplink_reordered = u.reordered;
+    q
+}
+
 /// Reconcile the select loop's `end_state` with the authoritative outcome
 /// from the Gemini session: a model-initiated end is a success even if its
 /// `EndCall` event lost the select race against e.g. `GeminiClosed` (which
@@ -68,6 +78,10 @@ struct Counters {
     underruns: AtomicU64,
     starved_ms: AtomicU64,
     quality_aborted: AtomicU64,
+    /// Cumulative uplink (phone→bridge) RTP loss totals, added once per call
+    /// at finalize alongside the downlink totals above.
+    uplink_received: AtomicU64,
+    uplink_lost: AtomicU64,
 }
 
 /// A point-in-time view of engine load and lifetime totals, for the
@@ -84,6 +98,8 @@ pub struct MetricsSnapshot {
     pub underruns_total: u64,
     pub starved_ms_total: u64,
     pub quality_aborted_total: u64,
+    pub uplink_received_total: u64,
+    pub uplink_lost_total: u64,
 }
 
 /// The call engine: owns the SIP transport, the call store, and config.
@@ -131,6 +147,8 @@ impl Engine {
             underruns_total: self.counters.underruns.load(Ordering::Relaxed),
             starved_ms_total: self.counters.starved_ms.load(Ordering::Relaxed),
             quality_aborted_total: self.counters.quality_aborted.load(Ordering::Relaxed),
+            uplink_received_total: self.counters.uplink_received.load(Ordering::Relaxed),
+            uplink_lost_total: self.counters.uplink_lost.load(Ordering::Relaxed),
         }
     }
 
@@ -262,7 +280,7 @@ async fn run_call(
         }
     };
     // 2. Decompose into owned channel ends.
-    let SipCallParts { events: mut sip_events, audio_in, audio_out, hangup: sip_hangup, .. } = call.split();
+    let SipCallParts { events: mut sip_events, audio_in, audio_out, hangup: sip_hangup, uplink_quality, .. } = call.split();
 
     // 3. Await answer (no Gemini yet — nothing to tear down on failure here).
     let codec = loop {
@@ -310,6 +328,8 @@ async fn run_call(
         prebuffer_ms: server.quality.prebuffer_ms,
         resume_ms: server.quality.resume_ms,
         quality: quality.clone(),
+        call_id: call_id.clone(),
+        uplink_dump: server.dump_uplink_dir.clone(),
     };
     let mut bridge_task = tokio::spawn(bridge::run(ports));
 
@@ -356,7 +376,7 @@ async fn run_call(
             _ = &mut deadline => break CallState::Completed,
             _ = &mut cancel_rx => break CallState::Cancelled,
             _ = qtick.tick() => {
-                let q = quality.snapshot();
+                let q = merge_quality(quality.snapshot(), uplink_quality.snapshot());
                 store.set_quality(&call_id, q);
                 if should_abort(&server.quality, q.underruns) {
                     // NOTE: don't bump `quality_aborted` here — the abort is not
@@ -386,11 +406,19 @@ async fn run_call(
     // Final quality snapshot + cumulative totals, added exactly once here
     // (not per tick, which only updates the live record + checks the abort
     // threshold).
-    let q = quality.snapshot();
+    let q = merge_quality(quality.snapshot(), uplink_quality.snapshot());
     store.set_quality(&call_id, q);
     counters.underruns.fetch_add(q.underruns, Ordering::Relaxed);
     counters.starved_ms.fetch_add(q.starved_ms, Ordering::Relaxed);
-    tracing::info!(%call_id, underruns = q.underruns, starved_ms = q.starved_ms, max_gap_ms = q.max_gap_ms, "call audio quality");
+    counters.uplink_received.fetch_add(q.uplink_received, Ordering::Relaxed);
+    counters.uplink_lost.fetch_add(q.uplink_lost, Ordering::Relaxed);
+    tracing::info!(
+        %call_id, codec = ?codec.kind,
+        uplink_received = q.uplink_received, uplink_lost = q.uplink_lost,
+        uplink_reordered = q.uplink_reordered,
+        underruns = q.underruns, starved_ms = q.starved_ms, max_gap_ms = q.max_gap_ms,
+        "call audio quality"
+    );
 
     store.set_transcript(&call_id, outcome.transcript);
     let final_goal = goal.or(outcome.goal);
@@ -451,6 +479,7 @@ mod tests {
             max_concurrent_channels: cap,
             greet_after_silence_ms: 4000,
             transcript_dir: None,
+            dump_uplink_dir: None,
             max_call_secs: 600,
             quality: crate::config::QualityConfig::default(),
         };
@@ -524,6 +553,16 @@ mod tests {
         assert_eq!(m.underruns_total, 0);
         assert_eq!(m.starved_ms_total, 0);
         assert_eq!(m.quality_aborted_total, 0);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn metrics_snapshot_exposes_uplink_totals() {
+        let (server, sip_cfg) = test_configs(1);
+        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
+        let m = engine.metrics_snapshot();
+        assert_eq!(m.uplink_received_total, 0);
+        assert_eq!(m.uplink_lost_total, 0);
         engine.shutdown().await;
     }
 

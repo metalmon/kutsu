@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::config::SipConfig;
 use crate::sip::{
     g711_kind_from_pt, plain_rtp_g711_config, G711Kind, NegotiatedCodec, SipCall, SipError,
-    SipEvent, TermReason,
+    SipEvent, TermReason, UplinkQualityShared, UplinkStats,
 };
 
 /// Build the shared endpoint with one UDP transport. `add_allow` is MANDATORY —
@@ -130,7 +130,8 @@ pub(crate) async fn run_call(
     let (in_tx, in_rx) = mpsc::channel::<Bytes>(64);
     let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(64);
     let (hup_tx, mut hup_rx) = oneshot::channel::<()>();
-    let handle = SipCall::from_parts(call_id, ev_rx, in_rx, out_tx, hup_tx);
+    let uplink_quality = UplinkQualityShared::new();
+    let handle = SipCall::from_parts(call_id, ev_rx, in_rx, out_tx, hup_tx, uplink_quality.clone());
     if reply.send(Ok(handle)).is_err() {
         let _ = outbound.cancel().await;
         return;
@@ -225,6 +226,7 @@ pub(crate) async fn run_call(
     });
 
     // Main loop: pump SIP/media, forward inbound audio, honour hangup.
+    let mut uplink_stats = UplinkStats::new();
     let reason = loop {
         tokio::select! {
             r = call.run() => match r {
@@ -238,6 +240,8 @@ pub(crate) async fn run_call(
                 Err(e) => break TermReason::Failed(e.to_string()),
             },
             Some(rtp) = receiver.recv() => {
+                uplink_stats.observe(rtp.sequence_number.0);
+                uplink_quality.publish(&uplink_stats.snapshot());
                 // Drop-on-full: never block the media loop on a stalled bridge.
                 let _ = in_tx.try_send(rtp.payload);
             }

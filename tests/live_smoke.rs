@@ -30,6 +30,7 @@ async fn short_live_session_returns_audio_and_ends() {
         net_check, max_concurrent_channels: 3,
         greet_after_silence_ms: kutsu::config::DEFAULT_GREET_AFTER_SILENCE_MS,
         transcript_dir: None,
+        dump_uplink_dir: None,
         max_call_secs: 600,
         quality: kutsu::config::QualityConfig::default(),
     };

@@ -232,6 +232,7 @@ async fn run_live(
         greet_after_silence_ms: greet_after_silence_ms
             .unwrap_or(kutsu::config::DEFAULT_GREET_AFTER_SILENCE_MS),
         transcript_dir: None,
+        dump_uplink_dir: None,
         max_call_secs: 600,
         quality: kutsu::config::QualityConfig::default(),
     };

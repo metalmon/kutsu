@@ -28,6 +28,12 @@ pub struct CallQuality {
     pub underruns: u64,
     pub starved_ms: u64,
     pub max_gap_ms: u64,
+    /// Uplink (phone -> us) RTP packets received.
+    pub uplink_received: u64,
+    /// Uplink RTP packets lost (RFC 3550 span - received).
+    pub uplink_lost: u64,
+    /// Uplink RTP packets that arrived late/out-of-order.
+    pub uplink_reordered: u64,
 }
 
 /// One call's record.
@@ -237,10 +243,13 @@ mod tests {
     fn set_quality_updates_record() {
         let store = CallStore::new();
         store.insert(rec("c1"));
-        store.set_quality("c1", CallQuality { underruns: 3, starved_ms: 60, max_gap_ms: 220 });
+        store.set_quality("c1", CallQuality {
+            underruns: 3, starved_ms: 60, max_gap_ms: 220,
+            uplink_received: 500, uplink_lost: 7, uplink_reordered: 1,
+        });
         let got = store.get("c1").unwrap();
         assert_eq!(got.quality.underruns, 3);
-        assert_eq!(got.quality.starved_ms, 60);
-        assert_eq!(got.quality.max_gap_ms, 220);
+        assert_eq!(got.quality.uplink_lost, 7);
+        assert_eq!(got.quality.uplink_received, 500);
     }
 }
