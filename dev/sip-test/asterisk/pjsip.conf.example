@@ -53,13 +53,18 @@ password = kutsupw
 
 [kutsu-aor](aor-tpl)
 
-;--- callee: the Linphone softphone ----------------------------------
+;--- callee: the softphone that receives the call (e.g. MicroSIP) -----
+; The AOR object MUST be named exactly like the endpoint/username (`callee`):
+; res_pjsip_registrar matches an inbound REGISTER's target AOR by that name, so
+; an AOR named `callee-aor` gives "AOR '' not found" (404) and the phone cannot
+; register — then Asterisk can't route an inbound call (6001 -> Dial) to it.
+; (kutsu above is register-free, so its AOR name is cosmetic.)
 [callee](endpoint-tpl)
 auth = callee-auth
-aors = callee-aor
+aors = callee
 
 [callee-auth](auth-tpl)
 username = callee
 password = calleepw
 
-[callee-aor](aor-tpl)
+[callee](aor-tpl)
