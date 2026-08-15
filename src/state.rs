@@ -129,23 +129,6 @@ impl CallStore {
         self.inner.lock().unwrap().values().cloned().collect()
     }
 
-    /// 1-based position of a `Queued` call among all queued calls, ordered by
-    /// (started_ms, call_id). `None` if absent or not queued.
-    pub fn queued_position(&self, call_id: &str) -> Option<usize> {
-        let g = self.inner.lock().unwrap();
-        let target = g.get(call_id)?;
-        if target.state != CallState::Queued {
-            return None;
-        }
-        let key = (target.started_ms, target.call_id.as_str());
-        let ahead = g
-            .values()
-            .filter(|r| r.state == CallState::Queued)
-            .filter(|r| (r.started_ms, r.call_id.as_str()) < key)
-            .count();
-        Some(ahead + 1)
-    }
-
     /// Snapshot of active (Ringing|InProgress) and Queued counts.
     pub fn counts(&self) -> StateCounts {
         let g = self.inner.lock().unwrap();
@@ -260,22 +243,6 @@ mod tests {
     fn queued_and_cancelled_serialize_snake_case() {
         assert_eq!(serde_json::to_string(&CallState::Queued).unwrap(), "\"queued\"");
         assert_eq!(serde_json::to_string(&CallState::Cancelled).unwrap(), "\"cancelled\"");
-    }
-
-    #[test]
-    fn queued_position_ranks_by_started_then_id() {
-        let store = CallStore::new();
-        let mut a = rec("call-0"); a.state = CallState::Queued; a.started_ms = 100;
-        let mut b = rec("call-1"); b.state = CallState::Queued; b.started_ms = 200;
-        let mut c = rec("call-2"); c.state = CallState::InProgress; c.started_ms = 50;
-        store.insert(a); store.insert(b); store.insert(c);
-        assert_eq!(store.queued_position("call-0"), Some(1));
-        assert_eq!(store.queued_position("call-1"), Some(2));
-        assert_eq!(store.queued_position("call-2"), None); // not queued
-        assert_eq!(store.queued_position("missing"), None);
-        let counts = store.counts();
-        assert_eq!(counts.queued, 2);
-        assert_eq!(counts.active, 1);
     }
 
     #[test]

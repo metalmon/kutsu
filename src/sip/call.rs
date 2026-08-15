@@ -158,6 +158,11 @@ pub(crate) async fn run_call(
         }
     };
 
+    // From here on the INVITE has already completed successfully (200 OK), so every
+    // TermReason::Failed { outcome: CallOutcome::Failed, .. } below is post-answer.
+    // Busy/NoAnswer are pre-answer INVITE outcomes only (see classify_completion_err
+    // above); a connected call that drops is classified Failed here. If this ever
+    // needs to emit Busy, the engine busy-retry wiring (engine.rs) must be revisited.
     // Capture the RTP sender/receiver + codec from the first media events.
     let mut sender = None;
     let mut receiver = None;
