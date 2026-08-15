@@ -134,6 +134,27 @@ pub struct ServerConfig {
     pub transcript_dir: Option<PathBuf>,
     /// Safety cap on a single call's duration (seconds).
     pub max_call_secs: u64,
+    /// Downlink audio-quality pacing (prebuffer/resume/abort thresholds).
+    pub quality: QualityConfig,
+}
+
+/// Downlink playout pacing thresholds. Tunes the tradeoff between latency
+/// (lower prebuffer/resume = agent speaks sooner) and audible glitching
+/// (higher = more cushion against jitter/underruns).
+#[derive(Clone, Copy, Debug)]
+pub struct QualityConfig {
+    /// Samples-buffered target (ms) before (re)starting downlink playout.
+    pub prebuffer_ms: u32,
+    /// Faster re-arm target (ms) after a mid-turn underrun.
+    pub resume_ms: u32,
+    /// Cumulative underruns in one call that abort it as unusable; 0 = never.
+    pub abort_underruns: u32,
+}
+
+impl Default for QualityConfig {
+    fn default() -> Self {
+        Self { prebuffer_ms: 140, resume_ms: 60, abort_underruns: 40 }
+    }
 }
 
 /// Default wait before the agent greets a silent callee (see
@@ -200,6 +221,14 @@ mod tests {
     }
 
     #[test]
+    fn quality_config_defaults() {
+        let q = QualityConfig::default();
+        assert_eq!(q.prebuffer_ms, 140);
+        assert_eq!(q.resume_ms, 60);
+        assert_eq!(q.abort_underruns, 40);
+    }
+
+    #[test]
     fn server_config_has_engine_fields() {
         let c = ServerConfig {
             api_key: "k".into(),
@@ -213,6 +242,7 @@ mod tests {
             greet_after_silence_ms: DEFAULT_GREET_AFTER_SILENCE_MS,
             transcript_dir: Some(std::path::PathBuf::from("/tmp/x")),
             max_call_secs: 600,
+            quality: QualityConfig::default(),
         };
         assert_eq!(c.max_call_secs, 600);
         assert!(c.transcript_dir.is_some());

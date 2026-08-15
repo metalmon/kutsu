@@ -237,7 +237,7 @@ impl KutsuServer {
         let body = serde_json::json!({
             "call_id": rec.call_id, "state": rec.state, "number": rec.number,
             "started_ms": rec.started_ms, "ended_ms": rec.ended_ms,
-            "error": rec.error, "queued_position": pos,
+            "error": rec.error, "queued_position": pos, "quality": rec.quality,
         });
         Ok(CallToolResult::success(vec![ContentBlock::text(body.to_string())]))
     }
@@ -250,7 +250,7 @@ impl KutsuServer {
         let rec = self.engine.store().get(&a.call_id).ok_or_else(|| unknown_call(&a.call_id))?;
         let body = serde_json::json!({
             "call_id": rec.call_id, "state": rec.state,
-            "transcript": rec.transcript, "goal": rec.goal,
+            "transcript": rec.transcript, "goal": rec.goal, "quality": rec.quality,
         });
         Ok(CallToolResult::success(vec![ContentBlock::text(body.to_string())]))
     }
@@ -336,6 +336,7 @@ mod tests {
             greet_after_silence_ms: 4000,
             transcript_dir: None,
             max_call_secs: 600,
+            quality: crate::config::QualityConfig::default(),
         };
         let sip = SipConfig {
             server: "127.0.0.1:5060".into(),

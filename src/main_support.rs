@@ -1,7 +1,7 @@
 //! Shared config construction for the `kutsu call` CLI and its integration test.
 
 use crate::config::{
-    Gender, Model, NetCheckConfig, Proxy, ScenarioConfig, ServerConfig, SipConfig,
+    Gender, Model, NetCheckConfig, Proxy, QualityConfig, ScenarioConfig, ServerConfig, SipConfig,
     SipTransportKind, DEFAULT_GREET_AFTER_SILENCE_MS,
 };
 
@@ -11,6 +11,10 @@ fn env_or(k: &str, d: &str) -> String {
 
 fn non_empty(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|s| !s.is_empty())
+}
+
+fn env_u32(k: &str, d: u32) -> u32 {
+    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
 }
 
 /// Build (ServerConfig, SipConfig) from environment (mirrors `run_live`'s
@@ -36,6 +40,11 @@ pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
         greet_after_silence_ms: DEFAULT_GREET_AFTER_SILENCE_MS,
         transcript_dir: non_empty("KUTSU_TRANSCRIPT_DIR").map(std::path::PathBuf::from),
         max_call_secs: 600,
+        quality: QualityConfig {
+            prebuffer_ms: env_u32("KUTSU_QUALITY_PREBUFFER_MS", 140),
+            resume_ms: env_u32("KUTSU_QUALITY_RESUME_MS", 60),
+            abort_underruns: env_u32("KUTSU_QUALITY_ABORT_UNDERRUNS", 40),
+        },
     };
     let sip = SipConfig {
         server: env_or("KUTSU_SIP_SERVER", "192.168.88.243:5060"),

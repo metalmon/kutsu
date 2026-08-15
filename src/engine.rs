@@ -8,10 +8,36 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::bridge::{self, BridgePorts};
-use crate::config::{ScenarioConfig, ServerConfig, SipConfig};
+use crate::config::{QualityConfig, ScenarioConfig, ServerConfig, SipConfig};
 use crate::gemini_live::{self, EndedBy, Event, TranscriptEntry};
 use crate::sip::{SipCallParts, SipEvent, SipTransport};
-use crate::state::{CallRecord, CallState, CallStore};
+use crate::state::{CallQuality, CallRecord, CallState, CallStore};
+
+/// Quality-abort gate: should a call in progress be aborted for degraded
+/// audio? `abort_underruns == 0` disables the gate (never abort). Pure
+/// decision, extracted from the `qtick` arm of `run_call`'s select loop so
+/// it's unit-testable without a live call.
+fn should_abort(cfg: &QualityConfig, underruns: u64) -> bool {
+    cfg.abort_underruns > 0 && underruns >= cfg.abort_underruns as u64
+}
+
+/// Reconcile the select loop's `end_state` with the authoritative outcome
+/// from the Gemini session: a model-initiated end is a success even if its
+/// `EndCall` event lost the select race against e.g. `GeminiClosed` (which
+/// would otherwise read `Failed`).
+fn reconcile_final_state(end_state: CallState, ended_by: EndedBy) -> CallState {
+    match ended_by {
+        EndedBy::ModelEndCall => CallState::Completed,
+        _ => end_state,
+    }
+}
+
+/// Only attach the abort error if the reconciled outcome is still `Failed` —
+/// a late `ModelEndCall` can override `end_state` to `Completed` even after
+/// the quality-abort arm fired; don't leave a stale error on a completed call.
+fn finalize_error(final_state: CallState, abort_reason: Option<String>) -> Option<String> {
+    if final_state == CallState::Failed { abort_reason } else { None }
+}
 
 /// Errors from placing a call.
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +63,11 @@ struct Counters {
     completed: AtomicU64,
     failed: AtomicU64,
     cancelled: AtomicU64,
+    /// Cumulative audio-quality totals, added once per call at finalize (not
+    /// per tick) so a call's underruns/starved-ms are counted exactly once.
+    underruns: AtomicU64,
+    starved_ms: AtomicU64,
+    quality_aborted: AtomicU64,
 }
 
 /// A point-in-time view of engine load and lifetime totals, for the
@@ -50,6 +81,9 @@ pub struct MetricsSnapshot {
     pub failed_total: u64,
     pub cancelled_total: u64,
     pub channels_cap: usize,
+    pub underruns_total: u64,
+    pub starved_ms_total: u64,
+    pub quality_aborted_total: u64,
 }
 
 /// The call engine: owns the SIP transport, the call store, and config.
@@ -94,6 +128,9 @@ impl Engine {
             failed_total: self.counters.failed.load(Ordering::Relaxed),
             cancelled_total: self.counters.cancelled.load(Ordering::Relaxed),
             channels_cap: self.server.max_concurrent_channels,
+            underruns_total: self.counters.underruns.load(Ordering::Relaxed),
+            starved_ms_total: self.counters.starved_ms.load(Ordering::Relaxed),
+            quality_aborted_total: self.counters.quality_aborted.load(Ordering::Relaxed),
         }
     }
 
@@ -119,6 +156,7 @@ impl Engine {
             error: None,
             started_ms: now_ms(),
             ended_ms: None,
+            quality: CallQuality::default(),
         });
         self.counters.placed.fetch_add(1, Ordering::Relaxed);
 
@@ -261,6 +299,7 @@ async fn run_call(
     // 5. Split the session; 6. start the bridge.
     let (gemini_handle, gemini_in, gemini_events) = session.split();
     let (events_out_tx, mut events_out_rx) = mpsc::channel::<Event>(256);
+    let quality = bridge::QualityShared::new();
     let ports = BridgePorts {
         codec: codec.kind,
         phone_in: audio_in,
@@ -268,6 +307,9 @@ async fn run_call(
         gemini_in,
         gemini_events,
         events_out: events_out_tx,
+        prebuffer_ms: server.quality.prebuffer_ms,
+        resume_ms: server.quality.resume_ms,
+        quality: quality.clone(),
     };
     let mut bridge_task = tokio::spawn(bridge::run(ports));
 
@@ -275,8 +317,10 @@ async fn run_call(
     let mut goal = None;
     let mut first_transcript = false;
     let mut events_open = true;
+    let mut abort_reason: Option<String> = None;
     let deadline = tokio::time::sleep(Duration::from_secs(server.max_call_secs));
     tokio::pin!(deadline);
+    let mut qtick = tokio::time::interval(Duration::from_secs(1));
     let end_state = loop {
         tokio::select! {
             ev = events_out_rx.recv(), if events_open => match ev {
@@ -311,6 +355,22 @@ async fn run_call(
             },
             _ = &mut deadline => break CallState::Completed,
             _ = &mut cancel_rx => break CallState::Cancelled,
+            _ = qtick.tick() => {
+                let q = quality.snapshot();
+                store.set_quality(&call_id, q);
+                if should_abort(&server.quality, q.underruns) {
+                    // NOTE: don't bump `quality_aborted` here — the abort is not
+                    // authoritative yet. A model `EndCall` racing this tick can
+                    // reconcile `final_state` back to Completed (see finalize),
+                    // in which case this was not a quality abort. Count it at
+                    // finalize, gated on the surviving abort error.
+                    abort_reason = Some(format!(
+                        "aborted: audio quality degraded ({} underruns, {} ms silence)",
+                        q.underruns, q.starved_ms
+                    ));
+                    break CallState::Failed;
+                }
+            }
         }
     };
 
@@ -320,16 +380,28 @@ async fn run_call(
     bridge_task.abort();
     let outcome = gemini_handle.join().await;
 
-    // 9. Finalize. Reconcile the loop's end_state with the authoritative outcome:
-    // a model-initiated end is a success even if its `EndCall` event lost the
-    // select race against `GeminiClosed` (which would otherwise read `Failed`).
-    let final_state = match outcome.ended_by {
-        EndedBy::ModelEndCall => CallState::Completed,
-        _ => end_state,
-    };
+    // 9. Finalize. Reconcile the loop's end_state with the authoritative outcome
+    // (see `reconcile_final_state`).
+    let final_state = reconcile_final_state(end_state, outcome.ended_by);
+    // Final quality snapshot + cumulative totals, added exactly once here
+    // (not per tick, which only updates the live record + checks the abort
+    // threshold).
+    let q = quality.snapshot();
+    store.set_quality(&call_id, q);
+    counters.underruns.fetch_add(q.underruns, Ordering::Relaxed);
+    counters.starved_ms.fetch_add(q.starved_ms, Ordering::Relaxed);
+    tracing::info!(%call_id, underruns = q.underruns, starved_ms = q.starved_ms, max_gap_ms = q.max_gap_ms, "call audio quality");
+
     store.set_transcript(&call_id, outcome.transcript);
     let final_goal = goal.or(outcome.goal);
-    store.finalize(&call_id, final_state, final_goal, None, now_ms());
+    let error = finalize_error(final_state, abort_reason);
+    // Count the quality abort exactly once here, only if it survived reconcile
+    // (a racing model EndCall can flip Failed -> Completed and clear the error).
+    // `error` is Some iff this was an abort that stuck as Failed.
+    if error.is_some() {
+        counters.quality_aborted.fetch_add(1, Ordering::Relaxed);
+    }
+    store.finalize(&call_id, final_state, final_goal, error, now_ms());
     bump_counter(&counters, final_state);
 
     // 10. Persist. Owner-only permissions: the transcript may contain PII.
@@ -380,6 +452,7 @@ mod tests {
             greet_after_silence_ms: 4000,
             transcript_dir: None,
             max_call_secs: 600,
+            quality: crate::config::QualityConfig::default(),
         };
         let sip_cfg = SipConfig {
             server: "127.0.0.1:5060".into(),
@@ -444,6 +517,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_snapshot_has_quality_fields() {
+        let (server, sip_cfg) = test_configs(1);
+        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
+        let m = engine.metrics_snapshot();
+        assert_eq!(m.underruns_total, 0);
+        assert_eq!(m.starved_ms_total, 0);
+        assert_eq!(m.quality_aborted_total, 0);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn metrics_snapshot_counts_placed_and_queued() {
         let (server, sip_cfg) = test_configs(0); // cap 0 → calls park in Queued
         let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
@@ -456,5 +540,47 @@ mod tests {
         assert_eq!(m.active, 0);
         assert_eq!(m.channels_cap, 0);
         engine.shutdown().await;
+    }
+
+    #[test]
+    fn should_abort_disabled_never_aborts() {
+        let cfg = crate::config::QualityConfig { abort_underruns: 0, ..crate::config::QualityConfig::default() };
+        assert!(!should_abort(&cfg, 0));
+        assert!(!should_abort(&cfg, 1_000_000));
+    }
+
+    #[test]
+    fn should_abort_trips_at_threshold_not_before() {
+        let cfg = crate::config::QualityConfig { abort_underruns: 40, ..crate::config::QualityConfig::default() };
+        assert!(!should_abort(&cfg, 0));
+        assert!(!should_abort(&cfg, 39));
+        assert!(should_abort(&cfg, 40));
+        assert!(should_abort(&cfg, 41));
+    }
+
+    #[test]
+    fn reconcile_final_state_table() {
+        // A model-initiated end always wins as Completed, regardless of what
+        // the select loop landed on (it may have raced GeminiClosed -> Failed).
+        for end_state in [CallState::Failed, CallState::HungUp, CallState::Completed, CallState::Cancelled] {
+            assert_eq!(reconcile_final_state(end_state, EndedBy::ModelEndCall), CallState::Completed);
+        }
+        // Any other ended_by leaves end_state untouched.
+        for ended_by in [EndedBy::CallerHangup, EndedBy::RemoteClose, EndedBy::Error] {
+            for end_state in [CallState::Failed, CallState::HungUp, CallState::Completed, CallState::Cancelled] {
+                assert_eq!(reconcile_final_state(end_state, ended_by), end_state);
+            }
+        }
+    }
+
+    #[test]
+    fn finalize_error_only_attached_when_failed() {
+        assert_eq!(finalize_error(CallState::Failed, Some("boom".into())), Some("boom".into()));
+        assert_eq!(finalize_error(CallState::Failed, None), None);
+        // A reconciled Completed (e.g. late ModelEndCall overriding an aborted
+        // end_state) must not carry a stale abort error.
+        assert_eq!(finalize_error(CallState::Completed, Some("boom".into())), None);
+        assert_eq!(finalize_error(CallState::HungUp, Some("boom".into())), None);
+        assert_eq!(finalize_error(CallState::Cancelled, Some("boom".into())), None);
     }
 }

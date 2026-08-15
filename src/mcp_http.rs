@@ -59,6 +59,9 @@ pub fn render_prometheus(m: &MetricsSnapshot) -> String {
         m.cancelled_total.to_string(),
     );
     g(&mut s, "kutsu_channels_cap", "Max concurrent channels.", "gauge", m.channels_cap.to_string());
+    g(&mut s, "kutsu_audio_underruns_total", "Audio underruns since start.", "counter", m.underruns_total.to_string());
+    g(&mut s, "kutsu_audio_starved_ms_total", "Total milliseconds of audio starvation.", "counter", m.starved_ms_total.to_string());
+    g(&mut s, "kutsu_calls_quality_aborted_total", "Calls aborted due to quality issues.", "counter", m.quality_aborted_total.to_string());
     s
 }
 
@@ -204,6 +207,7 @@ mod tests {
             greet_after_silence_ms: 4000,
             transcript_dir: None,
             max_call_secs: 600,
+            quality: crate::config::QualityConfig::default(),
         };
         let sip = SipConfig {
             server: "127.0.0.1:5060".into(),
@@ -261,6 +265,9 @@ mod tests {
             failed_total: 5,
             cancelled_total: 6,
             channels_cap: 3,
+            underruns_total: 0,
+            starved_ms_total: 0,
+            quality_aborted_total: 0,
         };
         let s = render_prometheus(&m);
         for line in [
@@ -275,6 +282,19 @@ mod tests {
             assert!(s.contains(line), "missing: {line}");
         }
         assert!(s.contains("# TYPE kutsu_calls_placed_total counter"));
+    }
+
+    #[test]
+    fn prometheus_has_quality_series() {
+        let m = MetricsSnapshot {
+            active: 0, queued: 0, placed_total: 0, completed_total: 0, failed_total: 0,
+            cancelled_total: 0, channels_cap: 3,
+            underruns_total: 7, starved_ms_total: 140, quality_aborted_total: 2,
+        };
+        let s = render_prometheus(&m);
+        for line in ["kutsu_audio_underruns_total 7", "kutsu_audio_starved_ms_total 140", "kutsu_calls_quality_aborted_total 2"] {
+            assert!(s.contains(line), "missing: {line}");
+        }
     }
 
     #[test]

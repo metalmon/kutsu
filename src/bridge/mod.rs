@@ -10,11 +10,38 @@ mod g711;
 mod resample;
 mod pace;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
 use crate::gemini_live::Event;
 use crate::sip::G711Kind;
+
+/// Shared, lock-free call-quality counters published by the downlink loop and
+/// read by the engine (e.g. for periodic state snapshots) without blocking
+/// either side.
+#[derive(Default)]
+pub struct QualityShared {
+    underruns: AtomicU64,
+    starved_ms: AtomicU64,
+    max_gap_ms: AtomicU64,
+}
+
+impl QualityShared {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn snapshot(&self) -> crate::state::CallQuality {
+        crate::state::CallQuality {
+            underruns: self.underruns.load(Ordering::Relaxed),
+            starved_ms: self.starved_ms.load(Ordering::Relaxed),
+            max_gap_ms: self.max_gap_ms.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// Everything the bridge needs for one call. The engine builds this from a
 /// `SipCall` (phone side) and a gemini `Session` (gemini side).
@@ -30,6 +57,12 @@ pub struct BridgePorts {
     pub gemini_events: mpsc::Receiver<Event>,
     /// Non-audio events forwarded to the engine.
     pub events_out: mpsc::Sender<Event>,
+    /// Downlink prefill target before (re)starting playout, in ms.
+    pub prebuffer_ms: u32,
+    /// Downlink refill target after a mid-turn underrun, in ms.
+    pub resume_ms: u32,
+    /// Shared call-quality counters, published once per pacer tick.
+    pub quality: Arc<QualityShared>,
 }
 
 /// Why the bridge stopped.
@@ -51,6 +84,9 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
         gemini_in,
         mut gemini_events,
         events_out,
+        prebuffer_ms,
+        resume_ms,
+        quality,
     } = ports;
 
     // Uplink: transparent, continuous, never-manipulated forward (spec §2).
@@ -67,8 +103,13 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
     tokio::pin!(uplink);
 
     // Downlink: 24 kHz buffer + 20 ms pacer + barge-in, on this task.
-    let mut downlink = pace::Downlink::new();
+    let mut downlink = pace::Downlink::new(prebuffer_ms, resume_ms);
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
+
+    // Inter-chunk gap clock: wall-clock time between consecutive OutputAudio
+    // events within a turn, tracked for the `max_gap_ms` quality metric.
+    let mut last_audio: Option<tokio::time::Instant> = None;
+    let mut max_gap_ms = 0u64;
 
     // Every loop exit goes through `break` so a single `uplink.abort()` below
     // covers every path -- dropping a JoinHandle detaches it (leak) instead of
@@ -80,8 +121,30 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
                 break BridgeEnd::PhoneClosed;
             }
             ev = gemini_events.recv() => match ev {
-                Some(Event::OutputAudio(pcm24)) => downlink.push(&pcm24),
-                Some(Event::Interrupted) => downlink.clear(),
+                Some(Event::OutputAudio(pcm24)) => {
+                    downlink.set_expecting(true);
+                    let now = tokio::time::Instant::now();
+                    if let Some(prev) = last_audio {
+                        let gap = now.duration_since(prev).as_millis() as u64;
+                        if gap > max_gap_ms {
+                            max_gap_ms = gap;
+                        }
+                    }
+                    last_audio = Some(now);
+                    downlink.push(&pcm24);
+                }
+                Some(Event::Interrupted) => {
+                    downlink.set_expecting(false);
+                    last_audio = None;
+                    downlink.clear();
+                }
+                Some(Event::TurnComplete) => {
+                    downlink.set_expecting(false);
+                    last_audio = None;
+                    if events_out.send(Event::TurnComplete).await.is_err() {
+                        // Engine dropped its event receiver; keep bridging audio.
+                    }
+                }
                 Some(other) => {
                     if events_out.send(other).await.is_err() {
                         // Engine dropped its event receiver; keep bridging audio.
@@ -92,6 +155,9 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
             _ = ticker.tick() => {
                 let pcm8 = downlink.next_frame();
                 let payload = g711::encode(codec, &pcm8);
+                quality.underruns.store(downlink.underruns(), Ordering::Relaxed);
+                quality.starved_ms.store(downlink.starved_ms(), Ordering::Relaxed);
+                quality.max_gap_ms.store(max_gap_ms, Ordering::Relaxed);
                 if phone_out.send(Bytes::from(payload)).await.is_err() {
                     break BridgeEnd::PhoneClosed;
                 }
@@ -128,7 +194,17 @@ mod tests {
         let (gemini_events_tx, gemini_events) = mpsc::channel(64);
         let (events_out, events_out_rx) = mpsc::channel(64);
         (
-            BridgePorts { codec, phone_in, phone_out, gemini_in, gemini_events, events_out },
+            BridgePorts {
+                codec,
+                phone_in,
+                phone_out,
+                gemini_in,
+                gemini_events,
+                events_out,
+                prebuffer_ms: 140,
+                resume_ms: 60,
+                quality: QualityShared::new(),
+            },
             Ends { phone_in_tx, phone_out_rx, gemini_in_rx, gemini_events_tx, events_out_rx },
         )
     }
@@ -154,13 +230,29 @@ mod tests {
     async fn downlink_paces_frames_to_phone() {
         let (ports, mut ends) = wire(G711Kind::Ulaw);
         let h = tokio::spawn(run(ports));
-        // Push 60 ms of loud audio.
-        ends.gemini_events_tx.send(Event::OutputAudio(vec![8000i16; 480 * 3])).await.unwrap();
-        // Advance three 20 ms ticks; expect three 160-byte frames.
+
+        // `tokio::time::interval`'s very first `tick()` resolves immediately
+        // (no time needs to pass). Force + discard that free tick now, on an
+        // empty buffer (deterministically silence), before pushing anything,
+        // so every tick from here on sits on the regular 20 ms cadence --
+        // same reasoning as `barge_in_silences_the_phone`.
+        tokio::task::yield_now().await;
+        let _ = ends.phone_out_rx.recv().await.unwrap();
+
+        // Push 200 ms of loud audio -- above wire()'s 140 ms prefill target,
+        // so playout actually starts instead of holding for prefill.
+        ends.gemini_events_tx.send(Event::OutputAudio(vec![8000i16; 480 * 10])).await.unwrap();
+        tokio::task::yield_now().await;
+
+        // Advance three 20 ms ticks; expect three 160-byte frames carrying
+        // real (non-silent) audio -- proves playout is actually pacing
+        // buffered audio to the phone, not just holding silence for prefill.
         for _ in 0..3 {
             tokio::time::advance(std::time::Duration::from_millis(20)).await;
             let frame = ends.phone_out_rx.recv().await.unwrap();
             assert_eq!(frame.len(), 160);
+            let pcm = g711::decode(G711Kind::Ulaw, &frame);
+            assert!(pcm.iter().any(|&s| s.abs() > 1000), "expected paced audio, not silence");
         }
         drop(ends);
         let _ = h.await;
@@ -229,6 +321,27 @@ mod tests {
         ends.gemini_events_tx.send(Event::TurnComplete).await.unwrap();
         let got = ends.events_out_rx.recv().await.unwrap();
         assert!(matches!(got, Event::TurnComplete));
+        drop(ends);
+        let _ = h.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quality_shared_records_underruns_while_expecting() {
+        let q = super::QualityShared::new();
+        let (mut ports, mut ends) = wire(G711Kind::Ulaw);
+        ports.prebuffer_ms = 0; // disable prefill so the test drains deterministically
+        ports.resume_ms = 0;
+        ports.quality = q.clone();
+        let h = tokio::spawn(run(ports));
+        // Model turn starts, one 20 ms chunk, then goes quiet mid-turn (no TurnComplete).
+        ends.gemini_events_tx.send(Event::OutputAudio(vec![8000i16; 480])).await.unwrap();
+        tokio::task::yield_now().await;
+        // Drain several ticks: after the one buffered frame, empty-while-expecting = underruns.
+        for _ in 0..4 {
+            tokio::time::advance(std::time::Duration::from_millis(20)).await;
+            let _ = ends.phone_out_rx.recv().await;
+        }
+        assert!(q.snapshot().underruns >= 1, "expected underruns recorded while expecting");
         drop(ends);
         let _ = h.await;
     }

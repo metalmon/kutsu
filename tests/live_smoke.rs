@@ -25,9 +25,13 @@ async fn short_live_session_returns_audio_and_ends() {
     };
     let server = kutsu::config::ServerConfig {
         api_key, proxy, model: kutsu::config::Model::HalfCascade,
-        voice: "Autonoe".into(), language: "ru-RU".into(),
+        voice: "Autonoe".into(), voice_gender: kutsu::config::Gender::Female,
+        language: "ru-RU".into(),
         net_check, max_concurrent_channels: 3,
         greet_after_silence_ms: kutsu::config::DEFAULT_GREET_AFTER_SILENCE_MS,
+        transcript_dir: None,
+        max_call_secs: 600,
+        quality: kutsu::config::QualityConfig::default(),
     };
     let scenario = kutsu::config::ScenarioConfig {
         system_prompt: "You are a friendly assistant. Greet briefly, then call end_call.".into(),
