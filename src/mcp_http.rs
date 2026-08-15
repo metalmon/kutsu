@@ -59,6 +59,9 @@ pub fn render_prometheus(m: &MetricsSnapshot) -> String {
         m.cancelled_total.to_string(),
     );
     g(&mut s, "kutsu_channels_cap", "Max concurrent channels.", "gauge", m.channels_cap.to_string());
+    g(&mut s, "kutsu_audio_underruns_total", "Audio underruns since start.", "counter", m.underruns_total.to_string());
+    g(&mut s, "kutsu_audio_starved_ms_total", "Total milliseconds of audio starvation.", "counter", m.starved_ms_total.to_string());
+    g(&mut s, "kutsu_calls_quality_aborted_total", "Calls aborted due to quality issues.", "counter", m.quality_aborted_total.to_string());
     s
 }
 
@@ -279,6 +282,19 @@ mod tests {
             assert!(s.contains(line), "missing: {line}");
         }
         assert!(s.contains("# TYPE kutsu_calls_placed_total counter"));
+    }
+
+    #[test]
+    fn prometheus_has_quality_series() {
+        let m = MetricsSnapshot {
+            active: 0, queued: 0, placed_total: 0, completed_total: 0, failed_total: 0,
+            cancelled_total: 0, channels_cap: 3,
+            underruns_total: 7, starved_ms_total: 140, quality_aborted_total: 2,
+        };
+        let s = render_prometheus(&m);
+        for line in ["kutsu_audio_underruns_total 7", "kutsu_audio_starved_ms_total 140", "kutsu_calls_quality_aborted_total 2"] {
+            assert!(s.contains(line), "missing: {line}");
+        }
     }
 
     #[test]
