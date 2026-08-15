@@ -39,6 +39,7 @@ impl QualityShared {
             underruns: self.underruns.load(Ordering::Relaxed),
             starved_ms: self.starved_ms.load(Ordering::Relaxed),
             max_gap_ms: self.max_gap_ms.load(Ordering::Relaxed),
+            ..Default::default()
         }
     }
 }
