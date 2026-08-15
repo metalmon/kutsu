@@ -10,6 +10,9 @@
 //! before building anything on top of this.
 
 mod call;
+mod uplink;
+
+pub use uplink::{UplinkQuality, UplinkStats};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{
