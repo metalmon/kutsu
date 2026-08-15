@@ -328,6 +328,8 @@ async fn run_call(
         prebuffer_ms: server.quality.prebuffer_ms,
         resume_ms: server.quality.resume_ms,
         quality: quality.clone(),
+        call_id: call_id.clone(),
+        uplink_dump: server.dump_uplink_dir.clone(),
     };
     let mut bridge_task = tokio::spawn(bridge::run(ports));
 
