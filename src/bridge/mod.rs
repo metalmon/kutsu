@@ -230,13 +230,29 @@ mod tests {
     async fn downlink_paces_frames_to_phone() {
         let (ports, mut ends) = wire(G711Kind::Ulaw);
         let h = tokio::spawn(run(ports));
-        // Push 60 ms of loud audio.
-        ends.gemini_events_tx.send(Event::OutputAudio(vec![8000i16; 480 * 3])).await.unwrap();
-        // Advance three 20 ms ticks; expect three 160-byte frames.
+
+        // `tokio::time::interval`'s very first `tick()` resolves immediately
+        // (no time needs to pass). Force + discard that free tick now, on an
+        // empty buffer (deterministically silence), before pushing anything,
+        // so every tick from here on sits on the regular 20 ms cadence --
+        // same reasoning as `barge_in_silences_the_phone`.
+        tokio::task::yield_now().await;
+        let _ = ends.phone_out_rx.recv().await.unwrap();
+
+        // Push 200 ms of loud audio -- above wire()'s 140 ms prefill target,
+        // so playout actually starts instead of holding for prefill.
+        ends.gemini_events_tx.send(Event::OutputAudio(vec![8000i16; 480 * 10])).await.unwrap();
+        tokio::task::yield_now().await;
+
+        // Advance three 20 ms ticks; expect three 160-byte frames carrying
+        // real (non-silent) audio -- proves playout is actually pacing
+        // buffered audio to the phone, not just holding silence for prefill.
         for _ in 0..3 {
             tokio::time::advance(std::time::Duration::from_millis(20)).await;
             let frame = ends.phone_out_rx.recv().await.unwrap();
             assert_eq!(frame.len(), 160);
+            let pcm = g711::decode(G711Kind::Ulaw, &frame);
+            assert!(pcm.iter().any(|&s| s.abs() > 1000), "expected paced audio, not silence");
         }
         drop(ends);
         let _ = h.await;
