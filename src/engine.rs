@@ -269,6 +269,10 @@ async fn run_call(
         gemini_in,
         gemini_events,
         events_out: events_out_tx,
+        // TODO(task 5): source from config; publish `quality` into call state.
+        prebuffer_ms: 140,
+        resume_ms: 60,
+        quality: bridge::QualityShared::new(),
     };
     let mut bridge_task = tokio::spawn(bridge::run(ports));
 
