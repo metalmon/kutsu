@@ -56,6 +56,12 @@ struct PlaceCallArgs {
     /// Optional lead/context object merged into the prompt.
     #[serde(default)]
     context: Option<serde_json::Value>,
+    /// Optional UTC epoch ms to place the call at. Past/absent = immediate.
+    #[serde(default)]
+    schedule_at: Option<u64>,
+    /// Optional prior call_id this is a manual retry of.
+    #[serde(default)]
+    retry_of: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -147,12 +153,22 @@ impl KutsuServer {
             goal_schema: a.goal_schema,
             context: a.context,
         };
-        let call_id = self.engine.place_call(a.to_number, scenario).await;
+        // A `schedule_at` in the past (or absent) means "now" — never an
+        // error, just immediate eligibility.
+        let now = crate::engine::now_ms();
+        let eligible = a.schedule_at.filter(|t| *t > now).unwrap_or(now);
+        let scheduled = eligible > now;
+        let call_id =
+            self.engine.place_call_at(a.to_number, scenario, eligible, 1, a.retry_of).await;
 
-        // Plain clients: unchanged immediate `{call_id}` result (Task 6/7).
-        if !client_supports_tasks {
+        // Plain clients, and any scheduled call (even for task-capable
+        // clients): immediate `{call_id, server_time_unix}` result. A
+        // scheduled call must never enter the task/poll flavor below — that
+        // task would sit idle (no dispatch, no status changes) until
+        // `eligible_at_ms`, which defeats the point of an MCP task.
+        if scheduled || !client_supports_tasks {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
-                serde_json::json!({ "call_id": call_id }).to_string(),
+                serde_json::json!({ "call_id": call_id, "server_time_unix": now }).to_string(),
             )])
             .into());
         }
@@ -200,11 +216,17 @@ impl KutsuServer {
                 use crate::state::CallState;
                 match terminal {
                     CallState::Completed | CallState::HungUp => {
+                        let server_time_unix = crate::engine::now_ms();
                         let body = engine
                             .store()
                             .get(&cid)
-                            .map(|r| serde_json::json!({ "transcript": r.transcript, "goal": r.goal }))
-                            .unwrap_or_else(|| serde_json::json!({}));
+                            .map(|r| {
+                                serde_json::json!({
+                                    "transcript": r.transcript, "goal": r.goal,
+                                    "server_time_unix": server_time_unix,
+                                })
+                            })
+                            .unwrap_or_else(|| serde_json::json!({ "server_time_unix": server_time_unix }));
                         Ok(CallToolResult::success(vec![ContentBlock::text(body.to_string())]))
                     }
                     CallState::Failed => {
@@ -238,6 +260,7 @@ impl KutsuServer {
             "call_id": rec.call_id, "state": rec.state, "number": rec.number,
             "started_ms": rec.started_ms, "ended_ms": rec.ended_ms,
             "error": rec.error, "queued_position": pos, "quality": rec.quality,
+            "server_time_unix": crate::engine::now_ms(),
         });
         Ok(CallToolResult::success(vec![ContentBlock::text(body.to_string())]))
     }
@@ -375,6 +398,8 @@ mod tests {
             system_prompt: "hi".into(),
             goal_schema: serde_json::json!({ "type": "object" }),
             context: None,
+            schedule_at: None,
+            retry_of: None,
         }
     }
 
@@ -501,6 +526,29 @@ mod tests {
         assert_eq!(task.ttl_ms, Some(600 * 1000 + 30_000));
 
         // Abort the background watcher task so it stops touching the engine.
+        srv.tasks.shutdown();
+    }
+
+    /// A scheduled call (`schedule_at` in the future) must take the immediate
+    /// `{call_id, server_time_unix}` branch even for a task-capable client —
+    /// scheduled calls never enter the task/poll flavor, because the task
+    /// would sit idle (no dispatch) until `eligible_at_ms`, defeating the
+    /// point of the immediate-return + client-side polling model.
+    #[tokio::test]
+    async fn scheduled_call_takes_immediate_branch() {
+        // cap-0 parks the call in Queued so no real INVITE is attempted.
+        let engine = Arc::new(test_engine(0).await);
+        let srv = KutsuServer::new(engine);
+
+        let mut a = args("600");
+        a.schedule_at = Some(crate::engine::now_ms() + 60_000);
+        let resp = srv.place_call_inner(a, true).await.unwrap();
+        let out = complete(resp);
+        let text = first_text(&out);
+        let json = serde_json::from_str::<serde_json::Value>(&text).unwrap();
+        assert!(json.get("call_id").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()));
+        assert!(json.get("server_time_unix").and_then(|v| v.as_u64()).is_some());
+
         srv.tasks.shutdown();
     }
 }
