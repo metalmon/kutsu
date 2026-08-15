@@ -89,7 +89,21 @@ pub fn build_setup(server: &ServerConfig, scenario: &ScenarioConfig, resume_hand
     json!({ "setup": setup })
 }
 
-/// Assemble the system instruction from prompt + optional context.
+/// Standard call-closing directive appended to every system prompt so the model
+/// closes deterministically via the tool. Without it the model tends to speak a
+/// goodbye WITHOUT calling `end_call`; the session stays open and it emits a
+/// second closing turn (the double-goodbye). Ported from the proven voice-cloud
+/// client's END_INSTRUCTION_TOOL. English by repo convention — the goodbye
+/// itself is spoken in the scenario's language.
+const CLOSING_INSTRUCTION: &str = "\n\n# Ending the call\n\
+    When the conversation is finished — you have said your goodbyes, agreed on a \
+    next step, or the other party firmly refuses or is rude — say ONE short, \
+    natural goodbye and, in the SAME turn, call the `end_call` tool. Say the \
+    goodbye only once: the line is played in full and then the call is hung up, \
+    so never add a second goodbye and do not keep talking after it.";
+
+/// Assemble the system instruction from prompt + optional context + the standard
+/// closing directive.
 /// (Current-time block is appended by the session at connect time — see Task 8.)
 fn build_system_prompt(scenario: &ScenarioConfig) -> String {
     let mut s = scenario.system_prompt.clone();
@@ -97,6 +111,7 @@ fn build_system_prompt(scenario: &ScenarioConfig) -> String {
         s.push_str("\n\n# Contact context\n");
         s.push_str(&ctx.to_string());
     }
+    s.push_str(CLOSING_INSTRUCTION);
     s
 }
 
@@ -207,6 +222,15 @@ mod tests {
         assert!(endpoint_url(&server(Model::HalfCascade)).contains(".v1beta."));
         assert!(endpoint_url(&server(Model::NativeAudio)).contains(".v1alpha."));
         assert!(endpoint_url(&server(Model::HalfCascade)).contains("key=KEY"));
+    }
+
+    #[test]
+    fn system_prompt_appends_closing_instruction() {
+        let p = build_system_prompt(&scenario());
+        assert!(p.starts_with("Be nice."));
+        assert!(p.contains("end_call"), "closing must reference the tool");
+        assert!(p.contains("SAME turn"), "closing must couple the goodbye to the tool");
+        assert!(p.to_lowercase().contains("goodbye"));
     }
 
     #[test]
