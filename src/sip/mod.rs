@@ -12,7 +12,7 @@
 mod call;
 mod uplink;
 
-pub use uplink::{UplinkQuality, UplinkStats};
+pub use uplink::{UplinkQuality, UplinkQualityShared, UplinkStats};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{

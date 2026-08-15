@@ -2,6 +2,9 @@
 //! 16-bit sequence space. Pure, single-writer; the SIP receive loop feeds it
 //! each arriving sequence number.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 /// A point-in-time uplink quality snapshot (phone -> us).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UplinkQuality {
@@ -67,6 +70,35 @@ impl UplinkStats {
     }
 }
 
+/// Lock-free uplink counters published by the SIP receive loop and read by
+/// the engine, mirroring `bridge::QualityShared`. Single writer, single reader.
+#[derive(Default)]
+pub struct UplinkQualityShared {
+    received: AtomicU64,
+    lost: AtomicU64,
+    reordered: AtomicU64,
+}
+
+impl UplinkQualityShared {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn publish(&self, q: &UplinkQuality) {
+        self.received.store(q.received, Ordering::Relaxed);
+        self.lost.store(q.lost, Ordering::Relaxed);
+        self.reordered.store(q.reordered, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> UplinkQuality {
+        UplinkQuality {
+            received: self.received.load(Ordering::Relaxed),
+            lost: self.lost.load(Ordering::Relaxed),
+            reordered: self.reordered.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +153,14 @@ mod tests {
     fn wraparound_has_no_loss() {
         let q = run(&[65534, 65535, 0, 1]);
         assert_eq!(q, UplinkQuality { received: 4, lost: 0, reordered: 0 });
+    }
+
+    #[test]
+    fn shared_roundtrips_published_snapshot() {
+        let shared = UplinkQualityShared::new();
+        assert_eq!(shared.snapshot(), UplinkQuality::default());
+        let q = UplinkQuality { received: 50, lost: 3, reordered: 2 };
+        shared.publish(&q);
+        assert_eq!(shared.snapshot(), q);
     }
 }
