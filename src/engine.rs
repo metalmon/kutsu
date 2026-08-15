@@ -5,11 +5,12 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::bridge::{self, BridgePorts};
 use crate::config::{QualityConfig, ScenarioConfig, ServerConfig, SipConfig};
 use crate::gemini_live::{self, EndedBy, Event, TranscriptEntry};
+use crate::queue::{MemQueue, PendingEntry, QueueStore};
 use crate::sip::{CallOutcome, SipCallParts, SipEvent, SipTransport};
 use crate::state::{CallQuality, CallRecord, CallState, CallStore};
 
@@ -129,30 +130,59 @@ pub struct MetricsSnapshot {
     pub unavailable_total: u64,
 }
 
-/// The call engine: owns the SIP transport, the call store, and config.
+/// The call engine: owns the SIP transport, the call store, config, and the
+/// pending-call queue driven by a central dispatcher task (replaces the old
+/// spawn-and-park-on-a-semaphore model).
 pub struct Engine {
     sip: SipTransport,
     store: CallStore,
     server: Arc<ServerConfig>,
-    permits: Arc<tokio::sync::Semaphore>,
+    /// Pending (not-yet-dispatched) calls, ordered by (eligible_at_ms, call_id).
+    queue: Arc<Mutex<Box<dyn QueueStore>>>,
+    /// Count of dispatched-but-not-yet-finalized calls; the concurrency gate
+    /// (`running < max_concurrent_channels`) that the semaphore used to enforce.
+    running: Arc<AtomicUsize>,
+    /// Woken on every enqueue and on every freed slot so the dispatcher never
+    /// busy-spins.
+    wake: Arc<Notify>,
     cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     seq: AtomicUsize,
     counters: Arc<Counters>,
+    /// The central dispatcher task; aborted on `shutdown`.
+    dispatcher: tokio::task::JoinHandle<()>,
 }
 
 impl Engine {
-    /// Build the engine (binds the SIP transport).
+    /// Build the engine (binds the SIP transport) and spawn the dispatcher.
     pub async fn new(server: Arc<ServerConfig>, sip_cfg: &SipConfig) -> Result<Self, EngineError> {
         let sip = SipTransport::new(sip_cfg).await?;
-        let permits = Arc::new(tokio::sync::Semaphore::new(server.max_concurrent_channels));
+        let store = CallStore::new();
+        let queue: Arc<Mutex<Box<dyn QueueStore>>> = Arc::new(Mutex::new(Box::new(MemQueue::new())));
+        let running = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::new(Notify::new());
+        let cancels = Arc::new(Mutex::new(HashMap::new()));
+        let counters = Arc::new(Counters::default());
+        let dispatcher = tokio::spawn(dispatcher(
+            sip.clone(),
+            store.clone(),
+            server.clone(),
+            queue.clone(),
+            running.clone(),
+            wake.clone(),
+            cancels.clone(),
+            counters.clone(),
+        ));
         Ok(Self {
             sip,
-            store: CallStore::new(),
+            store,
             server,
-            permits,
-            cancels: Arc::new(Mutex::new(HashMap::new())),
+            queue,
+            running,
+            wake,
+            cancels,
             seq: AtomicUsize::new(0),
-            counters: Arc::new(Counters::default()),
+            counters,
+            dispatcher,
         })
     }
 
@@ -160,12 +190,12 @@ impl Engine {
         &self.store
     }
 
-    /// Live load (from the `CallStore`) plus lifetime cumulative totals.
+    /// Live load (dispatched count + pending-queue depth) plus lifetime
+    /// cumulative totals.
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
-        let counts = self.store.counts();
         MetricsSnapshot {
-            active: counts.active,
-            queued: counts.queued,
+            active: self.running.load(Ordering::Relaxed),
+            queued: self.queue.lock().unwrap().len(),
             placed_total: self.counters.placed.load(Ordering::Relaxed),
             completed_total: self.counters.completed.load(Ordering::Relaxed),
             failed_total: self.counters.failed.load(Ordering::Relaxed),
@@ -191,10 +221,27 @@ impl Engine {
         self.server.max_call_secs
     }
 
-    /// Place an outbound call: records it as `Queued` and spawns the call
-    /// task, which waits for a concurrency permit before dialing. Always
-    /// succeeds; SIP/other failures surface later via `CallState::Failed`.
+    /// Place an outbound call now: enqueues it as `Queued` (attempt 1, no
+    /// `retry_of`) and wakes the dispatcher. Always succeeds; SIP/other
+    /// failures surface later via `CallState::Failed`.
     pub async fn place_call(&self, number: String, scenario: ScenarioConfig) -> String {
+        self.place_call_at(number, scenario, now_ms(), 1, None).await
+    }
+
+    /// Enqueue an outbound call eligible for dispatch at `eligible_at_ms`
+    /// (immediate callers pass `now_ms()`; scheduled/retry callers pass a
+    /// future time). `attempt` is 1 for a first dial; Task 8's busy-retry
+    /// passes the incremented attempt with the prior call's id as `retry_of`.
+    /// Records the call `Queued`, pushes a `PendingEntry`, and notifies the
+    /// dispatcher. Returns the new call_id.
+    pub async fn place_call_at(
+        &self,
+        number: String,
+        scenario: ScenarioConfig,
+        eligible_at_ms: u64,
+        attempt: u32,
+        retry_of: Option<String>,
+    ) -> String {
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
         let call_id = format!("call-{n}");
         self.store.insert(CallRecord {
@@ -208,46 +255,146 @@ impl Engine {
             ended_ms: None,
             quality: CallQuality::default(),
             outcome: None,
-            attempt: 1,
-            retry_of: None,
+            attempt,
+            retry_of: retry_of.clone(),
         });
         self.counters.placed.fetch_add(1, Ordering::Relaxed);
-
-        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-        self.cancels.lock().unwrap().insert(call_id.clone(), cancel_tx);
-
-        let sip = self.sip.clone();
-        let store = self.store.clone();
-        let server = self.server.clone();
-        let permits = self.permits.clone();
-        let cancels = self.cancels.clone();
-        let counters = self.counters.clone();
-        let id = call_id.clone();
-        tokio::spawn(async move {
-            run_call(sip, store, server, permits, cancels, counters, cancel_rx, scenario, number, id).await;
+        self.queue.lock().unwrap().push(PendingEntry {
+            call_id: call_id.clone(),
+            number,
+            scenario,
+            eligible_at_ms,
+            attempt,
+            retry_of,
         });
-
+        // Wake the dispatcher so an immediate call dispatches without waiting
+        // for its eligibility timer, and a scheduled call re-arms the timer.
+        self.wake.notify_one();
         call_id
     }
 
-    /// Signal a running/queued call to end. Returns true if a live signal was sent.
+    /// 1-based position of a pending call in real dispatch order
+    /// (`queue.position`). `None` once it has been dispatched or was never
+    /// queued. Reflects `eligible_at_ms` ordering, so a future-scheduled call
+    /// ranks behind sooner-eligible ones.
+    pub fn queued_position(&self, call_id: &str) -> Option<usize> {
+        self.queue.lock().unwrap().position(call_id)
+    }
+
+    /// Cancel a call. A still-`Queued` call is removed from the queue and
+    /// finalized `Cancelled` immediately (it was never dispatched); a
+    /// dispatched call is signalled through its cancel channel as before.
+    /// Returns true if a queued call was cancelled or a live signal was sent.
+    ///
+    /// The queue lock is held across the `cancels` lookup so a call racing
+    /// from queued to dispatched is caught in exactly one path: the dispatcher
+    /// pops it and registers its cancel channel under the same queue lock.
+    /// Lock order is always queue → cancels (never reversed), so no deadlock.
     pub fn end_call(&self, call_id: &str) -> bool {
-        if let Some(tx) = self.cancels.lock().unwrap().remove(call_id) {
-            tx.send(()).is_ok()
-        } else {
-            false
+        let mut q = self.queue.lock().unwrap();
+        if q.remove(call_id).is_some() {
+            drop(q);
+            self.store.finalize(call_id, CallState::Cancelled, None, None, None, now_ms());
+            bump_counter(&self.counters, CallState::Cancelled);
+            return true;
+        }
+        let tx = self.cancels.lock().unwrap().remove(call_id);
+        drop(q);
+        match tx {
+            Some(tx) => tx.send(()).is_ok(),
+            None => false,
         }
     }
 
     pub async fn shutdown(self) {
+        self.dispatcher.abort();
         self.sip.shutdown().await;
+    }
+}
+
+/// Central dispatcher: the single task that turns eligible pending entries
+/// into running calls, enforcing the `max_concurrent_channels` cap via the
+/// `running` counter. Spawned once in `Engine::new`; holds `Arc` clones of the
+/// engine's shared state. Never busy-spins: when nothing is dispatchable it
+/// parks on `wake` (enqueue / freed slot) or a timer to the next eligibility.
+#[allow(clippy::too_many_arguments)]
+async fn dispatcher(
+    sip: SipTransport,
+    store: CallStore,
+    server: Arc<ServerConfig>,
+    queue: Arc<Mutex<Box<dyn QueueStore>>>,
+    running: Arc<AtomicUsize>,
+    wake: Arc<Notify>,
+    cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    counters: Arc<Counters>,
+) {
+    let cap = server.max_concurrent_channels;
+    loop {
+        // Drain every currently-eligible entry until the cap is hit or nothing
+        // is eligible. Each iteration takes the queue lock only briefly.
+        loop {
+            let mut q = queue.lock().unwrap();
+            if running.load(Ordering::Relaxed) >= cap {
+                break;
+            }
+            let entry = match q.pop_eligible(now_ms()) {
+                Some(e) => e,
+                None => break,
+            };
+            // Register the cancel channel and claim the slot while still
+            // holding the queue lock, so `end_call` observes this call in
+            // exactly one place (queue OR cancels), never neither.
+            let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+            cancels.lock().unwrap().insert(entry.call_id.clone(), cancel_tx);
+            running.fetch_add(1, Ordering::Relaxed);
+            drop(q);
+
+            store.set_state(&entry.call_id, CallState::Ringing);
+
+            let sip = sip.clone();
+            let store = store.clone();
+            let server = server.clone();
+            let cancels = cancels.clone();
+            let counters = counters.clone();
+            let running = running.clone();
+            let wake = wake.clone();
+            let PendingEntry { call_id, number, scenario, attempt, retry_of, .. } = entry;
+            tokio::spawn(async move {
+                run_call(
+                    sip, store, server, cancels, counters, cancel_rx, scenario, number, call_id,
+                    attempt, retry_of,
+                )
+                .await;
+                // Free the slot and wake the dispatcher to backfill it.
+                running.fetch_sub(1, Ordering::Relaxed);
+                wake.notify_one();
+            });
+        }
+
+        // Nothing more to dispatch right now. Park until woken (a new enqueue
+        // or a freed slot) or — if we have spare capacity and a future-eligible
+        // entry exists — until that entry becomes eligible.
+        let sleep_until = if running.load(Ordering::Relaxed) < cap {
+            queue.lock().unwrap().peek_next_eligible_at()
+        } else {
+            None
+        };
+        match sleep_until {
+            Some(t) => {
+                let dur = Duration::from_millis(t.saturating_sub(now_ms()));
+                tokio::select! {
+                    _ = wake.notified() => {}
+                    _ = tokio::time::sleep(dur) => {}
+                }
+            }
+            None => wake.notified().await,
+        }
     }
 }
 
 /// Removes a call's `cancels` map entry when dropped, on every exit path —
 /// early returns, the normal end-of-function fallthrough, and panic unwind
-/// alike. Mirrors the owned-permit drop-safety pattern used for `_permit`
-/// above. `end_call` may have already removed the entry (to send on it); a
+/// alike. `end_call` may have already removed the entry (to send on it); a
 /// second `remove` on an absent key is a harmless no-op.
 struct CancelGuard {
     cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
@@ -293,33 +440,28 @@ fn bump_counter_outcome(counters: &Counters, outcome: CallOutcome) {
 }
 
 /// Drive one call to completion. Safe ordering: SIP first, answer, THEN Gemini.
+///
+/// The concurrency slot is now claimed by the dispatcher (which set this call
+/// `Ringing` and incremented `running` before spawning us), so there is no
+/// permit to acquire and no cancel-before-permit race — a still-`Queued` call
+/// is cancelled by `end_call` removing it from the queue before it ever
+/// reaches here. `attempt`/`retry_of` are carried for Task 8's busy-retry.
+#[allow(clippy::too_many_arguments)]
 async fn run_call(
     sip: SipTransport,
     store: CallStore,
     server: Arc<ServerConfig>,
-    permits: Arc<tokio::sync::Semaphore>,
     cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     counters: Arc<Counters>,
     mut cancel_rx: oneshot::Receiver<()>,
     scenario: ScenarioConfig,
     number: String,
     call_id: String,
+    attempt: u32,
+    retry_of: Option<String>,
 ) {
     let _cancel_guard = CancelGuard { cancels: cancels.clone(), call_id: call_id.clone() };
-
-    // Wait for a concurrency slot. Held (as an owned permit) for the whole
-    // call; released on drop, including on panic unwind — replaces SlotGuard.
-    // Raced against the cancel signal so a call parked in Queued (no permit
-    // available yet) can still be cancelled instead of blocking forever.
-    let _permit = tokio::select! {
-        p = permits.acquire_owned() => p.expect("semaphore not closed"),
-        _ = &mut cancel_rx => {
-            store.finalize(&call_id, CallState::Cancelled, None, None, None, now_ms());
-            bump_counter(&counters, CallState::Cancelled);
-            return;
-        }
-    };
-    store.set_state(&call_id, CallState::Ringing);
+    tracing::info!(%call_id, attempt, retry_of = ?retry_of, "dispatching call");
     // 1. INVITE.
     let call = match sip.place_call(&number).await {
         Ok(c) => c,
@@ -569,6 +711,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduler_respects_cap_and_eligibility() {
+        // Part A — cap: with cap = 1, two immediate enqueues must leave exactly
+        // one Queued at a time. The dispatched call hangs in the INVITE to a
+        // dead loopback trunk (no SIP stand), so it sits in Ringing while the
+        // second waits behind the cap.
+        let (server, sip_cfg) = test_configs(1);
+        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
+        let a = engine.place_call("600".into(), test_scenario()).await;
+        let b = engine.place_call("601".into(), test_scenario()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let sa = engine.store().get(&a).unwrap().state;
+        let sb = engine.store().get(&b).unwrap().state;
+        let queued = [sa, sb].iter().filter(|s| **s == CallState::Queued).count();
+        let ringing = [sa, sb].iter().filter(|s| **s == CallState::Ringing).count();
+        assert_eq!(queued, 1, "cap=1 must keep exactly one call Queued (states: {sa:?}, {sb:?})");
+        assert_eq!(ringing, 1, "cap=1 must dispatch exactly one call (states: {sa:?}, {sb:?})");
+        let m = engine.metrics_snapshot();
+        assert_eq!(m.active, 1, "running == 1 under cap 1");
+        assert_eq!(m.queued, 1, "one entry still pending in the queue");
+        engine.shutdown().await;
+
+        // Part B — eligibility: a future-eligible enqueue stays Queued until its
+        // time, even with free capacity. Uses real (wall-clock) durations, not
+        // tokio::time::pause(): eligibility is driven by `now_ms()` (SystemTime,
+        // per Task 6's queue), which pause() does not advance — pausing would
+        // decouple the dispatcher's timer from `now_ms()` and never fire.
+        let (server2, sip_cfg2) = test_configs(3);
+        let engine2 = Engine::new(std::sync::Arc::new(server2), &sip_cfg2).await.unwrap();
+        let future_ms = now_ms() + 200;
+        let c = engine2
+            .place_call_at("602".into(), test_scenario(), future_ms, 1, None)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert_eq!(
+            engine2.store().get(&c).unwrap().state,
+            CallState::Queued,
+            "not-yet-eligible call must stay Queued despite free capacity"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_ne!(
+            engine2.store().get(&c).unwrap().state,
+            CallState::Queued,
+            "call must be dispatched once its eligibility time passes"
+        );
+        engine2.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn place_call_queues_when_at_cap() {
         // cap = 0: every call must sit in Queued forever (no permit available).
         let (server, sip_cfg) = test_configs(0);
@@ -578,7 +768,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let rec = engine.store().get(&id).unwrap();
         assert_eq!(rec.state, CallState::Queued);
-        assert_eq!(engine.store().queued_position(&id), Some(1));
+        assert_eq!(engine.queued_position(&id), Some(1));
         engine.shutdown().await;
     }
 

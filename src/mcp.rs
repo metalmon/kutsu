@@ -178,7 +178,7 @@ impl KutsuServer {
                     // Publish the current human-readable status before waiting.
                     if let Some(rec) = engine.store().get(&cid) {
                         let label = call_status_label(rec.state);
-                        let msg = match engine.store().queued_position(&cid) {
+                        let msg = match engine.queued_position(&cid) {
                             Some(pos) => format!("call {cid}: {label} (queue position {pos})"),
                             None => format!("call {cid}: {label}"),
                         };
@@ -233,7 +233,7 @@ impl KutsuServer {
         Parameters(a): Parameters<CallIdArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let rec = self.engine.store().get(&a.call_id).ok_or_else(|| unknown_call(&a.call_id))?;
-        let pos = self.engine.store().queued_position(&a.call_id);
+        let pos = self.engine.queued_position(&a.call_id);
         let body = serde_json::json!({
             "call_id": rec.call_id, "state": rec.state, "number": rec.number,
             "started_ms": rec.started_ms, "ended_ms": rec.ended_ms,
