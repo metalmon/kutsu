@@ -336,6 +336,7 @@ mod tests {
             greet_after_silence_ms: 4000,
             transcript_dir: None,
             max_call_secs: 600,
+            quality: crate::config::QualityConfig::default(),
         };
         let sip = SipConfig {
             server: "127.0.0.1:5060".into(),

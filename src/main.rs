@@ -233,6 +233,7 @@ async fn run_live(
             .unwrap_or(kutsu::config::DEFAULT_GREET_AFTER_SILENCE_MS),
         transcript_dir: None,
         max_call_secs: 600,
+        quality: kutsu::config::QualityConfig::default(),
     };
 
     // 2. Preflight (fail closed).
