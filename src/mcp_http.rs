@@ -62,6 +62,8 @@ pub fn render_prometheus(m: &MetricsSnapshot) -> String {
     g(&mut s, "kutsu_audio_underruns_total", "Audio underruns since start.", "counter", m.underruns_total.to_string());
     g(&mut s, "kutsu_audio_starved_ms_total", "Total milliseconds of audio starvation.", "counter", m.starved_ms_total.to_string());
     g(&mut s, "kutsu_calls_quality_aborted_total", "Calls aborted due to quality issues.", "counter", m.quality_aborted_total.to_string());
+    g(&mut s, "kutsu_uplink_received_total", "Uplink RTP packets received since start.", "counter", m.uplink_received_total.to_string());
+    g(&mut s, "kutsu_uplink_lost_total", "Uplink RTP packets lost since start.", "counter", m.uplink_lost_total.to_string());
     s
 }
 
@@ -298,6 +300,20 @@ mod tests {
         let s = render_prometheus(&m);
         for line in ["kutsu_audio_underruns_total 7", "kutsu_audio_starved_ms_total 140", "kutsu_calls_quality_aborted_total 2"] {
             assert!(s.contains(line), "missing: {line}");
+        }
+    }
+
+    #[test]
+    fn uplink_series_present() {
+        let m = MetricsSnapshot {
+            active: 0, queued: 0, placed_total: 0, completed_total: 0, failed_total: 0,
+            cancelled_total: 0, channels_cap: 3,
+            underruns_total: 0, starved_ms_total: 0, quality_aborted_total: 0,
+            uplink_received_total: 900, uplink_lost_total: 12,
+        };
+        let s = render_prometheus(&m);
+        for line in ["kutsu_uplink_received_total 900", "kutsu_uplink_lost_total 12"] {
+            assert!(s.contains(line), "missing: {line}\n{s}");
         }
     }
 
