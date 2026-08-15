@@ -19,7 +19,7 @@ This feature closes the uplink measurement gap so the **next** Linphone call yie
 - Feasibility confirmed: `ezk_rtc::RtpPacket` (`rtp/rtp_packet.rs:6`) exposes public `sequence_number`, `timestamp`, `marker`, `payload`. Today `call.rs:242` reads only `.payload`; the sequence number is available and discarded. No ezk change needed.
 - **RFC 3550 loss accounting**, not naive gap counting: track an extended (wrap-aware) sequence number, `first_ext`, `max_ext`, `received`. Loss is derived as `(max_ext − first_ext + 1) − received`. This is correct under reordering (a late packet does not inflate loss) where a "count the hole" approach over-reports.
 - **Surface: logs + status JSON + Prometheus** (user choice). Uplink stats cross the SIP-thread → engine boundary via an `Arc` shared handle mirroring the existing `QualityShared` (single-writer in the SIP receive loop, single-reader in the engine `qtick`).
-- **Audio dump gated by env** `KUTSU_DUMP_UPLINK_DIR`, mirroring the existing `transcript_dir` config seam. Dump is decoded **PCM16 @ 8 kHz** (openable in any player), not raw µ-law.
+- **Audio dump gated by env** `KUTSU_DUMP_UPLINK_DIR`, mirroring the existing `transcript_dir` config seam. Dump **both stages** as PCM16 WAV: the **pre-resample 8 kHz** (exactly what arrived from the phone) and the **post-resample 16 kHz** (exactly what we hand to the Gemini sink). The 16 kHz is largely derivable from the 8 kHz, but capturing it independently isolates a *network* fault from a *resampler* fault — if 8 kHz is clean and 16 kHz is corrupt, the bug is in our upsample path, not the WiFi link — and it is literally the audio fed to ASR, replayable for verification. Raw µ-law is not dumped (PCM16 opens anywhere).
 - The per-call summary log line includes the **negotiated codec (µ-law/A-law)** and loss %, so it simultaneously answers the secondary hypothesis (a µ-law-vs-A-law path difference between the two softphones).
 
 ## Component 1 — `UplinkStats` (pure accounting)
@@ -60,9 +60,9 @@ Receive loop (`call.rs:240`): before forwarding, `stats.observe(rtp.sequence_num
 
 ## Component 4 — Uplink audio dump (`bridge`)
 
-`ServerConfig` gains `dump_uplink_dir: Option<PathBuf>` (mirrors `transcript_dir`), read in `main_support.rs` from `KUTSU_DUMP_UPLINK_DIR`. The engine passes a resolved per-call path into `BridgePorts` as `uplink_dump: Option<PathBuf>` = `dir.join(format!("{call_id}-uplink.wav"))`.
+`ServerConfig` gains `dump_uplink_dir: Option<PathBuf>` (mirrors `transcript_dir`), read in `main_support.rs` from `KUTSU_DUMP_UPLINK_DIR`. The engine passes the resolved per-call directory into `BridgePorts` as `uplink_dump: Option<PathBuf>` (the base dir; the bridge derives both filenames from `call_id`).
 
-The bridge uplink task (`mod.rs:94`), which already decodes `pcm8` at line 96, opens a `Pcm16Writer::create(path, 8000)` when `uplink_dump` is `Some`, writes each decoded `pcm8` block, and `finalize()`s on task exit. When `None` (default), the task is byte-for-byte unchanged. The dump is the *pre-resample* 8 kHz phone audio — exactly what arrived, so gaps/artifacts are audible as the phone side sent them.
+The bridge uplink task (`mod.rs:94`) already computes both `pcm8` (line 96) and `pcm16` (line 97). When `uplink_dump` is `Some(dir)`, it opens two writers at task start — `Pcm16Writer::create(dir.join(format!("{call_id}-uplink-8k.wav")), 8000)` and `…-uplink-16k.wav` at `16000` — writes each `pcm8` block to the first and each `pcm16` block to the second, and `finalize()`s both on task exit. When `None` (default), the task is byte-for-byte unchanged. The 8 kHz file is what arrived from the phone (network artifacts audible as sent); the 16 kHz file is what we handed to the Gemini sink (isolates a resampler fault and is the exact ASR input). `call_id` must therefore be available to the bridge — add it to `BridgePorts`.
 
 ## Component 5 — Prometheus (`mcp_http`)
 
@@ -81,7 +81,7 @@ The bridge uplink task (`mod.rs:94`), which already decodes `pcm8` at line 96, o
 - `UplinkStats`: in-order / single gap / reorder-after-gap / duplicate / wraparound / empty (Component 1 list).
 - `UplinkQualityShared`: `publish` then `snapshot` round-trips the values.
 - Prometheus: a `uplink_series_present` test asserts both new series render (mirrors `prometheus_has_quality_series`).
-- WAV dump: with `uplink_dump = Some(path)`, the bridge uplink task creates a readable PCM16 file; with `None`, no file is written.
+- WAV dump: with `uplink_dump = Some(dir)`, the bridge uplink task creates both readable PCM16 files (`-uplink-8k.wav` @ 8 kHz, `-uplink-16k.wav` @ 16 kHz); with `None`, no file is written.
 
 ## Extension seams (explicitly out of scope now)
 
