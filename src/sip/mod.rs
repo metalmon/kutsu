@@ -10,8 +10,10 @@
 //! before building anything on top of this.
 
 mod call;
+mod outcome;
 mod uplink;
 
+pub use outcome::{outcome_from_status, CallOutcome};
 pub use uplink::{UplinkQuality, UplinkQualityShared, UplinkStats};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
