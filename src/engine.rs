@@ -87,6 +87,14 @@ struct Counters {
     completed: AtomicU64,
     failed: AtomicU64,
     cancelled: AtomicU64,
+    /// Per-outcome cumulative totals for the dial-failure outcomes.
+    /// `bump_counter_outcome` maps `CallOutcome::Completed`/`Failed` onto
+    /// `completed`/`failed` above and the rest onto these.
+    busy: AtomicU64,
+    no_answer: AtomicU64,
+    rejected: AtomicU64,
+    not_found: AtomicU64,
+    unavailable: AtomicU64,
     /// Cumulative audio-quality totals, added once per call at finalize (not
     /// per tick) so a call's underruns/starved-ms are counted exactly once.
     underruns: AtomicU64,
@@ -114,6 +122,11 @@ pub struct MetricsSnapshot {
     pub quality_aborted_total: u64,
     pub uplink_received_total: u64,
     pub uplink_lost_total: u64,
+    pub busy_total: u64,
+    pub no_answer_total: u64,
+    pub rejected_total: u64,
+    pub not_found_total: u64,
+    pub unavailable_total: u64,
 }
 
 /// The call engine: owns the SIP transport, the call store, and config.
@@ -163,6 +176,11 @@ impl Engine {
             quality_aborted_total: self.counters.quality_aborted.load(Ordering::Relaxed),
             uplink_received_total: self.counters.uplink_received.load(Ordering::Relaxed),
             uplink_lost_total: self.counters.uplink_lost.load(Ordering::Relaxed),
+            busy_total: self.counters.busy.load(Ordering::Relaxed),
+            no_answer_total: self.counters.no_answer.load(Ordering::Relaxed),
+            rejected_total: self.counters.rejected.load(Ordering::Relaxed),
+            not_found_total: self.counters.not_found.load(Ordering::Relaxed),
+            unavailable_total: self.counters.unavailable.load(Ordering::Relaxed),
         }
     }
 
@@ -259,6 +277,21 @@ fn bump_counter(counters: &Counters, state: CallState) {
     }
 }
 
+/// Bump the cumulative counter matching a `CallOutcome`, for finalize sites
+/// that carry one (i.e. everywhere `bump_counter` would otherwise be told
+/// `CallState::Failed`, which loses the dial-outcome detail).
+fn bump_counter_outcome(counters: &Counters, outcome: CallOutcome) {
+    match outcome {
+        CallOutcome::Completed => counters.completed.fetch_add(1, Ordering::Relaxed),
+        CallOutcome::Busy => counters.busy.fetch_add(1, Ordering::Relaxed),
+        CallOutcome::NoAnswer => counters.no_answer.fetch_add(1, Ordering::Relaxed),
+        CallOutcome::Rejected => counters.rejected.fetch_add(1, Ordering::Relaxed),
+        CallOutcome::NotFound => counters.not_found.fetch_add(1, Ordering::Relaxed),
+        CallOutcome::Unavailable => counters.unavailable.fetch_add(1, Ordering::Relaxed),
+        CallOutcome::Failed => counters.failed.fetch_add(1, Ordering::Relaxed),
+    };
+}
+
 /// Drive one call to completion. Safe ordering: SIP first, answer, THEN Gemini.
 async fn run_call(
     sip: SipTransport,
@@ -292,7 +325,7 @@ async fn run_call(
         Ok(c) => c,
         Err(e) => {
             store.finalize(&call_id, CallState::Failed, None, Some(e.to_string()), Some(CallOutcome::Failed), now_ms());
-            bump_counter(&counters, CallState::Failed);
+            bump_counter_outcome(&counters, CallOutcome::Failed);
             return;
         }
     };
@@ -310,12 +343,12 @@ async fn run_call(
                     _ => (CallOutcome::NoAnswer, format!("{reason:?}")),
                 };
                 store.finalize(&call_id, CallState::Failed, None, Some(detail), Some(outcome), now_ms());
-                bump_counter(&counters, CallState::Failed);
+                bump_counter_outcome(&counters, outcome);
                 return;
             }
             None => {
                 store.finalize(&call_id, CallState::Failed, None, Some("sip closed before answer".into()), Some(CallOutcome::Failed), now_ms());
-                bump_counter(&counters, CallState::Failed);
+                bump_counter_outcome(&counters, CallOutcome::Failed);
                 return;
             }
         }
@@ -329,7 +362,7 @@ async fn run_call(
         Err(e) => {
             let _ = sip_hangup.send(());
             store.finalize(&call_id, CallState::Failed, None, Some(format!("gemini connect: {e}")), Some(CallOutcome::Failed), now_ms());
-            bump_counter(&counters, CallState::Failed);
+            bump_counter_outcome(&counters, CallOutcome::Failed);
             return;
         }
     };
@@ -451,8 +484,12 @@ async fn run_call(
     if error.is_some() {
         counters.quality_aborted.fetch_add(1, Ordering::Relaxed);
     }
-    store.finalize(&call_id, final_state, final_goal, error, finalize_outcome(final_state), now_ms());
-    bump_counter(&counters, final_state);
+    let outcome = finalize_outcome(final_state);
+    store.finalize(&call_id, final_state, final_goal, error, outcome, now_ms());
+    match outcome {
+        Some(o) => bump_counter_outcome(&counters, o),
+        None => bump_counter(&counters, CallState::Cancelled),
+    }
 
     // 10. Persist. Owner-only permissions: the transcript may contain PII.
     if let Some(dir) = &server.transcript_dir {

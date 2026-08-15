@@ -50,7 +50,12 @@ pub fn render_prometheus(m: &MetricsSnapshot) -> String {
         "counter",
         m.completed_total.to_string(),
     );
-    g(&mut s, "kutsu_calls_failed_total", "Calls failed.", "counter", m.failed_total.to_string());
+    g(&mut s, "kutsu_calls_failed_total", "Calls failed (technical failures only).", "counter", m.failed_total.to_string());
+    g(&mut s, "kutsu_calls_busy_total", "Calls that ended busy (486).", "counter", m.busy_total.to_string());
+    g(&mut s, "kutsu_calls_no_answer_total", "Calls with no answer (timeout/408/480).", "counter", m.no_answer_total.to_string());
+    g(&mut s, "kutsu_calls_rejected_total", "Calls rejected (603/403/6xx).", "counter", m.rejected_total.to_string());
+    g(&mut s, "kutsu_calls_not_found_total", "Calls to a number not found (404/484).", "counter", m.not_found_total.to_string());
+    g(&mut s, "kutsu_calls_unavailable_total", "Calls that hit a service-unavailable response (503/5xx).", "counter", m.unavailable_total.to_string());
     g(
         &mut s,
         "kutsu_calls_cancelled_total",
@@ -273,6 +278,11 @@ mod tests {
             quality_aborted_total: 0,
             uplink_received_total: 0,
             uplink_lost_total: 0,
+            busy_total: 0,
+            no_answer_total: 0,
+            rejected_total: 0,
+            not_found_total: 0,
+            unavailable_total: 0,
         };
         let s = render_prometheus(&m);
         for line in [
@@ -296,6 +306,7 @@ mod tests {
             cancelled_total: 0, channels_cap: 3,
             underruns_total: 7, starved_ms_total: 140, quality_aborted_total: 2,
             uplink_received_total: 0, uplink_lost_total: 0,
+            busy_total: 0, no_answer_total: 0, rejected_total: 0, not_found_total: 0, unavailable_total: 0,
         };
         let s = render_prometheus(&m);
         for line in ["kutsu_audio_underruns_total 7", "kutsu_audio_starved_ms_total 140", "kutsu_calls_quality_aborted_total 2"] {
@@ -310,9 +321,31 @@ mod tests {
             cancelled_total: 0, channels_cap: 3,
             underruns_total: 0, starved_ms_total: 0, quality_aborted_total: 0,
             uplink_received_total: 900, uplink_lost_total: 12,
+            busy_total: 0, no_answer_total: 0, rejected_total: 0, not_found_total: 0, unavailable_total: 0,
         };
         let s = render_prometheus(&m);
         for line in ["kutsu_uplink_received_total 900", "kutsu_uplink_lost_total 12"] {
+            assert!(s.contains(line), "missing: {line}\n{s}");
+        }
+    }
+
+    #[test]
+    fn outcome_series_present() {
+        let m = MetricsSnapshot {
+            active: 0, queued: 0, placed_total: 0, completed_total: 0, failed_total: 0,
+            cancelled_total: 0, channels_cap: 3,
+            underruns_total: 0, starved_ms_total: 0, quality_aborted_total: 0,
+            uplink_received_total: 0, uplink_lost_total: 0,
+            busy_total: 5, no_answer_total: 4, rejected_total: 3, not_found_total: 2, unavailable_total: 1,
+        };
+        let s = render_prometheus(&m);
+        for line in [
+            "kutsu_calls_busy_total 5",
+            "kutsu_calls_no_answer_total 4",
+            "kutsu_calls_rejected_total 3",
+            "kutsu_calls_not_found_total 2",
+            "kutsu_calls_unavailable_total 1",
+        ] {
             assert!(s.contains(line), "missing: {line}\n{s}");
         }
     }
