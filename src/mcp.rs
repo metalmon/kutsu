@@ -68,17 +68,19 @@ fn unknown_call(id: &str) -> ErrorData {
     ErrorData::invalid_params(format!("unknown call_id: {id}"), None)
 }
 
-/// Map a [`CallState`] to its corresponding MCP [`TaskStatus`].
-///
-/// Used by the `place_call` task branch.
-fn task_status_for(state: crate::state::CallState) -> rmcp::model::TaskStatus {
+/// Human-readable label for a [`CallState`], used in a task's progress
+/// message. (The task's actual MCP `TaskStatus` is derived by the framework
+/// from the task future's terminal `Ok`/`Err`, not from this label.)
+fn call_status_label(state: crate::state::CallState) -> &'static str {
     use crate::state::CallState;
-    use rmcp::model::TaskStatus;
     match state {
-        CallState::Queued | CallState::Ringing | CallState::InProgress => TaskStatus::Working,
-        CallState::Completed | CallState::HungUp => TaskStatus::Completed,
-        CallState::Cancelled => TaskStatus::Cancelled,
-        CallState::Failed => TaskStatus::Failed,
+        CallState::Queued => "queued",
+        CallState::Ringing => "ringing",
+        CallState::InProgress => "in progress",
+        CallState::Completed => "completed",
+        CallState::HungUp => "hung up",
+        CallState::Failed => "failed",
+        CallState::Cancelled => "cancelled",
     }
 }
 
@@ -175,10 +177,10 @@ impl KutsuServer {
                 let terminal = loop {
                     // Publish the current human-readable status before waiting.
                     if let Some(rec) = engine.store().get(&cid) {
-                        let status = task_status_for(rec.state);
+                        let label = call_status_label(rec.state);
                         let msg = match engine.store().queued_position(&cid) {
-                            Some(pos) => format!("call {cid}: {status:?} (queue position {pos})"),
-                            None => format!("call {cid}: {status:?}"),
+                            Some(pos) => format!("call {cid}: {label} (queue position {pos})"),
+                            None => format!("call {cid}: {label}"),
                         };
                         ctx.set_status_message(msg);
                     }
@@ -430,18 +432,21 @@ mod tests {
     }
 
     #[test]
-    fn task_status_mapping() {
-        use rmcp::model::TaskStatus::*;
+    fn call_status_label_and_terminal() {
         use crate::state::CallState as S;
-        assert!(matches!(task_status_for(S::Queued), Working));
-        assert!(matches!(task_status_for(S::Ringing), Working));
-        assert!(matches!(task_status_for(S::InProgress), Working));
-        assert!(matches!(task_status_for(S::Completed), Completed));
-        assert!(matches!(task_status_for(S::HungUp), Completed));
-        assert!(matches!(task_status_for(S::Cancelled), Cancelled));
-        assert!(matches!(task_status_for(S::Failed), Failed));
+        assert_eq!(call_status_label(S::Queued), "queued");
+        assert_eq!(call_status_label(S::Ringing), "ringing");
+        assert_eq!(call_status_label(S::InProgress), "in progress");
+        assert_eq!(call_status_label(S::Completed), "completed");
+        assert_eq!(call_status_label(S::HungUp), "hung up");
+        assert_eq!(call_status_label(S::Failed), "failed");
+        assert_eq!(call_status_label(S::Cancelled), "cancelled");
         assert!(!is_terminal_state(S::Queued));
+        assert!(!is_terminal_state(S::Ringing));
+        assert!(!is_terminal_state(S::InProgress));
         assert!(is_terminal_state(S::Completed));
+        assert!(is_terminal_state(S::HungUp));
+        assert!(is_terminal_state(S::Failed));
         assert!(is_terminal_state(S::Cancelled));
     }
 

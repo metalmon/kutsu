@@ -63,12 +63,13 @@ async fn place_call_via_mcp_completes() {
     let server = server_res.expect("server-side MCP handshake");
     let client = client_res.expect("client-side MCP handshake");
 
-    // place_call: `Peer<RoleClient>::call_tool` (src/service/client.rs:1393,
-    // `method!(peer_req call_tool CallToolRequest(CallToolRequestParams) =>
-    // CallToolResult)`, in the `impl Peer<RoleClient>` block starting at
-    // line 1055); reached off `RunningService` via its `Deref<Target =
-    // Peer<R>>` (src/service.rs:1055). Arguments are a
-    // `serde_json::Map<String, Value>` (`JsonObject`, src/model.rs:45).
+    // place_call: resolves to `RunningService<RoleClient, _>`'s *inherent*
+    // `call_tool` (the MRTR-round-aware wrapper) — Rust method resolution
+    // prefers an inherent method on the concrete receiver over the
+    // `Peer<RoleClient>::call_tool` reachable via `Deref<Target = Peer<R>>`.
+    // Both return `Result<CallToolResult, ServiceError>`; behavior here is
+    // identical. Arguments are a `serde_json::Map<String, Value>`
+    // (`JsonObject`).
     let place_args = call_args(&[
         ("to_number", serde_json::Value::String(env_or("KUTSU_SIP_EXT", "600"))),
         ("system_prompt", serde_json::Value::String(scenario.system_prompt.clone())),

@@ -28,6 +28,9 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 tokio-util = "0.7"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["trace"] }
+# Constant-time bearer-token comparison for the streamable-http `/mcp` guard
+# (avoids a timing side channel). Already in the tree transitively (ring/rustls).
+subtle = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
