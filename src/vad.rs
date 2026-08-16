@@ -24,6 +24,7 @@ use crate::config::VadConfig;
 pub struct Vad {
     cfg: VadConfig,
     noise_floor: f32,
+    last_rms: f32,
     consec: u32,
     fired: bool,
     frames_seen: u32,
@@ -31,8 +32,13 @@ pub struct Vad {
 
 impl Vad {
     pub fn new(cfg: VadConfig) -> Self {
-        Self { cfg, noise_floor: 0.0, consec: 0, fired: false, frames_seen: 0 }
+        Self { cfg, noise_floor: 0.0, last_rms: 0.0, consec: 0, fired: false, frames_seen: 0 }
     }
+
+    /// RMS of the most recently observed frame (for onset logging/tuning).
+    pub fn last_rms(&self) -> f32 { self.last_rms }
+    /// Current adaptive noise floor (for onset logging/tuning).
+    pub fn noise_floor(&self) -> f32 { self.noise_floor }
 
     /// Feed one incoming callee frame. Returns true exactly once — on the frame
     /// that confirms speech onset. Once fired, always returns false.
@@ -40,6 +46,7 @@ impl Vad {
         if self.fired || frame.is_empty() { return false; }
         let sumsq: f64 = frame.iter().map(|&s| (s as f64) * (s as f64)).sum();
         let rms = (sumsq / frame.len() as f64).sqrt() as f32;
+        self.last_rms = rms;
 
         if self.frames_seen < self.cfg.warmup_frames {
             let is_seed_frame = self.frames_seen == 0;

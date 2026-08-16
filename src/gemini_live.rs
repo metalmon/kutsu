@@ -189,7 +189,11 @@ pub(crate) async fn run_session<T: Transport>(
         //    turn was pending mid-exchange. A resumed handle or no pending turn
         //    needs nothing — the wording comes from the scenario prompt.
         if resume_handle.is_none() && resume_needed.load(Relaxed) {
-            tracing::info!("gemini reconnect: context lost mid-exchange — sent RESUME_CUE");
+            tracing::info!(
+                has_handle = resume_handle.is_some(),
+                resume_needed = true,
+                "gemini reconnect: context lost mid-exchange — sending RESUME_CUE"
+            );
             if transport.send_text(build_client_content(&server.resume_cue)).await.is_err() {
                 return SessionEnd::Resumable("send resume cue failed".into());
             }
@@ -249,6 +253,10 @@ pub(crate) async fn run_session<T: Transport>(
                     Err(_) => { answered_closed = true; } // sender dropped without answering: never greet
                 }
             }
+            // `select!` picks ready arms in random order, but in practice callee frames
+            // arrive at 20 ms intervals while this deadline is ~1 s out, so the VAD arm
+            // latches `callee_active` (disabling this guard) long before the timer is
+            // ready; the Role::User transcript fallback closes the remainder.
             _ = tokio::time::sleep_until(greet_deadline), if greet_armed && !greeted && !had_activity && !callee_active.load(Relaxed) && !is_reconnect => {
                 greeted = true;
                 greeted_ever.store(true, Relaxed);
@@ -265,7 +273,11 @@ pub(crate) async fn run_session<T: Transport>(
                         if vad.observe(&pcm) {
                             callee_active.store(true, Relaxed);
                             resume_needed.store(true, Relaxed);
-                            tracing::info!("gemini: callee speech onset — greeting suppressed");
+                            tracing::info!(
+                                rms = vad.last_rms(),
+                                floor = vad.noise_floor(),
+                                "gemini: callee speech onset — greeting suppressed"
+                            );
                         }
                         let msg = build_realtime_input(&pcm);
                         if transport.send_text(msg).await.is_err() {
