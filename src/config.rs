@@ -143,6 +143,10 @@ pub struct ServerConfig {
     pub quality: QualityConfig,
     /// Retry policy for transient dial outcomes (busy, etc).
     pub retry: RetryConfig,
+    /// Energy-VAD tuning for detecting that the callee has started speaking.
+    pub vad: VadConfig,
+    /// Instruction sent to the model when a session reconnects with lost context.
+    pub resume_cue: String,
 }
 
 /// Downlink playout pacing thresholds. Tunes the tradeoff between latency
@@ -214,11 +218,18 @@ impl Default for VadConfig {
 /// Default wait before the agent greets a silent callee (see
 /// [`ServerConfig::greet_after_silence_ms`]). With warm-start the Gemini
 /// session is already connected at answer, so this is a natural conversational
-/// beat, not dead air: ~1.5 s lets the callee get their "Алло?" in first (and,
+/// beat, not dead air: ~1 s lets the callee get their "Алло?" in first (and,
 /// if Gemini transcribes it in time, the agent responds reactively); if the
 /// callee stays silent, the agent greets. Override per deployment with
 /// `KUTSU_GREET_AFTER_SILENCE_MS` (0 disables the proactive greeting entirely).
-pub const DEFAULT_GREET_AFTER_SILENCE_MS: u64 = 1500;
+pub const DEFAULT_GREET_AFTER_SILENCE_MS: u64 = 1000;
+
+/// Default instruction sent to the model when a session reconnects with lost
+/// context mid-exchange. An instruction, not a spoken phrase; the model speaks
+/// it in the conversation's language. Override with `KUTSU_RESUME_CUE`.
+pub const RESUME_CUE: &str = "The connection dropped briefly and the last thing \
+    the other party said may be lost. Ask them to repeat what they just said, \
+    replying in the same language you have been speaking.";
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ScenarioConfig {
@@ -302,13 +313,15 @@ mod tests {
             max_call_secs: 600,
             quality: QualityConfig::default(),
             retry: RetryConfig::default(),
+            vad: VadConfig::default(),
+            resume_cue: RESUME_CUE.into(),
         };
         assert_eq!(c.max_call_secs, 600);
         assert!(c.transcript_dir.is_some());
     }
 
     #[test]
-    fn default_greet_delay_is_1500ms() {
-        assert_eq!(DEFAULT_GREET_AFTER_SILENCE_MS, 1500);
+    fn default_greet_delay_is_1000ms() {
+        assert_eq!(DEFAULT_GREET_AFTER_SILENCE_MS, 1000);
     }
 }

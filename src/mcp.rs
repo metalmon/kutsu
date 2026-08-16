@@ -342,7 +342,7 @@ impl ServerHandler for KutsuServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Model, NetCheckConfig, ServerConfig, SipConfig};
+    use crate::config::{Model, NetCheckConfig, ServerConfig, SipConfig, VadConfig, RESUME_CUE};
 
     /// Build a valid engine for tests, bound to loopback so `SipTransport::new`
     /// binds offline (no real trunk) — mirrors `engine::tests::test_configs`.
@@ -362,6 +362,8 @@ mod tests {
             max_call_secs: 600,
             quality: crate::config::QualityConfig::default(),
             retry: crate::config::RetryConfig::default(),
+            vad: VadConfig::default(),
+            resume_cue: RESUME_CUE.into(),
         };
         let sip = SipConfig {
             server: "127.0.0.1:5060".into(),

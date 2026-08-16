@@ -2,7 +2,7 @@
 
 use crate::config::{
     Gender, Model, NetCheckConfig, Proxy, QualityConfig, RetryConfig, ScenarioConfig, ServerConfig,
-    SipConfig, SipTransportKind, DEFAULT_GREET_AFTER_SILENCE_MS,
+    SipConfig, SipTransportKind, VadConfig, DEFAULT_GREET_AFTER_SILENCE_MS, RESUME_CUE,
 };
 
 fn env_or(k: &str, d: &str) -> String {
@@ -18,6 +18,10 @@ fn env_u32(k: &str, d: u32) -> u32 {
 }
 
 fn env_u64(k: &str, d: u64) -> u64 {
+    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+}
+
+fn env_f32(k: &str, d: f32) -> f32 {
     std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
 }
 
@@ -57,6 +61,13 @@ pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
             busy_max_attempts: env_u32("KUTSU_BUSY_MAX_ATTEMPTS", 3),
             busy_retry_interval_ms: env_u64("KUTSU_BUSY_RETRY_INTERVAL_MS", 300_000),
         },
+        vad: VadConfig {
+            min_rms: env_u32("KUTSU_VAD_MIN_RMS", 200),
+            ratio: env_f32("KUTSU_VAD_RATIO", 3.0),
+            onset_frames: env_u32("KUTSU_VAD_ONSET_FRAMES", 3),
+            warmup_frames: env_u32("KUTSU_VAD_WARMUP_FRAMES", 10),
+        },
+        resume_cue: env_or("KUTSU_RESUME_CUE", RESUME_CUE),
     };
     let sip = SipConfig {
         server: env_or("KUTSU_SIP_SERVER", "192.168.88.243:5060"),

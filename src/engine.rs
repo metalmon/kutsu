@@ -830,7 +830,7 @@ fn write_owner_only(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Model, NetCheckConfig};
+    use crate::config::{Model, NetCheckConfig, VadConfig, RESUME_CUE};
 
     /// Build a valid `(ServerConfig, SipConfig)` pair for tests. The SIP config
     /// is bound to loopback so `SipTransport::new` binds offline (no real trunk).
@@ -850,6 +850,8 @@ mod tests {
             max_call_secs: 600,
             quality: crate::config::QualityConfig::default(),
             retry: crate::config::RetryConfig::default(),
+            vad: VadConfig::default(),
+            resume_cue: RESUME_CUE.into(),
         };
         let sip_cfg = SipConfig {
             server: "127.0.0.1:5060".into(),
