@@ -6,3 +6,4 @@ kutsu.toml
 /logs/
 
 *.log
+uplink-dump/
