@@ -5,6 +5,9 @@ edition = "2024"
 description = "Outbound SIP calling MCP server, bridging real phone calls to Gemini Live"
 license = "MIT"
 
+[workspace]
+members = ["crates/gemini-live"]
+
 [lib]
 name = "kutsu"
 path = "src/lib.rs"
@@ -14,6 +17,10 @@ name = "kutsu"
 path = "src/main.rs"
 
 [dependencies]
+# The Gemini Live client, developed in its own repo and vendored here as a git
+# submodule (crates/gemini-live). Owns wire/transport/session; kutsu keeps call
+# orchestration on top.
+gemini-live = { path = "crates/gemini-live" }
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
