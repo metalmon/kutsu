@@ -170,6 +170,32 @@ pub(crate) async fn run_session<T: Transport>(
         return SessionEnd::Resumable("send setup failed".into());
     }
 
+    // Reconnect recovery: a session that reopened after a drop must not carry
+    // over the stale uplink backlog nor a half-played downlink, and — only if
+    // context was truly lost mid-exchange — must ask the callee to repeat.
+    if is_reconnect {
+        // 1. Drop the stale uplink backlog (frames queued during the outage
+        //    are old callee audio the reopened model must never hear).
+        let mut drained = 0u32;
+        while audio_in.try_recv().is_ok() {
+            drained += 1;
+        }
+        tracing::info!(drained, "gemini reconnect: dropped stale uplink frames");
+        // 2. Flush the pacer: the bridge's barge-in path clears the downlink
+        //    buffer on `Interrupted`, discarding any mid-played audio.
+        let _ = events.send(Event::Interrupted).await;
+        // 3. RESUME_CUE, only when context was genuinely lost: no server-side
+        //    resumption handle (the model can't restore context itself) AND a
+        //    turn was pending mid-exchange. A resumed handle or no pending turn
+        //    needs nothing — the wording comes from the scenario prompt.
+        if resume_handle.is_none() && resume_needed.load(Relaxed) {
+            tracing::info!("gemini reconnect: context lost mid-exchange — sent RESUME_CUE");
+            if transport.send_text(build_client_content(&server.resume_cue)).await.is_err() {
+                return SessionEnd::Resumable("send resume cue failed".into());
+            }
+        }
+    }
+
     // Hybrid greeting: on a fresh session, if neither side has produced anything
     // within `greet_after_silence_ms`, prompt the model to greet first. A value
     // of 0 disables the proactive greeting (purely reactive).
@@ -991,5 +1017,135 @@ mod tests {
         assert!(!rstate.on_failure());
         assert!(!rstate.on_failure());
         assert!(rstate.on_failure());
+    }
+
+    // --- reconnect recovery: on a reopened session (`is_reconnect = true`),
+    // `run_session` drops the stale uplink backlog, flushes the pacer with an
+    // `Interrupted` event, and sends the RESUME_CUE only when context was truly
+    // lost mid-exchange (no resumption handle AND a turn was pending).
+
+    #[tokio::test]
+    async fn reconnect_lost_context_sends_resume_cue() {
+        // No handle + a turn was pending -> the model can't restore context, so
+        // it must ask the callee to repeat via the scenario's resume cue.
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = FakeTransport {
+            incoming: std::collections::VecDeque::new(),
+            sent: sent.clone(),
+            pending_when_empty: false,
+        };
+        let (_atx, mut arx) = mpsc::channel::<Vec<i16>>(8);
+        let (etx, mut _erx) = mpsc::channel::<Event>(64);
+        let mut setup_ok = false;
+        let (_answered_tx, answered_rx) = tokio::sync::watch::channel(true);
+        let end = run_session(
+            transport, &server(), &scenario(), None, &mut arx, &etx, &mut None, &mut setup_ok,
+            answered_rx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)), // resume_needed
+            true, // is_reconnect
+        ).await;
+        assert!(matches!(end, SessionEnd::RemoteClose));
+        let expected = build_client_content(&server().resume_cue);
+        let sent = sent.lock().unwrap();
+        assert!(sent.iter().any(|s| *s == expected), "RESUME_CUE must be sent on lost context");
+        assert!(!sent.iter().any(|s| s.contains(GREET_CUE)), "no GREET_CUE on reconnect");
+    }
+
+    #[tokio::test]
+    async fn reconnect_with_handle_sends_no_cue() {
+        // A server-side resumption handle means the model restores context
+        // itself: no cue of any kind is sent.
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = FakeTransport {
+            incoming: std::collections::VecDeque::new(),
+            sent: sent.clone(),
+            pending_when_empty: false,
+        };
+        let (_atx, mut arx) = mpsc::channel::<Vec<i16>>(8);
+        let (etx, mut _erx) = mpsc::channel::<Event>(64);
+        let mut setup_ok = false;
+        let (_answered_tx, answered_rx) = tokio::sync::watch::channel(true);
+        let _ = run_session(
+            transport, &server(), &scenario(), Some("h".into()), &mut arx, &etx, &mut None,
+            &mut setup_ok, answered_rx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)), // resume_needed (irrelevant: handle present)
+            true, // is_reconnect
+        ).await;
+        let expected = build_client_content(&server().resume_cue);
+        let sent = sent.lock().unwrap();
+        assert!(!sent.iter().any(|s| *s == expected), "no RESUME_CUE when a handle is present");
+        assert!(!sent.iter().any(|s| s.contains(GREET_CUE)), "no GREET_CUE on reconnect");
+    }
+
+    #[tokio::test]
+    async fn reconnect_without_pending_turn_sends_no_cue() {
+        // No handle, but no turn was pending mid-exchange: nothing was lost, so
+        // no cue is sent.
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = FakeTransport {
+            incoming: std::collections::VecDeque::new(),
+            sent: sent.clone(),
+            pending_when_empty: false,
+        };
+        let (_atx, mut arx) = mpsc::channel::<Vec<i16>>(8);
+        let (etx, mut _erx) = mpsc::channel::<Event>(64);
+        let mut setup_ok = false;
+        let (_answered_tx, answered_rx) = tokio::sync::watch::channel(true);
+        let _ = run_session(
+            transport, &server(), &scenario(), None, &mut arx, &etx, &mut None, &mut setup_ok,
+            answered_rx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), // resume_needed = false
+            true, // is_reconnect
+        ).await;
+        let expected = build_client_content(&server().resume_cue);
+        let sent = sent.lock().unwrap();
+        assert!(!sent.iter().any(|s| *s == expected), "no RESUME_CUE without a pending turn");
+        assert!(!sent.iter().any(|s| s.contains(GREET_CUE)), "no GREET_CUE on reconnect");
+    }
+
+    #[tokio::test]
+    async fn reconnect_drains_stale_uplink() {
+        // Frames queued during the outage must be dropped, never forwarded as
+        // realtime input, and exactly one Interrupted flush must be emitted.
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = FakeTransport {
+            incoming: std::collections::VecDeque::new(),
+            sent: sent.clone(),
+            pending_when_empty: false,
+        };
+        let (atx, mut arx) = mpsc::channel::<Vec<i16>>(16);
+        let (etx, mut erx) = mpsc::channel::<Event>(64);
+        // Pre-queue stale frames, then drop the sender so that after the drain
+        // the loop's `audio_in.recv()` yields None -> Hangup, ending the session
+        // deterministically.
+        for _ in 0..5 { atx.send(vec![1234i16; 320]).await.unwrap(); }
+        drop(atx);
+        let mut setup_ok = false;
+        let (_answered_tx, answered_rx) = tokio::sync::watch::channel(true);
+        let _ = run_session(
+            transport, &server(), &scenario(), None, &mut arx, &etx, &mut None, &mut setup_ok,
+            answered_rx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            true, // is_reconnect
+        ).await;
+        // No realtime-input frame from the drained stale audio was forwarded.
+        assert!(
+            !sent.lock().unwrap().iter().any(|s| s.contains("realtime_input")),
+            "stale uplink frames must be drained, not forwarded"
+        );
+        // Exactly one Interrupted flush was emitted to the bridge.
+        let mut interrupted = 0;
+        while let Ok(ev) = erx.try_recv() {
+            if matches!(ev, Event::Interrupted) { interrupted += 1; }
+        }
+        assert_eq!(interrupted, 1, "exactly one Interrupted flush on reconnect");
     }
 }
