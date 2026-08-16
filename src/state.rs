@@ -34,6 +34,13 @@ pub struct CallQuality {
     pub uplink_lost: u64,
     /// Uplink RTP packets that arrived late/out-of-order.
     pub uplink_reordered: u64,
+    /// Uplink audio level: RMS amplitude (0..32767, linear PCM16) of the
+    /// decoded phone audio over the call. A very low value means the callee's
+    /// mic/gain was quiet — a plausible ASR-quality factor independent of loss.
+    /// Approximate call-average: the uplink task is detached when the bridge is
+    /// aborted at teardown, so the last few teardown-window frames may be
+    /// excluded (negligible against a whole-call average).
+    pub uplink_rms: u64,
 }
 
 /// One call's record.
@@ -251,7 +258,7 @@ mod tests {
         store.insert(rec("c1"));
         store.set_quality("c1", CallQuality {
             underruns: 3, starved_ms: 60, max_gap_ms: 220,
-            uplink_received: 500, uplink_lost: 7, uplink_reordered: 1,
+            uplink_received: 500, uplink_lost: 7, uplink_reordered: 1, uplink_rms: 2048,
         });
         let got = store.get("c1").unwrap();
         assert_eq!(got.quality.underruns, 3);

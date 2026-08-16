@@ -27,6 +27,10 @@ pub struct QualityShared {
     underruns: AtomicU64,
     starved_ms: AtomicU64,
     max_gap_ms: AtomicU64,
+    /// Running sum of squares of decoded uplink PCM16 samples, and the sample
+    /// count — snapshot derives the RMS level. Published by the uplink task.
+    uplink_sumsq: AtomicU64,
+    uplink_samples: AtomicU64,
 }
 
 impl QualityShared {
@@ -35,12 +39,25 @@ impl QualityShared {
     }
 
     pub fn snapshot(&self) -> crate::state::CallQuality {
+        let sumsq = self.uplink_sumsq.load(Ordering::Relaxed);
+        let samples = self.uplink_samples.load(Ordering::Relaxed);
+        let uplink_rms = if samples > 0 { ((sumsq / samples) as f64).sqrt() as u64 } else { 0 };
         crate::state::CallQuality {
             underruns: self.underruns.load(Ordering::Relaxed),
             starved_ms: self.starved_ms.load(Ordering::Relaxed),
             max_gap_ms: self.max_gap_ms.load(Ordering::Relaxed),
+            uplink_rms,
             ..Default::default()
         }
+    }
+
+    /// Accumulate one decoded uplink PCM16 frame into the running RMS level.
+    /// Sum-of-squares in u64: max 32768^2 per sample, so `u64::MAX / 32768^2`
+    /// ≈ 1.7e10 samples (~24 days at 8 kHz) before overflow — far beyond any call.
+    fn add_uplink_level(&self, pcm: &[i16]) {
+        let sq: u64 = pcm.iter().map(|&s| (s as i64 * s as i64) as u64).sum();
+        self.uplink_sumsq.fetch_add(sq, Ordering::Relaxed);
+        self.uplink_samples.fetch_add(pcm.len() as u64, Ordering::Relaxed);
     }
 }
 
@@ -98,6 +115,7 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
 
     // Uplink: transparent, continuous, never-manipulated forward (spec §2).
     // Separate task so its backpressure `await` can never stall the downlink.
+    let uplink_quality = quality.clone();
     let uplink = tokio::spawn(async move {
         let mut dump8 = uplink_dump.as_ref().and_then(|dir| {
             let path = dir.join(format!("{call_id}-uplink-8k.wav"));
@@ -121,6 +139,7 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
         });
         while let Some(payload) = phone_in.recv().await {
             let pcm8 = g711::decode(codec, &payload);
+            uplink_quality.add_uplink_level(&pcm8);
             let pcm16 = resample::up_8k_16k(&pcm8);
             // Synchronous `hound` writes on this async uplink task, between
             // `recv` and `gemini_in.send`: negligible under normal disk I/O,
@@ -211,6 +230,16 @@ mod tests {
     use crate::sip::G711Kind;
     use bytes::Bytes;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn uplink_rms_is_zero_before_any_audio_and_matches_a_constant_tone() {
+        let q = QualityShared::new();
+        assert_eq!(q.snapshot().uplink_rms, 0); // no samples -> 0, not a divide-by-zero
+        // A constant-amplitude signal has RMS == its amplitude.
+        q.add_uplink_level(&[1000i16; 400]);
+        q.add_uplink_level(&[1000i16; 400]);
+        assert_eq!(q.snapshot().uplink_rms, 1000);
+    }
 
     // Build ports + keep the far ends for the test to drive.
     struct Ends {
