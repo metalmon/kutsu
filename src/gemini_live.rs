@@ -157,7 +157,12 @@ pub(crate) async fn run_session<T: Transport>(
     latest_handle: &mut Option<String>,
     setup_ok: &mut bool,
     mut answered: tokio::sync::watch::Receiver<bool>,
+    callee_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    greeted_ever: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    resume_needed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    is_reconnect: bool,
 ) -> SessionEnd {
+    use std::sync::atomic::Ordering::Relaxed;
     // 1. Setup.
     let setup = proto::build_setup(server, scenario, resume_handle.as_deref());
     tracing::debug!(model = ?server.model, "gemini: sending setup");
@@ -169,7 +174,10 @@ pub(crate) async fn run_session<T: Transport>(
     // within `greet_after_silence_ms`, prompt the model to greet first. A value
     // of 0 disables the proactive greeting (purely reactive).
     let greet_enabled = server.greet_after_silence_ms > 0;
-    let mut greeted = resume_handle.is_some() || !greet_enabled; // never greet on resume or when disabled
+    // Never greet on resume, when disabled, on a reconnect, or if this call
+    // already greeted in an earlier attempt (persistent `greeted_ever`).
+    let mut greeted =
+        resume_handle.is_some() || !greet_enabled || greeted_ever.load(Relaxed) || is_reconnect;
     let mut had_activity = false;
 
     // Greeting arms only after `answered` — never during ring. `greet_armed`
@@ -194,6 +202,10 @@ pub(crate) async fn run_session<T: Transport>(
     let mut answered_closed = false;
 
     let mut audio_frames_sent: u64 = 0;
+    // Per-attempt energy VAD over the incoming callee audio. A fresh instance
+    // per `run_session` is correct: its noise floor / onset counter reset on
+    // every reconnect, while the shared `callee_active` flag persists.
+    let mut vad = crate::vad::Vad::new(server.vad);
     loop {
         tokio::select! {
             // Arm the greeting the moment the call is answered (once). Once
@@ -211,8 +223,9 @@ pub(crate) async fn run_session<T: Transport>(
                     Err(_) => { answered_closed = true; } // sender dropped without answering: never greet
                 }
             }
-            _ = tokio::time::sleep_until(greet_deadline), if greet_armed && !greeted && !had_activity => {
+            _ = tokio::time::sleep_until(greet_deadline), if greet_armed && !greeted && !had_activity && !callee_active.load(Relaxed) && !is_reconnect => {
                 greeted = true;
+                greeted_ever.store(true, Relaxed);
                 tracing::info!("gemini: callee silent — sending greeting kickoff");
                 if transport.send_text(build_client_content(GREET_CUE)).await.is_err() {
                     return SessionEnd::Resumable("send greeting failed".into());
@@ -221,6 +234,13 @@ pub(crate) async fn run_session<T: Transport>(
             frame = audio_in.recv() => {
                 match frame {
                     Some(pcm) => {
+                        // VAD only READS the frame for RMS; it never alters,
+                        // delays, or drops the audio forwarded to Gemini below.
+                        if vad.observe(&pcm) {
+                            callee_active.store(true, Relaxed);
+                            resume_needed.store(true, Relaxed);
+                            tracing::info!("gemini: callee speech onset — greeting suppressed");
+                        }
                         let msg = build_realtime_input(&pcm);
                         if transport.send_text(msg).await.is_err() {
                             return SessionEnd::Resumable("send audio failed".into());
@@ -255,12 +275,21 @@ pub(crate) async fn run_session<T: Transport>(
                                 ServerEvent::SetupComplete => { *setup_ok = true; }
                                 ServerEvent::OutputAudio(pcm) =>
                                     { had_activity = true; let _ = events.send(Event::OutputAudio(pcm)).await; }
-                                ServerEvent::Transcript { role, text, final_ } =>
-                                    { had_activity = true; let _ = events.send(Event::Transcript { role, text, final_ }).await; }
+                                ServerEvent::Transcript { role, text, final_ } => {
+                                    had_activity = true;
+                                    // Belt-and-suspenders: an ASR user turn is a
+                                    // callee-active signal even if energy VAD
+                                    // missed a from-frame-one speech onset.
+                                    if role == Role::User {
+                                        callee_active.store(true, Relaxed);
+                                        resume_needed.store(true, Relaxed);
+                                    }
+                                    let _ = events.send(Event::Transcript { role, text, final_ }).await;
+                                }
                                 ServerEvent::Interrupted =>
                                     { had_activity = true; let _ = events.send(Event::Interrupted).await; }
                                 ServerEvent::TurnComplete =>
-                                    { had_activity = true; let _ = events.send(Event::TurnComplete).await; }
+                                    { had_activity = true; resume_needed.store(false, Relaxed); let _ = events.send(Event::TurnComplete).await; }
                                 ServerEvent::ResumptionHandle(h) => { *latest_handle = Some(h); }
                                 ServerEvent::GoAway => return SessionEnd::Resumable("goAway".into()),
                                 ServerEvent::ToolCallEndCall { call_id, goal } => {
@@ -434,6 +463,16 @@ pub async fn start(
         let mut transcript: Vec<TranscriptEntry> = Vec::new();
         let clock = tokio::time::Instant::now();
 
+        // Shared across every reconnect attempt of THIS call: whether the
+        // callee has spoken, whether we already greeted, and whether the model
+        // owes a reply. Each `run_session` gets a clone; the flags outlive
+        // individual attempts so a reconnect never re-greets.
+        let callee_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let greeted_ever = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let resume_needed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // false on the first attempt, true on every subsequent loop iteration.
+        let mut is_reconnect = false;
+
         loop {
             if hangup_rx.try_recv().is_ok() {
                 return CallOutcome { ended_by: EndedBy::CallerHangup, goal: None, transcript };
@@ -500,6 +539,8 @@ pub async fn start(
                             transport, &server, &scenario, handle.clone(),
                             &mut audio_rx, &tap_tx, &mut latest, &mut setup_ok,
                             answered.clone(),
+                            callee_active.clone(), greeted_ever.clone(), resume_needed.clone(),
+                            is_reconnect,
                         ) => Some(e),
                         _ = hangup_rx.recv() => None,
                     };
@@ -538,6 +579,9 @@ pub async fn start(
                     if rstate.on_failure() { handle = None; }
                 }
             }
+
+            // Any further loop iteration is a reconnect: never re-greet.
+            is_reconnect = true;
 
             tokio::select! {
                 _ = tokio::time::sleep(backoff.next_delay()) => {}
@@ -660,6 +704,10 @@ mod tests {
         let (_answered_tx, answered_rx) = tokio::sync::watch::channel(true);
         let end = run_session(
             transport, &server(), &scenario(), None, &mut arx, &etx, &mut None, &mut setup_ok, answered_rx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            false,
         ).await;
 
         // The server acknowledged setup, so this attempt made real progress.
@@ -698,6 +746,10 @@ mod tests {
         let end = run_session(
             transport, &server(), &scenario(), None, &mut arx, &etx, &mut latest_handle, &mut setup_ok,
             answered_rx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            false,
         ).await;
         // No more frames after the update -> remote close.
         assert!(matches!(end, SessionEnd::RemoteClose));
@@ -736,6 +788,10 @@ mod tests {
             run_session(
                 transport, &srv, &scenario(), None, &mut arx, &etx, &mut None,
                 &mut setup_ok, answered_rx,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                false,
             ).await
         });
 
@@ -775,6 +831,10 @@ mod tests {
             run_session(
                 transport, &srv_clone, &scenario(), None, &mut arx, &etx, &mut None,
                 &mut setup_ok, answered_rx,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                false,
             ).await
         });
 
@@ -796,6 +856,58 @@ mod tests {
         run.abort();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn greeting_suppressed_when_callee_speaks() {
+        // answered flips true at t0, but the callee starts talking BEFORE the
+        // greet delay elapses: energy VAD trips `callee_active`, so the greet
+        // timer's guard goes false and no GREET_CUE is ever sent.
+        let mut srv = server();
+        srv.greet_after_silence_ms = 50;
+        let incoming = std::collections::VecDeque::new();
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = FakeTransport { incoming, sent: sent.clone(), pending_when_empty: true };
+        let (atx, mut arx) = mpsc::channel::<Vec<i16>>(16);
+        let (etx, mut _erx) = mpsc::channel::<Event>(64);
+        let mut setup_ok = false;
+        let (answered_tx, answered_rx) = tokio::sync::watch::channel(false);
+
+        let srv_clone = srv.clone();
+        let run = tokio::spawn(async move {
+            run_session(
+                transport, &srv_clone, &scenario(), None, &mut arx, &etx, &mut None,
+                &mut setup_ok, answered_rx,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                false,
+            ).await
+        });
+
+        // Let the spawned task register its waits, then answer the call.
+        tokio::task::yield_now().await;
+        answered_tx.send(true).unwrap();
+
+        // Feed callee audio BEFORE advancing past the greet delay. The VAD
+        // seeds its floor from the FIRST frame, so send quiet frames first to
+        // establish a low baseline, then a loud burst (amplitude ~6000) long
+        // enough to confirm onset (onset_frames = 3). These frames are queued
+        // in the channel and drained before the paused clock auto-advances to
+        // the greet deadline, so `callee_active` is set in time to gate it.
+        for _ in 0..2 { atx.send(vec![0i16; 320]).await.unwrap(); }
+        for _ in 0..6 { atx.send(vec![6000i16; 320]).await.unwrap(); }
+        tokio::task::yield_now().await;
+
+        // Now advance well past the greet delay; the guard must stay false.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert!(
+            !sent.lock().unwrap().iter().any(|s| s.contains(GREET_CUE)),
+            "no GREET_CUE must be sent once the callee has spoken"
+        );
+
+        run.abort();
+    }
+
     #[tokio::test]
     async fn setup_failure_never_sets_setup_ok() {
         // send_text always succeeds on FakeTransport, so drive the "no frames
@@ -809,6 +921,10 @@ mod tests {
         let (_answered_tx, answered_rx) = tokio::sync::watch::channel(true);
         let end = run_session(
             transport, &server(), &scenario(), None, &mut arx, &etx, &mut None, &mut setup_ok, answered_rx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            false,
         ).await;
         assert!(matches!(end, SessionEnd::RemoteClose));
         assert!(!setup_ok);
