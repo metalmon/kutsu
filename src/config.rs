@@ -134,6 +134,9 @@ pub struct ServerConfig {
     pub transcript_dir: Option<PathBuf>,
     /// Directory for per-call uplink audio dumps (WAV). `None` disables it.
     pub dump_uplink_dir: Option<PathBuf>,
+    /// Directory for per-call downlink audio dumps (WAV: Gemini 24k + phone 8k).
+    /// `None` disables it.
+    pub dump_downlink_dir: Option<PathBuf>,
     /// Safety cap on a single call's duration (seconds).
     pub max_call_secs: u64,
     /// Downlink audio-quality pacing (prebuffer/resume/abort thresholds).
@@ -261,6 +264,7 @@ mod tests {
             greet_after_silence_ms: DEFAULT_GREET_AFTER_SILENCE_MS,
             transcript_dir: Some(std::path::PathBuf::from("/tmp/x")),
             dump_uplink_dir: None,
+            dump_downlink_dir: None,
             max_call_secs: 600,
             quality: QualityConfig::default(),
             retry: RetryConfig::default(),

@@ -685,6 +685,7 @@ async fn run_call(
         quality: quality.clone(),
         call_id: call_id.clone(),
         uplink_dump: server.dump_uplink_dir.clone(),
+        downlink_dump: server.dump_downlink_dir.clone(),
     };
     let mut bridge_task = tokio::spawn(bridge::run(ports));
 
@@ -845,7 +846,7 @@ mod tests {
             max_concurrent_channels: cap,
             greet_after_silence_ms: 4000,
             transcript_dir: None,
-            dump_uplink_dir: None,
+            dump_uplink_dir: None, dump_downlink_dir: None,
             max_call_secs: 600,
             quality: crate::config::QualityConfig::default(),
             retry: crate::config::RetryConfig::default(),

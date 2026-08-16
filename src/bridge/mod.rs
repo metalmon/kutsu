@@ -85,6 +85,9 @@ pub struct BridgePorts {
     pub call_id: String,
     /// If set, directory to write per-call uplink WAV dumps into.
     pub uplink_dump: Option<std::path::PathBuf>,
+    /// If set, directory to write per-call downlink WAV dumps into
+    /// (`<call>-downlink-24k.wav` from Gemini + `<call>-downlink-8k.wav` to phone).
+    pub downlink_dump: Option<std::path::PathBuf>,
 }
 
 /// Why the bridge stopped.
@@ -111,11 +114,15 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
         quality,
         call_id,
         uplink_dump,
+        downlink_dump,
     } = ports;
 
     // Uplink: transparent, continuous, never-manipulated forward (spec §2).
     // Separate task so its backpressure `await` can never stall the downlink.
     let uplink_quality = quality.clone();
+    // `call_id` is moved into the uplink `async move` below; keep a copy for
+    // the downlink dump filenames on this task.
+    let call_id_dl = call_id.clone();
     let uplink = tokio::spawn(async move {
         let mut dump8 = uplink_dump.as_ref().and_then(|dir| {
             let path = dir.join(format!("{call_id}-uplink-8k.wav"));
@@ -164,6 +171,24 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
     let mut last_audio: Option<tokio::time::Instant> = None;
     let mut max_gap_ms = 0u64;
 
+    // Optional downlink dump: `-downlink-24k.wav` is the raw model audio from
+    // Gemini (pre-resample); `-downlink-8k.wav` is what we send to the phone
+    // (post-resample). Both live on this task, so they finalize on loop exit.
+    let open_dl = |suffix: &str, rate: u32| {
+        downlink_dump.as_ref().and_then(|dir| {
+            let path = dir.join(format!("{call_id_dl}-downlink-{suffix}.wav"));
+            match crate::audio_file::Pcm16Writer::create(&path, rate) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to open downlink dump");
+                    None
+                }
+            }
+        })
+    };
+    let mut dl_dump24 = open_dl("24k", 24000);
+    let mut dl_dump8 = open_dl("8k", 8000);
+
     // Every loop exit goes through `break` so a single `uplink.abort()` below
     // covers every path -- dropping a JoinHandle detaches it (leak) instead of
     // cancelling it, so we must abort explicitly rather than just `return`.
@@ -184,6 +209,7 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
                         }
                     }
                     last_audio = Some(now);
+                    if let Some(w) = dl_dump24.as_mut() { let _ = w.write(&pcm24); }
                     downlink.push(&pcm24);
                 }
                 Some(Event::Interrupted) => {
@@ -207,6 +233,7 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
             },
             _ = ticker.tick() => {
                 let pcm8 = downlink.next_frame();
+                if let Some(w) = dl_dump8.as_mut() { let _ = w.write(&pcm8); }
                 let payload = g711::encode(codec, &pcm8);
                 quality.underruns.store(downlink.underruns(), Ordering::Relaxed);
                 quality.starved_ms.store(downlink.starved_ms(), Ordering::Relaxed);
@@ -220,6 +247,8 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
     // Harmless no-op if the uplink task already finished (the `&mut uplink`
     // branch above); required to stop it on the other two exit paths.
     uplink.abort();
+    if let Some(w) = dl_dump24.take() { let _ = w.finalize(); }
+    if let Some(w) = dl_dump8.take() { let _ = w.finalize(); }
     end
 }
 
@@ -268,7 +297,7 @@ mod tests {
                 resume_ms: 60,
                 quality: QualityShared::new(),
                 call_id: "c1".to_string(),
-                uplink_dump: None,
+                uplink_dump: None, downlink_dump: None,
             },
             Ends { phone_in_tx, phone_out_rx, gemini_in_rx, gemini_events_tx, events_out_rx },
         )
@@ -438,6 +467,36 @@ mod tests {
         assert!(sixteen.exists(), "16k dump missing");
         assert!(!crate::audio_file::read_pcm16(&eight, 8000).unwrap().is_empty());
         assert!(!crate::audio_file::read_pcm16(&sixteen, 16000).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn downlink_dump_writes_both_wavs() {
+        let dir = std::env::temp_dir().join(format!("kutsu-downlink-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (mut ports, ends) = wire(G711Kind::Ulaw);
+        ports.call_id = "d1".to_string();
+        ports.downlink_dump = Some(dir.clone());
+        let h = tokio::spawn(run(ports));
+
+        // Model audio (24k) -> the 24k dump; the 20ms pacer ticks -> the 8k dump.
+        for _ in 0..3 {
+            ends.gemini_events_tx.send(Event::OutputAudio(vec![1000i16; 480 * 4])).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await; // let several ticks fire
+        // Close the gemini side; the bridge returns `GeminiClosed` and finalizes
+        // both writers on the way out. Keep the rest of `ends` alive so phone_out
+        // sends keep succeeding.
+        drop(ends.gemini_events_tx);
+        let _ = h.await;
+
+        let k24 = dir.join("d1-downlink-24k.wav");
+        let k8 = dir.join("d1-downlink-8k.wav");
+        assert!(k24.exists(), "24k downlink dump missing");
+        assert!(k8.exists(), "8k downlink dump missing");
+        assert!(!crate::audio_file::read_pcm16(&k24, 24000).unwrap().is_empty());
+        assert!(!crate::audio_file::read_pcm16(&k8, 8000).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
