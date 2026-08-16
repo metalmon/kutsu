@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use crate::config::{Gender, Model, ScenarioConfig, ServerConfig};
 
 const HALF_MODEL: &str = "gemini-3.1-flash-live-preview";
-const NATIVE_MODEL: &str = "gemini-2.5-flash-native-audio-preview-12-2025";
+const NATIVE_MODEL: &str = "gemini-2.5-flash-native-audio-latest";
 
 fn model_name(m: Model) -> &'static str {
     match m {
@@ -82,8 +82,13 @@ pub fn build_setup(server: &ServerConfig, scenario: &ScenarioConfig, resume_hand
     });
 
     if native {
-        setup["enableAffectiveDialog"] = json!(true);
-        setup["proactivity"] = json!({ "proactiveAudio": true });
+        // native-audio: reasoning off (lower latency; the prototype ships this).
+        setup["generationConfig"]["thinkingConfig"] = json!({ "thinkingBudget": 0 });
+        // NOTE: `enableAffectiveDialog` / `proactivity` are v1alpha niceties the
+        // Python genai SDK serializes for a different wire shape; the raw JSON
+        // setup rejects them ("Unknown name ... at 'setup'", close 1007). They
+        // are optional (the prototype gates them behind env flags), so we omit
+        // them until their correct raw-API placement is confirmed.
     }
 
     json!({ "setup": setup })
@@ -299,11 +304,15 @@ mod tests {
     fn native_audio_setup_shape() {
         let s = build_setup(&server(Model::NativeAudio), &scenario(), Some("H1"));
         let setup = &s["setup"];
-        assert_eq!(setup["model"], "models/gemini-2.5-flash-native-audio-preview-12-2025");
+        assert_eq!(setup["model"], "models/gemini-2.5-flash-native-audio-latest");
         // No languageCode on native.
         assert!(setup["generationConfig"]["speechConfig"]["languageCode"].is_null());
-        assert_eq!(setup["enableAffectiveDialog"], true);
-        assert_eq!(setup["proactivity"]["proactiveAudio"], true);
+        // v1alpha affective/proactivity fields are omitted from the raw setup
+        // (the JSON API rejects them; see build_setup note).
+        assert!(setup["enableAffectiveDialog"].is_null());
+        assert!(setup["proactivity"].is_null());
+        // Reasoning disabled on native (lower latency).
+        assert_eq!(setup["generationConfig"]["thinkingConfig"]["thinkingBudget"], 0);
         // NON_BLOCKING behavior on end_call.
         assert_eq!(setup["tools"][0]["functionDeclarations"][0]["behavior"], "NON_BLOCKING");
         // Native VAD.

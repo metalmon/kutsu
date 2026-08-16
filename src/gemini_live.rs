@@ -447,7 +447,13 @@ impl Transport for WsTransport {
                 // bytes), not text — accept both.
                 Ok(Message::Text(t)) => return Some(Ok(t.to_string())),
                 Ok(Message::Binary(b)) => return Some(Ok(String::from_utf8_lossy(&b).into_owned())),
-                Ok(Message::Close(_)) => return None,
+                Ok(Message::Close(frame)) => {
+                    match frame {
+                        Some(cf) => tracing::warn!(code = %cf.code, reason = %cf.reason, "gemini: server closed WS"),
+                        None => tracing::warn!("gemini: server closed WS (no close frame)"),
+                    }
+                    return None;
+                }
                 Ok(_) => continue, // ignore ping/pong
                 Err(e) => return Some(Err(crate::error::Error::Connect(e.to_string()))),
             }

@@ -41,7 +41,10 @@ pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
     let server = ServerConfig {
         api_key,
         proxy,
-        model: Model::HalfCascade,
+        model: match env_or("KUTSU_MODEL", "native-audio").trim().to_ascii_lowercase().as_str() {
+            "half-cascade" | "half" | "halfcascade" | "cascade" => Model::HalfCascade,
+            _ => Model::NativeAudio,
+        },
         voice: env_or("KUTSU_VOICE", "Autonoe"),
         voice_gender: Gender::parse(&env_or("KUTSU_VOICE_GENDER", "female")),
         language: env_or("KUTSU_LANGUAGE", "en-US"),
