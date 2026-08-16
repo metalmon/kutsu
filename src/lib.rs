@@ -26,6 +26,7 @@ pub mod queue;
 pub mod reconnect;
 pub mod sip;
 pub mod state;
+pub mod vad;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

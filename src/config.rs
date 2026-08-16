@@ -179,6 +179,21 @@ impl Default for RetryConfig {
     }
 }
 
+/// Energy-VAD tuning for detecting that the callee has started speaking.
+#[derive(Debug, Clone, Copy)]
+pub struct VadConfig {
+    /// Absolute RMS floor: a frame below this is never speech, even if the
+    /// adaptive noise floor has decayed toward zero. Telephone-calibrated.
+    pub min_rms: u32,
+    /// Speech = frame RMS >= max(min_rms, noise_floor * ratio).
+    pub ratio: f32,
+    /// Consecutive speech frames required to confirm onset (rejects clicks).
+    pub onset_frames: u32,
+}
+impl Default for VadConfig {
+    fn default() -> Self { Self { min_rms: 200, ratio: 3.0, onset_frames: 3 } }
+}
+
 /// Default wait before the agent greets a silent callee (see
 /// [`ServerConfig::greet_after_silence_ms`]). With warm-start the Gemini
 /// session is already connected at answer, so this is a natural conversational
