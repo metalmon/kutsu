@@ -37,6 +37,9 @@ pub struct CallQuality {
     /// Uplink audio level: RMS amplitude (0..32767, linear PCM16) of the
     /// decoded phone audio over the call. A very low value means the callee's
     /// mic/gain was quiet — a plausible ASR-quality factor independent of loss.
+    /// Approximate call-average: the uplink task is detached when the bridge is
+    /// aborted at teardown, so the last few teardown-window frames may be
+    /// excluded (negligible against a whole-call average).
     pub uplink_rms: u64,
 }
 

@@ -52,8 +52,8 @@ impl QualityShared {
     }
 
     /// Accumulate one decoded uplink PCM16 frame into the running RMS level.
-    /// Sum-of-squares in u64: max ~32768^2 per sample, so it holds ~8.6e9
-    /// samples (~12 days at 8 kHz) before overflow — far beyond any call.
+    /// Sum-of-squares in u64: max 32768^2 per sample, so `u64::MAX / 32768^2`
+    /// ≈ 1.7e10 samples (~24 days at 8 kHz) before overflow — far beyond any call.
     fn add_uplink_level(&self, pcm: &[i16]) {
         let sq: u64 = pcm.iter().map(|&s| (s as i64 * s as i64) as u64).sum();
         self.uplink_sumsq.fetch_add(sq, Ordering::Relaxed);
