@@ -87,6 +87,15 @@ Both are reconnect-only (`is_reconnect == true`); the first-open path is unchang
 - Reconnect drain: with frames pre-queued on `audio_in`, a reconnect attempt drains them (they are not forwarded to the new session) while a first open forwards normally; the reconnect path emits one `Interrupted` to the bridge.
 - Config: `DEFAULT_GREET_AFTER_SILENCE_MS == 1000`; VAD env parse; `KUTSU_RESUME_CUE` override.
 
+## Improvements over the prototype
+
+This is a port, but deliberately better than the prototype where it was rough:
+- **Pure, unit-tested core** — the VAD is a pure `Vad::observe(frame) -> bool` (adaptive floor + onset), the greeting gate and reconnect-cue decision are pure predicates. The prototype was untested async glue; here each rule is asserted independently.
+- **Adaptive + tunable, not a fixed mic-tuned constant** — the prototype's `BARGE_RMS=1400` was silently wrong for any non-local-mic source; ours self-calibrates via the noise floor and exposes the absolute floor as env, calibratable against the per-call `uplink_rms` log.
+- **i18n-safe cue** — the prototype hardcoded a Russian spoken phrase; ours is an English model-*instruction*, configurable, with an explicit language-pinning clause. Repo text stays English.
+- **Observability** — structured `tracing` on each decision (not the prototype's ad-hoc prints), so the behaviour is tunable in production: `INFO` when the proactive greeting is suppressed because the callee spoke (with the onset RMS + floor), when `RESUME_CUE` is sent (with the no-handle/resume_needed reason), and when the reconnect drain drops N stale uplink frames. These make threshold tuning and reconnect diagnosis a log read, not a guess.
+- **Explicit reconnect signal** — `is_reconnect` is passed explicitly rather than inferred from `handle == None` (which conflates a first open with an early reconnect), removing a latent ambiguity the prototype's `opened` flag papered over implicitly.
+
 ## Extension seams (out of scope now)
 
 - **Silero/ML VAD backend** (the prototype's optional `VAD_BACKEND=silero`) — energy VAD suffices for gating a greeting; a learned VAD is a later swap behind the same `callee_active` signal.
