@@ -585,7 +585,13 @@ async fn run_call(
     store.set_state(&call_id, CallState::InProgress);
 
     // 4. Connect Gemini AFTER answer (its events now have a drain waiting).
-    let session = match gemini_live::start(&server, &scenario).await {
+    // TODO(warm-start task 2): replace this pre-answered stub with the real
+    // `answered` watch wired from SIP's 200 OK, so Gemini can connect during
+    // ring without greeting before answer.
+    let session = match gemini_live::start(&server, &scenario, {
+        let (_tx, rx) = tokio::sync::watch::channel(true);
+        rx
+    }).await {
         Ok(s) => s,
         Err(e) => {
             let _ = sip_hangup.send(());
