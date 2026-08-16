@@ -7,3 +7,4 @@ kutsu.toml
 
 *.log
 uplink-dump/
+downlink-dump/

@@ -10,7 +10,7 @@ mod g711;
 mod resample;
 mod pace;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -18,6 +18,13 @@ use tokio::sync::mpsc;
 
 use crate::gemini_live::Event;
 use crate::sip::G711Kind;
+
+/// How long after the last model audio frame the downlink still counts as
+/// "active" for the end-of-call drain. Must exceed the largest normal
+/// inter-chunk gap on the Gemini path so a momentary empty buffer mid-goodbye
+/// doesn't end the drain early. Well under a second so a truly finished turn
+/// tears down promptly.
+const DOWNLINK_GRACE_MS: u64 = 600;
 
 /// Shared, lock-free call-quality counters published by the downlink loop and
 /// read by the engine (e.g. for periodic state snapshots) without blocking
@@ -31,6 +38,12 @@ pub struct QualityShared {
     /// count — snapshot derives the RMS level. Published by the uplink task.
     uplink_sumsq: AtomicU64,
     uplink_samples: AtomicU64,
+    /// True while the downlink is still delivering a turn: either the pacer
+    /// holds buffered audio, or model audio arrived within the last grace
+    /// window (so a brief inter-chunk gap doesn't read as "done"). Published
+    /// every pacer tick; the engine polls it to drain the model's closing
+    /// audio to the phone before hanging up.
+    downlink_active: AtomicBool,
 }
 
 impl QualityShared {
@@ -49,6 +62,18 @@ impl QualityShared {
             uplink_rms,
             ..Default::default()
         }
+    }
+
+    /// Publish whether the downlink is still delivering a turn (buffered audio
+    /// or recent model audio). Called every pacer tick from `run`.
+    fn set_downlink_active(&self, active: bool) {
+        self.downlink_active.store(active, Ordering::Relaxed);
+    }
+
+    /// True while the downlink is still delivering a turn. The engine polls this
+    /// on a model-initiated end to drain the goodbye before teardown.
+    pub fn downlink_active(&self) -> bool {
+        self.downlink_active.load(Ordering::Relaxed)
     }
 
     /// Accumulate one decoded uplink PCM16 frame into the running RMS level.
@@ -238,6 +263,15 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
                 quality.underruns.store(downlink.underruns(), Ordering::Relaxed);
                 quality.starved_ms.store(downlink.starved_ms(), Ordering::Relaxed);
                 quality.max_gap_ms.store(max_gap_ms, Ordering::Relaxed);
+                // "Active" = buffer non-empty OR model audio arrived within the
+                // grace window. The grace bridges inter-chunk gaps (and audio
+                // that streams in just after `end_call`) so the drain doesn't
+                // stop on a momentary empty buffer mid-goodbye.
+                let recent_audio = last_audio.is_some_and(|t| {
+                    tokio::time::Instant::now().duration_since(t)
+                        < std::time::Duration::from_millis(DOWNLINK_GRACE_MS)
+                });
+                quality.set_downlink_active(downlink.pending() || recent_audio);
                 if phone_out.send(Bytes::from(payload)).await.is_err() {
                     break BridgeEnd::PhoneClosed;
                 }

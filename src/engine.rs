@@ -751,6 +751,20 @@ async fn run_call(
     };
 
     // 8. Teardown (BYE both sides, stop the bridge, get the authoritative outcome).
+    // On a model-initiated end (goodbye + `end_call`, so `goal` is set), let the
+    // downlink pacer play the buffered goodbye out to the phone before we hang
+    // up — otherwise BYE + `bridge_task.abort()` truncate the model's last words.
+    // The bridge keeps pacing while we wait. Bounded so a buffer that never
+    // drains can't hang teardown; every other exit path tears down immediately.
+    if goal.is_some() {
+        // Cap covers a full closing turn played at real time (~5 s) plus slack;
+        // it only bites if the downlink never goes idle. Normally the wait ends
+        // the moment the goodbye finishes and the buffer drains.
+        let drain_cap = tokio::time::Instant::now() + Duration::from_secs(8);
+        while quality.downlink_active() && tokio::time::Instant::now() < drain_cap {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
     let _ = sip_hangup.send(());
     gemini_handle.hangup().await;
     bridge_task.abort();

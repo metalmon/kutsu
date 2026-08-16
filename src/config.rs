@@ -164,7 +164,7 @@ pub struct QualityConfig {
 
 impl Default for QualityConfig {
     fn default() -> Self {
-        Self { prebuffer_ms: 140, resume_ms: 60, abort_underruns: 40 }
+        Self { prebuffer_ms: 180, resume_ms: 60, abort_underruns: 40 }
     }
 }
 
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn quality_config_defaults() {
         let q = QualityConfig::default();
-        assert_eq!(q.prebuffer_ms, 140);
+        assert_eq!(q.prebuffer_ms, 180);
         assert_eq!(q.resume_ms, 60);
         assert_eq!(q.abort_underruns, 40);
     }

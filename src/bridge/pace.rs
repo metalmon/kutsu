@@ -93,6 +93,13 @@ impl Downlink {
         self.starved_ms
     }
 
+    /// True while buffered downlink audio remains to be played out. The engine
+    /// polls this to let the model's closing audio drain to the phone before
+    /// hanging up, so the goodbye isn't truncated by BYE + bridge teardown.
+    pub fn pending(&self) -> bool {
+        !self.buf.is_empty()
+    }
+
     /// Produce one 20 ms frame (160 samples @ 8 kHz).
     pub fn next_frame(&mut self) -> Vec<i16> {
         if !self.playing {
@@ -132,6 +139,16 @@ impl Downlink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_reflects_buffered_audio() {
+        let mut d = Downlink::new(0, 0);
+        assert!(!d.pending(), "empty buffer is not pending");
+        d.push(&[8000i16; 480]); // one 20 ms block
+        assert!(d.pending(), "buffered audio is pending");
+        let _ = d.next_frame(); // plays out the whole block
+        assert!(!d.pending(), "drained buffer is not pending");
+    }
 
     #[test]
     fn underrun_yields_silence_frame() {

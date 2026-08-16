@@ -56,7 +56,7 @@ pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
         dump_downlink_dir: non_empty("KUTSU_DUMP_DOWNLINK_DIR").map(std::path::PathBuf::from),
         max_call_secs: 600,
         quality: QualityConfig {
-            prebuffer_ms: env_u32("KUTSU_QUALITY_PREBUFFER_MS", 140),
+            prebuffer_ms: env_u32("KUTSU_QUALITY_PREBUFFER_MS", 180),
             resume_ms: env_u32("KUTSU_QUALITY_RESUME_MS", 60),
             abort_underruns: env_u32("KUTSU_QUALITY_ABORT_UNDERRUNS", 40),
         },
