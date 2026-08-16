@@ -16,7 +16,8 @@
 - kutsu builds/tests only with `cargo test --lib --features vendor-openssl`; integration compiles with `cargo build --tests --features "vendor-openssl live-tests"`.
 - The crate builds and tests standalone (`cargo test` in `crates/gemini-live`).
 - No behavior regression: greeting suppression on callee speech, reconnect-safe no-re-greet, `RESUME_CUE` on lost-context reconnect, the goodbye drain, and byte-transparent uplink audio all still hold. All 133 current kutsu lib tests stay green (adapted to the new API, not deleted).
-- Wire contract is authoritative from the spec's "Wire contract" section and [[voice-cloud-reference]]: snake_case top-level oneof keys, camelCase inner; binary server frames; model `-latest` on native (v1alpha) / `gemini-3.1-flash-live-preview` (v1beta); `enableAffectiveDialog` under `generationConfig`; `proactivity` top-level; no `languageCode` on native; `thinkingBudget=0` on native.
+- **The wire layer (`build_setup`, `parse_server_message`, affective handling) MIRRORS the google-genai SDK converters as the source of truth** — `_live_converters.py` (the MLDev / Gemini Developer API path, not Vertex) and `types.py`. kutsu's `src/proto.rs` is only a cross-check (it was hand-derived and fixed against the SDK; where they disagree, the SDK wins). Do not re-derive the wire format; encode the SDK's exact `to_object`/`from_object` field paths, casing, and part filtering (e.g. `thought` parts). The crate's own *types* (SetupConfig/ServerEvent) may be ergonomic Rust APIs; only the wire serialization/parsing must match the SDK byte-for-byte.
+- Wire contract quick-reference (all derived from the SDK, see spec "Wire contract"): snake_case top-level oneof keys, camelCase inner; binary server frames; model `-latest` on native (v1alpha) / `gemini-3.1-flash-live-preview` (v1beta); `enableAffectiveDialog` under `generationConfig`; `proactivity` top-level; no `languageCode` on native; `thinkingBudget=0` on native.
 - Affective dialog is **on** in the crate, paired with the token-stripping parser. Never leak `<ctrl95>` frames into `Transcript` text or `OutputAudio`.
 - English cue/prompt text stays in kutsu (prompt assembly is not part of the crate).
 
@@ -67,15 +68,17 @@
 **Interfaces:**
 - Produces: `pub fn parse_server_message(bytes: &[u8]) -> Result<Vec<ServerEvent>>` (accepts binary JSON).
 
-- [ ] **Step 1:** Port `parse_server_message` from `src/proto.rs` (setupComplete, modelTurn audio/text, input/outputTranscription → Transcript, interrupted, turnComplete, toolCall → ToolCall, sessionResumptionUpdate → ResumptionHandle, goAway). Accept `&[u8]` and decode as UTF-8 JSON.
+- [ ] **Step 1:** Mirror the SDK's `_LiveServerMessage_from_mldev` converter (`_live_converters.py`) as the authority — including how it walks `serverContent.modelTurn.parts` and the `thought`/`thought_signature` part flags (thought parts are internal annotations, NOT content — exclude them, which is how the SDK's output stays clean of affective/annotation tokens). Handle setupComplete, modelTurn audio (`inlineData`) + non-thought text, input/outputTranscription → Transcript, interrupted, turnComplete, toolCall → ToolCall, sessionResumptionUpdate → ResumptionHandle, goAway. Cross-check against `src/proto.rs` (where they disagree, the SDK wins). Accept `&[u8]`, decode UTF-8 JSON.
 - [ ] **Step 2:** Port the existing proto parse tests; assert binary-bytes input parses identically to the string form.
 - [ ] **Step 3:** `cargo test` in crate — green.
 
-### Task 5: `wire` — affective `<ctrl95>` token parser
+### Task 5: `wire` — affective handling (verify, not reverse-engineer)
 
-**Files:** Modify crate `src/wire.rs` (part 3).
+**Files:** Modify crate `src/wire.rs` (part 3) if needed.
 
-**PRE-STEP (capture, human-run):** With `enableAffectiveDialog` on, capture a raw server frame carrying affective tokens by running a live call with the transport close/frame debug log and saving one frame. Record the exact framing (delimiter bytes around `emotion_user`/`emotion_model` and the label) in this task's brief before writing the parser. Do not guess the byte format.
+**Premise:** The prototype runs `enableAffectiveDialog` ON through the SDK and does NOT parse any tokens, with no leakage — because the SDK excludes internal `thought` parts from content (handled in Task 4). So Task 4's SDK-faithful parse should already keep the output clean with affective on; there is likely NOTHING bespoke to do here. This task VERIFIES that, and only adds handling if a real residual remains.
+
+**Verify-step (human-run, only if needed):** If, after Task 4, a live call with `enableAffectiveDialog` on still leaks `<ctrl95>`/`emotion_*` tokens into a `Transcript`, capture one raw server frame (transport debug log) to see which field/part actually carries them, and extend the parser to mirror how the SDK drops them. Do not reverse-engineer speculatively; only if the SDK-faithful port proves insufficient.
 
 - [ ] **Step 1:** Test (using the captured frame shape): a model-turn text containing the affective frame parses into a clean `Transcript` (tokens removed) plus one or more `Affect { role, label }` events. A frame with no affective tokens is unchanged.
 - [ ] **Step 2:** Implement the stripper in `parse_server_message`: detect the `<ctrl95>`-framed `emotion_user`/`emotion_model` annotations, emit `Affect`, and pass the cleaned text to `Transcript`. Never emit the raw tokens.
