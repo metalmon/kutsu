@@ -73,7 +73,9 @@ pub fn build_setup(server: &ServerConfig, scenario: &ScenarioConfig, resume_hand
             "temperature": 0.8,
             "speechConfig": speech
         },
-        "systemInstruction": { "parts": [ { "text": build_system_prompt(scenario, server.voice_gender) } ] },
+        "systemInstruction": { "parts": [ { "text":
+            build_system_prompt(scenario, server.voice_gender) + &language_instruction(&server.language)
+        } ] },
         "tools": [ { "functionDeclarations": [ end_call ] } ],
         "realtimeInputConfig": { "automaticActivityDetection": aad },
         "sessionResumption": { "handle": resume_handle },
@@ -82,13 +84,15 @@ pub fn build_setup(server: &ServerConfig, scenario: &ScenarioConfig, resume_hand
     });
 
     if native {
-        // native-audio: reasoning off (lower latency; the prototype ships this).
+        // native-audio v1alpha extras — the prototype ships all three ON.
+        // Wire placement per the google-genai live converter
+        // (`_live_converters.py`): `thinkingConfig` and `enableAffectiveDialog`
+        // nest under `generationConfig`; `proactivity` is a top-level `setup`
+        // field. Putting `enableAffectiveDialog` directly under `setup` is what
+        // triggered close 1007 ("Unknown name enableAffectiveDialog at 'setup'").
         setup["generationConfig"]["thinkingConfig"] = json!({ "thinkingBudget": 0 });
-        // NOTE: `enableAffectiveDialog` / `proactivity` are v1alpha niceties the
-        // Python genai SDK serializes for a different wire shape; the raw JSON
-        // setup rejects them ("Unknown name ... at 'setup'", close 1007). They
-        // are optional (the prototype gates them behind env flags), so we omit
-        // them until their correct raw-API placement is confirmed.
+        setup["generationConfig"]["enableAffectiveDialog"] = json!(true);
+        setup["proactivity"] = json!({ "proactiveAudio": true });
     }
 
     json!({ "setup": setup })
@@ -124,6 +128,21 @@ fn gender_instruction(gender: Gender) -> &'static str {
              Never use feminine self-reference.",
         Gender::Neutral => "",
     }
+}
+
+/// Pin the spoken language via the system prompt. Essential on native-audio,
+/// which ignores the structured `languageCode` and otherwise picks a language
+/// on its own (it drifts to English from an English scaffold). Harmless on
+/// half-cascade, where it just reinforces the `languageCode`. Keeps
+/// `KUTSU_LANGUAGE` authoritative on every model. `language` is a BCP-47 tag
+/// (e.g. `ru-RU`), which the model understands directly.
+fn language_instruction(language: &str) -> String {
+    format!(
+        "\n\n# Language\nSpeak ONLY in the language with BCP-47 code `{language}`, always — \
+         from the very first word and in every single reply. You may understand the other party \
+         when they use another language, but you MUST always answer in `{language}`, pronouncing \
+         it cleanly and naturally like a native speaker, with no foreign accent."
+    )
 }
 
 /// Assemble the system instruction: per-call scenario (prompt + optional
@@ -307,10 +326,12 @@ mod tests {
         assert_eq!(setup["model"], "models/gemini-2.5-flash-native-audio-latest");
         // No languageCode on native.
         assert!(setup["generationConfig"]["speechConfig"]["languageCode"].is_null());
-        // v1alpha affective/proactivity fields are omitted from the raw setup
-        // (the JSON API rejects them; see build_setup note).
+        // v1alpha extras: affective nests under generationConfig, proactivity is
+        // top-level (paths per the google-genai live converter). enableAffectiveDialog
+        // must NOT be at setup top-level (that caused close 1007).
         assert!(setup["enableAffectiveDialog"].is_null());
-        assert!(setup["proactivity"].is_null());
+        assert_eq!(setup["generationConfig"]["enableAffectiveDialog"], true);
+        assert_eq!(setup["proactivity"]["proactiveAudio"], true);
         // Reasoning disabled on native (lower latency).
         assert_eq!(setup["generationConfig"]["thinkingConfig"]["thinkingBudget"], 0);
         // NON_BLOCKING behavior on end_call.
@@ -322,6 +343,16 @@ mod tests {
         assert_eq!(aad["silenceDurationMs"], 100);
         // Resumption handle carried.
         assert_eq!(setup["sessionResumption"]["handle"], "H1");
+    }
+
+    #[test]
+    fn setup_pins_language_in_system_instruction() {
+        // native-audio ignores the structured languageCode, so the language must
+        // be pinned in the prompt (from server.language) or the model drifts.
+        let s = build_setup(&server(Model::NativeAudio), &scenario(), None);
+        let sys = s["setup"]["systemInstruction"]["parts"][0]["text"].as_str().unwrap();
+        assert!(sys.contains("# Language"), "system instruction must carry a language section");
+        assert!(sys.contains("en-US"), "language directive must pin server.language (en-US here)");
     }
 }
 
