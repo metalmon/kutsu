@@ -236,7 +236,11 @@ async fn run_live(
     }
 
     // 3. Start session.
-    let mut session = kutsu::gemini_live::start(&server, &scenario).await?;
+    // Pre-answered stub: this CLI path has no ring/answer signal of its own.
+    let mut session = kutsu::gemini_live::start(&server, &scenario, {
+        let (_tx, rx) = tokio::sync::watch::channel(true);
+        rx
+    }).await?;
 
     // 4. Feed audio (32 ms frames at real-time pace) in a task.
     let samples = kutsu::audio_file::read_pcm16(&audio_in, 16000)?;

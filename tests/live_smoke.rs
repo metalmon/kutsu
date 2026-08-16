@@ -46,7 +46,11 @@ async fn short_live_session_returns_audio_and_ends() {
     assert!(matches!(kutsu::net_check::verdict(&health, &server.net_check),
                      kutsu::net_check::Verdict::Ok), "network: {}", health.summary());
 
-    let mut session = kutsu::gemini_live::start(&server, &scenario).await.expect("start");
+    // Pre-answered stub: this smoke test has no ring/answer signal of its own.
+    let mut session = kutsu::gemini_live::start(&server, &scenario, {
+        let (_tx, rx) = tokio::sync::watch::channel(true);
+        rx
+    }).await.expect("start");
     // Send ~1s of silence to trigger a turn.
     let silence = vec![0i16; 512];
     for _ in 0..30 { let _ = session.audio_in.send(silence.clone()).await; tokio::time::sleep(std::time::Duration::from_millis(32)).await; }

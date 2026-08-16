@@ -156,6 +156,7 @@ pub(crate) async fn run_session<T: Transport>(
     events: &mpsc::Sender<Event>,
     latest_handle: &mut Option<String>,
     setup_ok: &mut bool,
+    mut answered: tokio::sync::watch::Receiver<bool>,
 ) -> SessionEnd {
     // 1. Setup.
     let setup = proto::build_setup(server, scenario, resume_handle.as_deref());
@@ -168,15 +169,49 @@ pub(crate) async fn run_session<T: Transport>(
     // within `greet_after_silence_ms`, prompt the model to greet first. A value
     // of 0 disables the proactive greeting (purely reactive).
     let greet_enabled = server.greet_after_silence_ms > 0;
-    let greet_at =
-        tokio::time::Instant::now() + std::time::Duration::from_millis(server.greet_after_silence_ms);
     let mut greeted = resume_handle.is_some() || !greet_enabled; // never greet on resume or when disabled
     let mut had_activity = false;
+
+    // Greeting arms only after `answered` — never during ring. `greet_armed`
+    // gates the timer; `greet_deadline` is meaningless until armed.
+    let mut greet_armed = *answered.borrow(); // already answered (e.g. reconnect path) -> arm now
+    let mut greet_deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(server.greet_after_silence_ms);
+    if !greet_armed {
+        // Belt-and-suspenders: the `greet_armed` guard on the select arm below
+        // is what actually keeps this timer inert; this far-future placeholder
+        // just avoids leaving `greet_deadline` at a meaningless "now" value
+        // before it is armed.
+        greet_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(86_400);
+    }
+
+    // `watch::Receiver::changed()` resolves `Ready(Err(_))` immediately (not
+    // pending) once the sender is dropped, and keeps doing so on every
+    // subsequent call. If the arming arm below stayed enabled after that, the
+    // select loop would busy-spin polling it forever. `answered_closed` latches
+    // that outcome so the arm's guard turns permanently false the moment the
+    // sender goes away without ever having sent `true`.
+    let mut answered_closed = false;
 
     let mut audio_frames_sent: u64 = 0;
     loop {
         tokio::select! {
-            _ = tokio::time::sleep_until(greet_at), if !greeted && !had_activity => {
+            // Arm the greeting the moment the call is answered (once). Once
+            // `greet_armed`/`greeted` is true, or the `answered` sender has
+            // been dropped without ever answering, this arm's guard is false
+            // forever, so it can't busy-loop.
+            changed = answered.changed(), if !greet_armed && !greeted && !answered_closed => {
+                match changed {
+                    Ok(()) if *answered.borrow() => {
+                        greet_armed = true;
+                        greet_deadline = tokio::time::Instant::now()
+                            + std::time::Duration::from_millis(server.greet_after_silence_ms);
+                    }
+                    Ok(()) => {} // changed but still false (shouldn't happen for a bool that only goes false->true, but harmless)
+                    Err(_) => { answered_closed = true; } // sender dropped without answering: never greet
+                }
+            }
+            _ = tokio::time::sleep_until(greet_deadline), if greet_armed && !greeted && !had_activity => {
                 greeted = true;
                 tracing::info!("gemini: callee silent — sending greeting kickoff");
                 if transport.send_text(build_client_content(GREET_CUE)).await.is_err() {
@@ -379,7 +414,11 @@ impl Transport for WsTransport {
 /// that keeps closing the socket before anything useful happens still ramps
 /// backoff and eventually drops a possibly-stale handle instead of retrying
 /// at the 300ms base delay forever.
-pub async fn start(server: &ServerConfig, scenario: &ScenarioConfig) -> Result<Session> {
+pub async fn start(
+    server: &ServerConfig,
+    scenario: &ScenarioConfig,
+    answered: tokio::sync::watch::Receiver<bool>,
+) -> Result<Session> {
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<i16>>(64);
     let (event_tx, event_rx) = mpsc::channel::<Event>(256);
     let (hangup_tx, mut hangup_rx) = mpsc::channel::<()>(1);
@@ -460,6 +499,7 @@ pub async fn start(server: &ServerConfig, scenario: &ScenarioConfig) -> Result<S
                         e = run_session(
                             transport, &server, &scenario, handle.clone(),
                             &mut audio_rx, &tap_tx, &mut latest, &mut setup_ok,
+                            answered.clone(),
                         ) => Some(e),
                         _ = hangup_rx.recv() => None,
                     };
@@ -520,6 +560,12 @@ mod tests {
     struct FakeTransport {
         incoming: std::collections::VecDeque<String>,
         pub sent: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        /// When the queue is drained: `false` (default) mirrors a closed
+        /// connection (`recv()` returns `None`, as all the pre-existing tests
+        /// expect); `true` mirrors a live connection with nothing new yet
+        /// (`recv()` pends forever), needed by the greet-timer gate tests so
+        /// the session doesn't end via `RemoteClose` before the timer fires.
+        pending_when_empty: bool,
     }
 
     impl Transport for FakeTransport {
@@ -528,7 +574,11 @@ mod tests {
             Ok(())
         }
         async fn recv(&mut self) -> Option<Result<String>> {
-            self.incoming.pop_front().map(Ok)
+            match self.incoming.pop_front() {
+                Some(s) => Some(Ok(s)),
+                None if self.pending_when_empty => std::future::pending().await,
+                None => None,
+            }
         }
     }
 
@@ -600,13 +650,16 @@ mod tests {
             r#"{"toolCall":{"functionCalls":[{"id":"c1","name":"end_call","args":{"disposition":"done"}}]}}"#.to_string(),
         ]);
         let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let transport = FakeTransport { incoming, sent: sent.clone() };
+        let transport = FakeTransport { incoming, sent: sent.clone(), pending_when_empty: false };
 
         let (_atx, mut arx) = mpsc::channel::<Vec<i16>>(8);
         let (etx, mut erx) = mpsc::channel::<Event>(64);
 
         let mut setup_ok = false;
-        let end = run_session(transport, &server(), &scenario(), None, &mut arx, &etx, &mut None, &mut setup_ok).await;
+        let (_answered_tx, answered_rx) = tokio::sync::watch::channel(true);
+        let end = run_session(
+            transport, &server(), &scenario(), None, &mut arx, &etx, &mut None, &mut setup_ok, answered_rx,
+        ).await;
 
         // The server acknowledged setup, so this attempt made real progress.
         assert!(setup_ok);
@@ -635,13 +688,15 @@ mod tests {
             r#"{"sessionResumptionUpdate":{"newHandle":"H9","resumable":true}}"#.to_string(),
         ]);
         let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let transport = FakeTransport { incoming, sent };
+        let transport = FakeTransport { incoming, sent, pending_when_empty: false };
         let (_atx, mut arx) = mpsc::channel::<Vec<i16>>(8);
         let (etx, mut _erx) = mpsc::channel::<Event>(64);
         let mut latest_handle = None;
         let mut setup_ok = false;
+        let (_answered_tx, answered_rx) = tokio::sync::watch::channel(true);
         let end = run_session(
             transport, &server(), &scenario(), None, &mut arx, &etx, &mut latest_handle, &mut setup_ok,
+            answered_rx,
         ).await;
         // No more frames after the update -> remote close.
         assert!(matches!(end, SessionEnd::RemoteClose));
@@ -654,18 +709,105 @@ mod tests {
         assert!(!setup_ok);
     }
 
+    // --- answered gate: the greeting must never fire before the call is
+    // answered. `answered` is a level-triggered watch<bool>, so a session that
+    // starts before answer (warm-start) must wait for it to flip true before
+    // arming the greet timer at all.
+
+    #[tokio::test(start_paused = true)]
+    async fn no_greeting_before_answered() {
+        // greet_after_silence_ms small; answered stays false the whole time.
+        let mut srv = server();
+        srv.greet_after_silence_ms = 50;
+        let incoming = std::collections::VecDeque::new();
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // pending_when_empty: this fixture models a live connection where the
+        // callee just never talks, not one that closes — otherwise the
+        // session would end via RemoteClose before the greet timer could
+        // ever fire, and the test would pass for the wrong reason.
+        let transport = FakeTransport { incoming, sent: sent.clone(), pending_when_empty: true };
+        let (_atx, mut arx) = mpsc::channel::<Vec<i16>>(8);
+        let (etx, mut _erx) = mpsc::channel::<Event>(64);
+        let mut setup_ok = false;
+        let (_answered_tx, answered_rx) = tokio::sync::watch::channel(false);
+
+        let run = tokio::spawn(async move {
+            run_session(
+                transport, &srv, &scenario(), None, &mut arx, &etx, &mut None,
+                &mut setup_ok, answered_rx,
+            ).await
+        });
+
+        // Let the spawned task register its (disarmed) wait, then sleep well
+        // past the greet delay; the callee stays silent and `answered` never
+        // flips, so no greeting must be sent. `sleep().await` under a paused
+        // clock auto-advances to unblock itself once every other task is
+        // stalled, which reliably drives the spawned task forward (a bare
+        // `tokio::time::advance()` from the driving task does not).
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+
+        assert!(
+            !sent.lock().unwrap().iter().any(|s| s.contains(GREET_CUE)),
+            "no GREET_CUE must be sent while answered is false"
+        );
+
+        run.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn greets_after_answered_when_callee_silent() {
+        // answered flips true at t0; no model output arrives; after
+        // greet_after_silence_ms, expect exactly one GREET_CUE message.
+        let mut srv = server();
+        srv.greet_after_silence_ms = 50;
+        let incoming = std::collections::VecDeque::new();
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = FakeTransport { incoming, sent: sent.clone(), pending_when_empty: true };
+        let (_atx, mut arx) = mpsc::channel::<Vec<i16>>(8);
+        let (etx, mut _erx) = mpsc::channel::<Event>(64);
+        let mut setup_ok = false;
+        let (answered_tx, answered_rx) = tokio::sync::watch::channel(false);
+
+        let srv_clone = srv.clone();
+        let run = tokio::spawn(async move {
+            run_session(
+                transport, &srv_clone, &scenario(), None, &mut arx, &etx, &mut None,
+                &mut setup_ok, answered_rx,
+            ).await
+        });
+
+        // Let the spawned task reach its first await point (registering the
+        // `answered.changed()` wait) before we flip the signal.
+        tokio::task::yield_now().await;
+        answered_tx.send(true).unwrap();
+        // `sleep().await` under a paused clock auto-advances time to unblock
+        // itself once every other task is stalled — this drives the spawned
+        // task's `changed()` wakeup and its subsequently-armed greet timer,
+        // unlike a bare `tokio::time::advance()` call from the driving task
+        // (which does not reliably re-poll a sibling spawned task's freshly
+        // registered timer in this harness).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let greet_count = sent.lock().unwrap().iter().filter(|s| s.contains(GREET_CUE)).count();
+        assert_eq!(greet_count, 1, "exactly one GREET_CUE must be sent after answered");
+
+        run.abort();
+    }
+
     #[tokio::test]
     async fn setup_failure_never_sets_setup_ok() {
         // send_text always succeeds on FakeTransport, so drive the "no frames
         // at all" case: the connection drops before even setupComplete.
         let incoming = std::collections::VecDeque::new();
         let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let transport = FakeTransport { incoming, sent };
+        let transport = FakeTransport { incoming, sent, pending_when_empty: false };
         let (_atx, mut arx) = mpsc::channel::<Vec<i16>>(8);
         let (etx, mut _erx) = mpsc::channel::<Event>(64);
         let mut setup_ok = false;
+        let (_answered_tx, answered_rx) = tokio::sync::watch::channel(true);
         let end = run_session(
-            transport, &server(), &scenario(), None, &mut arx, &etx, &mut None, &mut setup_ok,
+            transport, &server(), &scenario(), None, &mut arx, &etx, &mut None, &mut setup_ok, answered_rx,
         ).await;
         assert!(matches!(end, SessionEnd::RemoteClose));
         assert!(!setup_ok);

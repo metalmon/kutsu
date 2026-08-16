@@ -179,9 +179,9 @@ impl Default for RetryConfig {
 /// Default wait before the agent greets a silent callee (see
 /// [`ServerConfig::greet_after_silence_ms`]). Tuned for OUTBOUND calls: the
 /// callee answers expecting the caller to speak, so a long silence reads as a
-/// dead line. Empirically ~4 s felt like an awkward gap after "Алло?"; ~1.5 s
-/// lets the media path settle yet greets promptly.
-pub const DEFAULT_GREET_AFTER_SILENCE_MS: u64 = 1500;
+/// dead line. Empirically ~4 s felt like an awkward gap after "Алло?"; ~0.4 s
+/// provides a quick nudge after the agent's answer.
+pub const DEFAULT_GREET_AFTER_SILENCE_MS: u64 = 400;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ScenarioConfig {
@@ -267,5 +267,10 @@ mod tests {
         };
         assert_eq!(c.max_call_secs, 600);
         assert!(c.transcript_dir.is_some());
+    }
+
+    #[test]
+    fn default_greet_delay_is_400ms() {
+        assert_eq!(DEFAULT_GREET_AFTER_SILENCE_MS, 400);
     }
 }
