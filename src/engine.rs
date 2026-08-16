@@ -767,10 +767,17 @@ async fn run_call(
     counters.starved_ms.fetch_add(q.starved_ms, Ordering::Relaxed);
     counters.uplink_received.fetch_add(q.uplink_received, Ordering::Relaxed);
     counters.uplink_lost.fetch_add(q.uplink_lost, Ordering::Relaxed);
+    // Uplink level in dBFS (0 dBFS = full-scale PCM16); -inf when silent.
+    let uplink_dbfs = if q.uplink_rms > 0 {
+        20.0 * (q.uplink_rms as f64 / 32768.0).log10()
+    } else {
+        f64::NEG_INFINITY
+    };
     tracing::info!(
         %call_id, codec = ?codec.kind,
         uplink_received = q.uplink_received, uplink_lost = q.uplink_lost,
         uplink_reordered = q.uplink_reordered,
+        uplink_rms = q.uplink_rms, uplink_dbfs = format!("{uplink_dbfs:.1}"),
         underruns = q.underruns, starved_ms = q.starved_ms, max_gap_ms = q.max_gap_ms,
         "call audio quality"
     );
