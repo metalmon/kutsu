@@ -508,6 +508,52 @@ fn bump_counter_outcome(counters: &Counters, outcome: CallOutcome) {
     };
 }
 
+/// Outcome of the ring-wait: what the SIP side did while we waited (feeding a
+/// warm Gemini session silence keepalive). Extracted so the ring loop — the
+/// only part that can't be unit-tested against a live SIP answer — is testable
+/// with a mock `SipEvent` source and a test audio sink.
+enum RingOutcome {
+    /// 200 OK: the negotiated codec to bridge with.
+    Answered(crate::sip::NegotiatedCodec),
+    /// Call ended before answer (busy/rejected/hangup); carries the reason.
+    Terminated(crate::sip::TermReason),
+    /// SIP event channel closed before any answer.
+    Closed,
+}
+
+/// Ring-wait loop: await the SIP answer while pushing 20 ms of 16 kHz silence
+/// (`vec![0i16; 320]`) into the warm Gemini session every 20 ms as keepalive,
+/// so the connection stays live through the ring window. `warm_audio` is
+/// `Some` only when a warm session exists; when `None` the silence branch is
+/// disabled and we simply await the next event (no busy-spin). The silence
+/// `interval` lives entirely inside this function, so it is dropped the moment
+/// we return — guaranteeing `audio_in` has a single writer (the bridge) once
+/// the call is up. `recv` is cancel-safe, so racing it against the tick never
+/// drops an event.
+async fn ring_wait(
+    sip_events: &mut mpsc::Receiver<SipEvent>,
+    warm_audio: Option<&mpsc::Sender<Vec<i16>>>,
+) -> RingOutcome {
+    let mut silence = tokio::time::interval(Duration::from_millis(20));
+    loop {
+        tokio::select! {
+            ev = sip_events.recv() => return match ev {
+                Some(SipEvent::Answered { codec }) => RingOutcome::Answered(codec),
+                Some(SipEvent::Terminated(reason)) => RingOutcome::Terminated(reason),
+                None => RingOutcome::Closed,
+            },
+            _ = silence.tick(), if warm_audio.is_some() => {
+                // Keepalive: drop on a full/closed channel — the warm session
+                // hasn't started draining audio yet, and losing a silence frame
+                // is harmless.
+                if let Some(s) = warm_audio {
+                    let _ = s.try_send(vec![0i16; 320]);
+                }
+            }
+        }
+    }
+}
+
 /// Drive one call to completion. Safe ordering: SIP first, answer, THEN Gemini.
 ///
 /// The concurrency slot is now claimed by the dispatcher (which set this call
@@ -544,64 +590,92 @@ async fn run_call(
     // 2. Decompose into owned channel ends.
     let SipCallParts { events: mut sip_events, audio_in, audio_out, hangup: sip_hangup, uplink_quality, .. } = call.split();
 
-    // 3. Await answer (no Gemini yet — nothing to tear down on failure here).
-    let codec = loop {
-        match sip_events.recv().await {
-            Some(SipEvent::Answered { codec }) => break codec,
-            Some(SipEvent::Terminated(reason)) => {
-                let (outcome, detail) = match reason {
-                    crate::sip::TermReason::Failed { outcome, detail } => (outcome, detail),
-                    // Remote/local hangup before answer is effectively no-answer.
-                    _ => (CallOutcome::NoAnswer, format!("{reason:?}")),
-                };
-                store.finalize(&call_id, CallState::Failed, None, Some(detail), Some(outcome), now_ms());
-                bump_counter_outcome(&counters, outcome);
-                // Busy is the only auto-retried outcome (NoAnswer and all
-                // others finalize terminally here). The finalized record above
-                // is linked forward by the follow-up's `retry_of`; the
-                // follow-up gets a fresh call_id from `place_call_at`, so this
-                // record is never re-finalized (no double-finalize).
-                if outcome == CallOutcome::Busy && should_retry_busy(attempt, &server.retry) {
-                    enqueuer
-                        .place_call_at(
-                            number.clone(),
-                            scenario.clone(),
-                            now_ms() + server.retry.busy_retry_interval_ms,
-                            attempt + 1,
-                            Some(call_id.clone()),
-                        )
-                        .await;
-                }
-                return;
-            }
-            None => {
-                store.finalize(&call_id, CallState::Failed, None, Some("sip closed before answer".into()), Some(CallOutcome::Failed), now_ms());
-                bump_counter_outcome(&counters, CallOutcome::Failed);
-                return;
-            }
-        }
-    };
-    let answered_at = now_ms();
-    store.set_state(&call_id, CallState::InProgress);
+    // 3. Warm-start Gemini DURING the ring window. `answered` starts `false`,
+    // so Task 1's gate keeps the greeting armed only once we fire it on the
+    // real 200 OK — never during ring. A warm-connect failure is tolerated:
+    // `warm` holds the `Err`, the call falls back to a post-answer connect
+    // rather than being dropped.
+    let (answered_tx, answered_rx) = tokio::sync::watch::channel(false);
+    let warm = gemini_live::start(&server, &scenario, answered_rx.clone()).await;
+    if let Err(e) = &warm {
+        tracing::warn!(%call_id, "gemini warm-connect failed during ring, will retry after answer: {e}");
+    }
 
-    // 4. Connect Gemini AFTER answer (its events now have a drain waiting).
-    // TODO(warm-start task 2): replace this pre-answered stub with the real
-    // `answered` watch wired from SIP's 200 OK, so Gemini can connect during
-    // ring without greeting before answer.
-    let session = match gemini_live::start(&server, &scenario, {
-        let (_tx, rx) = tokio::sync::watch::channel(true);
-        rx
-    }).await {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = sip_hangup.send(());
-            store.finalize(&call_id, CallState::Failed, None, Some(format!("gemini connect: {e}")), Some(CallOutcome::Failed), now_ms());
+    // 4. Ring-wait: await answer while feeding the warm session silence
+    // keepalive (see `ring_wait`). The silence `interval` lives inside
+    // `ring_wait`, so it is gone before the bridge starts — single writer on
+    // `audio_in`.
+    let codec = match ring_wait(&mut sip_events, warm.as_ref().ok().map(|s| &s.audio_in)).await {
+        RingOutcome::Answered(codec) => codec,
+        RingOutcome::Terminated(reason) => {
+            // No answer: tear down the warm session (hang up + drop) so it does
+            // not leak, then finalize exactly as before.
+            if let Ok(s) = &warm {
+                s.hangup().await;
+            }
+            drop(warm);
+            let (outcome, detail) = match reason {
+                crate::sip::TermReason::Failed { outcome, detail } => (outcome, detail),
+                // Remote/local hangup before answer is effectively no-answer.
+                _ => (CallOutcome::NoAnswer, format!("{reason:?}")),
+            };
+            store.finalize(&call_id, CallState::Failed, None, Some(detail), Some(outcome), now_ms());
+            bump_counter_outcome(&counters, outcome);
+            // Busy is the only auto-retried outcome (NoAnswer and all others
+            // finalize terminally here). The finalized record above is linked
+            // forward by the follow-up's `retry_of`; the follow-up gets a fresh
+            // call_id from `place_call_at`, so this record is never
+            // re-finalized (no double-finalize).
+            if outcome == CallOutcome::Busy && should_retry_busy(attempt, &server.retry) {
+                enqueuer
+                    .place_call_at(
+                        number.clone(),
+                        scenario.clone(),
+                        now_ms() + server.retry.busy_retry_interval_ms,
+                        attempt + 1,
+                        Some(call_id.clone()),
+                    )
+                    .await;
+            }
+            return;
+        }
+        RingOutcome::Closed => {
+            if let Ok(s) = &warm {
+                s.hangup().await;
+            }
+            drop(warm);
+            store.finalize(&call_id, CallState::Failed, None, Some("sip closed before answer".into()), Some(CallOutcome::Failed), now_ms());
             bump_counter_outcome(&counters, CallOutcome::Failed);
             return;
         }
     };
+
+    // 5. Answered — arm the greeting NOW (the ONLY place `answered_tx` is set
+    // true), stamp the answer time, mark in-progress.
+    let _ = answered_tx.send(true);
+    let answered_at = now_ms();
+    store.set_state(&call_id, CallState::InProgress);
+
+    // 6. Obtain the live session: use the warm one if it connected, else fall
+    // back to a post-answer connect. `answered_rx` is already `true`, so the
+    // greeting arms immediately on the fallback path.
+    let (session, warm_start) = match warm {
+        Ok(s) => (s, true),
+        Err(_) => match gemini_live::start(&server, &scenario, answered_rx.clone()).await {
+            Ok(s) => (s, false),
+            Err(e) => {
+                let _ = sip_hangup.send(());
+                store.finalize(&call_id, CallState::Failed, None, Some(format!("gemini connect: {e}")), Some(CallOutcome::Failed), now_ms());
+                bump_counter_outcome(&counters, CallOutcome::Failed);
+                return;
+            }
+        },
+    };
     let gemini_connected_at = now_ms();
-    tracing::info!(%call_id, dead_air_ms = gemini_connected_at - answered_at, "gemini connected after answer");
+    // On the warm path `dead_air_ms` is ~0 (the session was already connected
+    // through the ring); on the fallback path it reflects the post-answer
+    // connect latency.
+    tracing::info!(%call_id, dead_air_ms = gemini_connected_at - answered_at, warm_start, "gemini connected");
 
     // 5. Split the session; 6. start the bridge.
     let (gemini_handle, gemini_in, gemini_events) = session.split();
@@ -995,6 +1069,67 @@ mod tests {
         assert!(should_retry_busy(1, &cfg));
         assert!(should_retry_busy(2, &cfg));
         assert!(!should_retry_busy(3, &cfg)); // 3rd attempt is the last; no 4th
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ring_wait_feeds_silence_then_returns_codec() {
+        // A warm session exists: the ring-wait must push silence keepalive on
+        // each 20 ms tick until the SIP side answers, then return the codec.
+        use crate::sip::{G711Kind, NegotiatedCodec};
+        let (ev_tx, mut ev_rx) = mpsc::channel::<SipEvent>(8);
+        let (aud_tx, mut aud_rx) = mpsc::channel::<Vec<i16>>(64);
+        let codec = NegotiatedCodec { pt: 0, kind: G711Kind::Ulaw, ptime_ms: 20 };
+        // Driver: let several silence ticks elapse under paused time, then answer.
+        let driver = async {
+            for _ in 0..5 {
+                tokio::time::advance(Duration::from_millis(20)).await;
+            }
+            ev_tx.send(SipEvent::Answered { codec }).await.unwrap();
+        };
+        let (outcome, ()) = tokio::join!(ring_wait(&mut ev_rx, Some(&aud_tx)), driver);
+        match outcome {
+            RingOutcome::Answered(c) => assert_eq!(c.pt, 0),
+            _ => panic!("expected Answered"),
+        }
+        // At least one silence frame per elapsed tick, each exactly 20 ms of
+        // 16 kHz mono (320 samples).
+        let mut frames = 0;
+        while let Ok(f) = aud_rx.try_recv() {
+            assert_eq!(f.len(), 320);
+            frames += 1;
+        }
+        assert!(frames >= 5, "expected >=5 silence frames during ring, got {frames}");
+    }
+
+    #[tokio::test]
+    async fn ring_wait_terminated_returns_terminated_and_stops_feeding() {
+        // A Terminated before answer must return the teardown path; no live
+        // answer, so run_call hangs up + drops the warm session (asserted here
+        // only that the helper reports Terminated with the reason preserved).
+        let (ev_tx, mut ev_rx) = mpsc::channel::<SipEvent>(8);
+        let (aud_tx, _aud_rx) = mpsc::channel::<Vec<i16>>(64);
+        ev_tx
+            .send(SipEvent::Terminated(crate::sip::TermReason::Failed {
+                outcome: CallOutcome::Busy,
+                detail: "486 Busy Here".into(),
+            }))
+            .await
+            .unwrap();
+        match ring_wait(&mut ev_rx, Some(&aud_tx)).await {
+            RingOutcome::Terminated(crate::sip::TermReason::Failed { outcome, .. }) => {
+                assert_eq!(outcome, CallOutcome::Busy);
+            }
+            _ => panic!("expected Terminated(Failed{{Busy}})"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ring_wait_closed_channel_returns_closed() {
+        // SIP event channel dropped before any answer -> Closed. No warm
+        // session (None) means the silence branch is disabled: no busy-spin.
+        let (ev_tx, mut ev_rx) = mpsc::channel::<SipEvent>(8);
+        drop(ev_tx);
+        assert!(matches!(ring_wait(&mut ev_rx, None).await, RingOutcome::Closed));
     }
 
     #[test]
