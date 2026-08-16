@@ -16,7 +16,7 @@ The connect + setup latency is **not** inherent: it can be hidden behind the rin
 - **Silence keepalive is required.** Gemini closes an idle post-`setup` WSS; the engine must feed silence into the session during ring to keep it alive (confirmed behaviour, not speculative).
 - **Greeting gated on answer.** The auto-greet timer inside `run_session` must not fire during ring. `start`/`run_session` take an `answered` signal; the greet timer arms only after it fires. During ring the model stays silent (no `GREET_CUE` sent, timer not armed).
 - **Waste on no-answer is accepted.** If the callee never answers, the warm Gemini session is torn down (`hangup` + `join`). The user accepted this cost for option A.
-- **Warm-connect failure during ring falls back**, it does not kill the call: if `start` errors during ring, log and connect after answer as today (don't lose a dialable call to a warm-up hiccup).
+- **Warm-connect resilience is internal to the session.** `start` is infallible before its internal spawn — all connect fallibility lives in the session's spawned reconnect loop, not in a `run_call`-level fallback. A connect failure during ring is retried inside the session, not by re-calling `start` after answer.
 - **Default greet delay 1500 → 400 ms.** After answer, if the callee is silent, nudge Gemini to greet after a short 400 ms beat (user-chosen), not 1.5 s.
 
 ## Component 1 — `run_call` ring-window sequencing (`engine.rs`)
@@ -26,7 +26,7 @@ Today (`engine.rs:545-617`): `split` → await `Answered` (silent loop) → `gem
 New order:
 - After `split`, immediately `gemini_live::start(&server, &scenario, answered)` (see Component 2 for `answered`). Hold the returned `Session` (warm; WSS + setup in flight).
 - Await `Answered` in a `select!` that ALSO ticks every 20 ms, pushing a 20 ms silence frame (`vec![0i16; 320]`, 16 kHz) into `session.audio_in` to keep the WSS alive. The existing `Terminated`/`None` arms are unchanged (finalize per the current outcome logic).
-  - If `start` failed, skip the silence feed and fall back to the current post-answer connect path.
+  - `start` is infallible before its internal spawn, so this arm is a defensive guard, not the primary mechanism; connect resilience lives in the session's internal reconnect loop.
 - On `Answered`: stop the silence ticks, fire the `answered` signal, record `answered_at`, set `InProgress`, and build `BridgePorts` with the warm session's `audio_in`/`events` (exactly as today, but the session already exists — no `start().await` on the answer path). The bridge takes over feeding `audio_in` from the phone uplink; the engine's silence feed has stopped, so there is a single writer again.
 - Teardown: on `Terminated`/no-answer during the ring wait, `session.hangup().await` + drop/join so the warm session is closed cleanly. (Reuse the existing `Session::hangup`/`join`.)
 
@@ -48,7 +48,7 @@ Note: `start` spawns a reconnect loop that may call `run_session` more than once
 
 ## Error handling & edge cases
 
-- `start` fails during ring → fall back to connect-after-answer (current path); the call is not lost.
+- `start` is infallible before its internal spawn, so a connect failure during ring does not surface at the `run_call` level; the session's internal reconnect loop is the resilience mechanism, not a `run_call`-level fallback re-`start()` after answer.
 - Callee never answers (`Terminated`/timeout during ring) → `hangup` + join the warm session; outcome unchanged (NoAnswer/Busy/etc. per the existing classification).
 - Callee answers while the WSS is still mid-`setup` (very fast pickup) → the `answered` signal fires; the greet timer waits for the session to be usable; audio flows once `setup` completes. No greeting is lost (it is gated after answer, not after setup — if setup lags, the greet timer starts on answer but the first cue only sends once the loop is live).
 - The silence feed must stop the instant the bridge starts, so `session.audio_in` has a single writer during the call (no interleaving of engine-silence and phone audio). Structurally: the engine's silence ticks live only inside the ring-wait `select!`, which is exited before the bridge is built.

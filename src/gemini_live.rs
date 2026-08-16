@@ -178,7 +178,10 @@ pub(crate) async fn run_session<T: Transport>(
     let mut greet_deadline = tokio::time::Instant::now()
         + std::time::Duration::from_millis(server.greet_after_silence_ms);
     if !greet_armed {
-        // far future placeholder so the timer never fires until armed
+        // Belt-and-suspenders: the `greet_armed` guard on the select arm below
+        // is what actually keeps this timer inert; this far-future placeholder
+        // just avoids leaving `greet_deadline` at a meaningless "now" value
+        // before it is armed.
         greet_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(86_400);
     }
 

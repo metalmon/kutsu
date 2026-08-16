@@ -592,14 +592,9 @@ async fn run_call(
 
     // 3. Warm-start Gemini DURING the ring window. `answered` starts `false`,
     // so Task 1's gate keeps the greeting armed only once we fire it on the
-    // real 200 OK — never during ring. A warm-connect failure is tolerated:
-    // `warm` holds the `Err`, the call falls back to a post-answer connect
-    // rather than being dropped.
+    // real 200 OK — never during ring.
     let (answered_tx, answered_rx) = tokio::sync::watch::channel(false);
     let warm = gemini_live::start(&server, &scenario, answered_rx.clone()).await;
-    if let Err(e) = &warm {
-        tracing::warn!(%call_id, "gemini warm-connect failed during ring, will retry after answer: {e}");
-    }
 
     // 4. Ring-wait: await answer while feeding the warm session silence
     // keepalive (see `ring_wait`). The silence `interval` lives inside
@@ -656,26 +651,23 @@ async fn run_call(
     let answered_at = now_ms();
     store.set_state(&call_id, CallState::InProgress);
 
-    // 6. Obtain the live session: use the warm one if it connected, else fall
-    // back to a post-answer connect. `answered_rx` is already `true`, so the
-    // greeting arms immediately on the fallback path.
-    let (session, warm_start) = match warm {
-        Ok(s) => (s, true),
-        Err(_) => match gemini_live::start(&server, &scenario, answered_rx.clone()).await {
-            Ok(s) => (s, false),
-            Err(e) => {
-                let _ = sip_hangup.send(());
-                store.finalize(&call_id, CallState::Failed, None, Some(format!("gemini connect: {e}")), Some(CallOutcome::Failed), now_ms());
-                bump_counter_outcome(&counters, CallOutcome::Failed);
-                return;
-            }
-        },
+    // 6. Obtain the live session from the warm start.
+    // gemini_live::start is infallible before its internal spawn today;
+    // ring-failure resilience is the session's internal reconnect loop. This
+    // Err arm is a defensive guard, not the primary mechanism.
+    let session = match warm {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = sip_hangup.send(());
+            store.finalize(&call_id, CallState::Failed, None, Some(format!("gemini connect: {e}")), Some(CallOutcome::Failed), now_ms());
+            bump_counter_outcome(&counters, CallOutcome::Failed);
+            return;
+        }
     };
     let gemini_connected_at = now_ms();
-    // On the warm path `dead_air_ms` is ~0 (the session was already connected
-    // through the ring); on the fallback path it reflects the post-answer
-    // connect latency.
-    tracing::info!(%call_id, dead_air_ms = gemini_connected_at - answered_at, warm_start, "gemini connected");
+    // `dead_air_ms` is ~0 since the session was already connected through the
+    // ring (warm-start).
+    tracing::info!(%call_id, dead_air_ms = gemini_connected_at - answered_at, "gemini connected");
 
     // 5. Split the session; 6. start the bridge.
     let (gemini_handle, gemini_in, gemini_events) = session.split();
@@ -1088,7 +1080,10 @@ mod tests {
         };
         let (outcome, ()) = tokio::join!(ring_wait(&mut ev_rx, Some(&aud_tx)), driver);
         match outcome {
-            RingOutcome::Answered(c) => assert_eq!(c.pt, 0),
+            RingOutcome::Answered(c) => {
+                assert_eq!(c.pt, 0);
+                assert_eq!(c.kind, crate::sip::G711Kind::Ulaw);
+            }
             _ => panic!("expected Answered"),
         }
         // At least one silence frame per elapsed tick, each exactly 20 ms of
