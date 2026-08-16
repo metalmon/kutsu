@@ -43,7 +43,7 @@ pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
         language: env_or("KUTSU_LANGUAGE", "en-US"),
         net_check: NetCheckConfig::default(),
         max_concurrent_channels: 3,
-        greet_after_silence_ms: DEFAULT_GREET_AFTER_SILENCE_MS,
+        greet_after_silence_ms: env_u64("KUTSU_GREET_AFTER_SILENCE_MS", DEFAULT_GREET_AFTER_SILENCE_MS),
         transcript_dir: non_empty("KUTSU_TRANSCRIPT_DIR").map(std::path::PathBuf::from),
         dump_uplink_dir: non_empty("KUTSU_DUMP_UPLINK_DIR").map(std::path::PathBuf::from),
         dump_downlink_dir: non_empty("KUTSU_DUMP_DOWNLINK_DIR").map(std::path::PathBuf::from),
