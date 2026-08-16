@@ -2,10 +2,23 @@
 //! (audio_io.py). Detects the onset of callee speech from incoming PCM16.
 //!
 //! Cold-start calibration matters: the discriminator between a steady line
-//! background and genuine speech is temporal, not amplitude alone. The first
-//! `warmup_frames` frames unconditionally train `noise_floor` to the line's
-//! background level (no detection during that window); only after warmup does
-//! the ratio-gated threshold from the voice-cloud prototype apply.
+//! background and genuine speech is a JUMP from an established baseline, not
+//! absolute loudness. The very first frame ever observed has no prior
+//! contrast to be judged against, so it unconditionally seeds `noise_floor`.
+//! For the rest of the `warmup_frames` window, a frame that jumps above the
+//! floor already established by that seed is treated as speech immediately —
+//! so a "Алло" arriving right after pickup isn't silently averaged into the
+//! background — while frames that stay near the seed keep training it.
+//!
+//! Residual ambiguity (not fixable, documented deliberately): speech that is
+//! present and perfectly sustained from literally the first observed frame,
+//! with no lead-in at all — not even one quieter frame — is indistinguishable
+//! from a steady background at that same level, because the seed frame has
+//! no contrast to be judged against. This is an inherent limit of
+//! energy-only VAD, not a bug in this module. The integration layer (see
+//! Task 3) also treats a user-role `Transcript` (ASR-driven) as a
+//! `callee_active` signal, so this exact edge case is still caught — just
+//! slightly later, once Gemini transcribes the first words.
 use crate::config::VadConfig;
 
 pub struct Vad {
@@ -29,14 +42,27 @@ impl Vad {
         let rms = (sumsq / frame.len() as f64).sqrt() as f32;
 
         if self.frames_seen < self.cfg.warmup_frames {
-            // Calibration window: track the background unconditionally
-            // (regardless of level) and never detect speech yet.
+            let is_seed_frame = self.frames_seen == 0;
             self.frames_seen += 1;
-            self.noise_floor = self.noise_floor * 0.9 + rms * 0.1;
-            self.consec = 0;
-            return false;
+            if is_seed_frame {
+                // No prior contrast exists yet: absorb unconditionally to
+                // seed the floor (see module doc for the residual ambiguity
+                // this implies).
+                self.noise_floor = rms;
+                self.consec = 0;
+                return false;
+            }
+            // Jump-bail: a level well above the already-established floor is
+            // speech even during warmup; only frames near the floor keep
+            // training it.
+            return self.classify(rms);
         }
+        self.classify(rms)
+    }
 
+    /// Shared speech/background classification against the current floor.
+    /// Used for both post-warmup detection and the warmup jump-bail.
+    fn classify(&mut self, rms: f32) -> bool {
         let threshold = (self.cfg.min_rms as f32).max(self.noise_floor * self.cfg.ratio);
         if rms >= threshold {
             self.consec += 1;
@@ -94,6 +120,22 @@ mod tests {
         // throughout, including warmup: the floor adapts up toward ~1500
         // (threshold ~4500), so the same-level input never reads as speech.
         for _ in 0..200 { assert!(!v.observe(&frame(1500, 320))); }
+    }
+
+    #[test]
+    fn speech_jump_during_warmup_fires() {
+        let mut v = Vad::new(cfg());
+        // A few quiet baseline frames right after pickup establish the floor
+        // (the first of these seeds it, since there's no prior contrast yet).
+        for _ in 0..4 { assert!(!v.observe(&frame(80, 320))); }
+        // The callee's "Алло" is a clear jump above that established floor —
+        // still inside the warmup window (frames_seen well under
+        // warmup_frames=10), but the jump-bail catches it immediately
+        // instead of averaging it into the background.
+        assert!(!v.observe(&frame(4000, 320)));
+        assert!(!v.observe(&frame(4000, 320)));
+        assert!(v.observe(&frame(4000, 320))); // 3rd burst frame confirms onset
+        assert!(!v.observe(&frame(4000, 320))); // already fired
     }
 
     #[test]
