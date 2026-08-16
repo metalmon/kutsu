@@ -91,7 +91,12 @@ pub fn build_setup(server: &ServerConfig, scenario: &ScenarioConfig, resume_hand
         // field. Putting `enableAffectiveDialog` directly under `setup` is what
         // triggered close 1007 ("Unknown name enableAffectiveDialog at 'setup'").
         setup["generationConfig"]["thinkingConfig"] = json!({ "thinkingBudget": 0 });
-        setup["generationConfig"]["enableAffectiveDialog"] = json!(true);
+        // NOTE: `enableAffectiveDialog` is intentionally OFF. It makes the model
+        // emit emotion control tokens (`emotion_user`/`emotion_model` framed by
+        // `<ctrl95>`) inline in the stream; the google-genai SDK parses/strips
+        // them, but this hand-rolled client does not, so they leak into the
+        // transcript and spoken audio (garbled "strange" output). Re-enable only
+        // once the parser strips the `<ctrl95>` affective frames.
         setup["proactivity"] = json!({ "proactiveAudio": true });
     }
 
@@ -326,12 +331,12 @@ mod tests {
         assert_eq!(setup["model"], "models/gemini-2.5-flash-native-audio-latest");
         // No languageCode on native.
         assert!(setup["generationConfig"]["speechConfig"]["languageCode"].is_null());
-        // v1alpha extras: affective nests under generationConfig, proactivity is
-        // top-level (paths per the google-genai live converter). enableAffectiveDialog
-        // must NOT be at setup top-level (that caused close 1007).
+        // proactivity is a top-level setup field (path per the google-genai live
+        // converter). enableAffectiveDialog is OFF (its emotion control tokens
+        // leak through the hand-rolled client — see build_setup note).
+        assert!(setup["proactivity"]["proactiveAudio"] == true);
         assert!(setup["enableAffectiveDialog"].is_null());
-        assert_eq!(setup["generationConfig"]["enableAffectiveDialog"], true);
-        assert_eq!(setup["proactivity"]["proactiveAudio"], true);
+        assert!(setup["generationConfig"]["enableAffectiveDialog"].is_null());
         // Reasoning disabled on native (lower latency).
         assert_eq!(setup["generationConfig"]["thinkingConfig"]["thinkingBudget"], 0);
         // NON_BLOCKING behavior on end_call.
