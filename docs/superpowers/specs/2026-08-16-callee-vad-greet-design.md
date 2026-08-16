@@ -55,7 +55,16 @@ On a reconnect (`is_reconnect == true`), never greet. After setup:
 
 `resume_needed` is cleared on `ServerEvent::TurnComplete` (the model finished its reply). The existing `resume_handle.is_some()` local `greeted` shortcut is superseded by the persistent `greeted` + `is_reconnect` logic.
 
-## Component 4 — config (`config.rs`, `main_support.rs`)
+## Component 4 — drop stale audio on reconnect (no catch-up)
+
+The prototype flushes both directions on reconnect (`gemini_live.py:251-253`: `audio_out.flush()` + drain `mic_q`) so the resumed session starts from live audio instead of replaying a backlog. We port both:
+
+- **Uplink drain (the main lag source).** During the WSS gap, `run_session` is between attempts and not reading `audio_in`, so the bridge's callee frames accumulate in that channel (up to its 64-frame / ~1.3 s bound). On reconnect, before entering the session loop, non-blockingly drain the backlog — `while audio_rx.try_recv().is_ok() {}` — so the new Gemini session receives *live* callee audio, not 1.3 s of stale frames it would otherwise have to catch up on. This pairs naturally with RESUME_CUE: the mid-exchange callee audio is dropped, so asking them to repeat is the correct recovery.
+- **Downlink flush.** Stale model audio still buffered in the pacer from before the drop should not prepend the resumed turn. The bridge does not observe the internal Gemini reconnect, so on reconnect `gemini_live` emits the existing `Event::Interrupted` to the bridge (the barge-in path already does `downlink.clear()` + `set_expecting(false)`), flushing the pacer. Effect is smaller than the uplink drain (the pacer largely self-drains during the ≥300 ms backoff), but it avoids a stale fragment playing ahead of the resumed audio.
+
+Both are reconnect-only (`is_reconnect == true`); the first-open path is unchanged.
+
+## Component 5 — config (`config.rs`, `main_support.rs`)
 
 - `DEFAULT_GREET_AFTER_SILENCE_MS`: 1500 → 1000. (`KUTSU_GREET_AFTER_SILENCE_MS` override already exists.)
 - `RESUME_CUE`: a const **English instruction to the model** (mirroring `GREET_CUE`'s style, not the prototype's spoken Russian phrase), with an explicit language-pinning clause, e.g. "The connection dropped briefly and the last exchange may be lost. Ask the other party to repeat what they just said, replying in the same language you have been speaking." Overridable via `KUTSU_RESUME_CUE`, so a deployment can set the exact wording/language.
@@ -75,7 +84,8 @@ On a reconnect (`is_reconnect == true`), never greet. After setup:
 - VAD (pure, unit-tested): a helper `fn vad_step(state, frame, cfg) -> onset_bool` (or a small `Vad` struct) — silence keeps `callee_active` false; a burst of `onset_frames` above `max(min_rms, floor*ratio)` flips it; a single loud frame does not (onset gating); the noise floor adapts (a rising steady background does not eventually read as speech).
 - Greeting gate (FakeTransport, extend the warm-start tests): greeting suppressed when `callee_active` is set before the timer; greeting fires when the callee stays silent; `greeted` set once — a second `run_session` (simulated reconnect, `is_reconnect=true`) sends no `GREET_CUE`.
 - Reconnect cue: `is_reconnect=true` + `resume_handle=None` + `resume_needed=true` → `RESUME_CUE` sent; with `resume_handle=Some` → nothing sent; with `resume_needed=false` → nothing sent.
-- Config: `DEFAULT_GREET_AFTER_SILENCE_MS == 1000`; VAD env parse.
+- Reconnect drain: with frames pre-queued on `audio_in`, a reconnect attempt drains them (they are not forwarded to the new session) while a first open forwards normally; the reconnect path emits one `Interrupted` to the bridge.
+- Config: `DEFAULT_GREET_AFTER_SILENCE_MS == 1000`; VAD env parse; `KUTSU_RESUME_CUE` override.
 
 ## Extension seams (out of scope now)
 
