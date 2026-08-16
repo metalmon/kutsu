@@ -182,16 +182,27 @@ impl Default for RetryConfig {
 /// Energy-VAD tuning for detecting that the callee has started speaking.
 #[derive(Debug, Clone, Copy)]
 pub struct VadConfig {
-    /// Absolute RMS floor: a frame below this is never speech, even if the
-    /// adaptive noise floor has decayed toward zero. Telephone-calibrated.
+    /// Absolute RMS floor: a frame below this is never speech, regardless of
+    /// how low the adaptive noise floor has decayed. Telephone-calibrated
+    /// against measured uplink levels (line background roughly 50-500 RMS,
+    /// voiced "Алло" roughly 200-500 RMS), so genuine quiet callee speech
+    /// still clears it once the floor has been calibrated (see
+    /// `warmup_frames`).
     pub min_rms: u32,
-    /// Speech = frame RMS >= max(min_rms, noise_floor * ratio).
+    /// Speech = frame RMS >= max(min_rms, noise_floor * ratio). Only
+    /// evaluated after the `warmup_frames` calibration period; during
+    /// warmup no detection happens at all.
     pub ratio: f32,
     /// Consecutive speech frames required to confirm onset (rejects clicks).
     pub onset_frames: u32,
+    /// Frames at call start spent purely calibrating `noise_floor` to the
+    /// line's background level before any speech detection runs (the EMA is
+    /// updated on every warmup frame regardless of level; detection is
+    /// disabled). At 20 ms/frame, 10 frames is about 200 ms.
+    pub warmup_frames: u32,
 }
 impl Default for VadConfig {
-    fn default() -> Self { Self { min_rms: 200, ratio: 3.0, onset_frames: 3 } }
+    fn default() -> Self { Self { min_rms: 200, ratio: 3.0, onset_frames: 3, warmup_frames: 10 } }
 }
 
 /// Default wait before the agent greets a silent callee (see
