@@ -189,16 +189,22 @@ pub struct VadConfig {
     /// still clears it once the floor has been calibrated (see
     /// `warmup_frames`).
     pub min_rms: u32,
-    /// Speech = frame RMS >= max(min_rms, noise_floor * ratio). Only
-    /// evaluated after the `warmup_frames` calibration period; during
-    /// warmup no detection happens at all.
+    /// Speech = frame RMS >= max(min_rms, noise_floor * ratio). The very
+    /// first observed frame seeds `noise_floor` unconditionally (there is no
+    /// prior contrast to judge it against); from the second frame on, every
+    /// frame — including during `warmup_frames` — is classified against this
+    /// threshold, and the floor's EMA is updated only on frames that fall
+    /// below it (non-speech).
     pub ratio: f32,
     /// Consecutive speech frames required to confirm onset (rejects clicks).
     pub onset_frames: u32,
-    /// Frames at call start spent purely calibrating `noise_floor` to the
-    /// line's background level before any speech detection runs (the EMA is
-    /// updated on every warmup frame regardless of level; detection is
-    /// disabled). At 20 ms/frame, 10 frames is about 200 ms.
+    /// Bounds the startup window in which a sudden jump above the
+    /// (already-seeded) noise floor can still confirm onset early —
+    /// so an immediate loud onset shortly after a brief quiet baseline is
+    /// caught rather than being averaged into the background. Detection is
+    /// not disabled during this window; it uses the same
+    /// `max(min_rms, noise_floor * ratio)` classification as afterward. At
+    /// 20 ms/frame, 10 frames is about 200 ms.
     pub warmup_frames: u32,
 }
 impl Default for VadConfig {
