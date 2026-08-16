@@ -362,7 +362,16 @@ async fn run_call_cli(number: String, scenario_path: Option<std::path::PathBuf>)
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     };
 
-    println!("call ended: {final_state:?}");
+    // Surface the structured outcome + SIP/technical detail, not just the
+    // coarse CallState — this is what tells busy/no-answer/not-found apart.
+    let rec = engine.store().get(&id);
+    let outcome = rec.as_ref().and_then(|r| r.outcome);
+    let detail = rec.as_ref().and_then(|r| r.error.clone());
+    println!(
+        "call ended: {final_state:?}{}{}",
+        outcome.map(|o| format!(" (outcome: {o:?})")).unwrap_or_default(),
+        detail.map(|d| format!(" — {d}")).unwrap_or_default(),
+    );
     engine.shutdown().await;
     match final_state {
         kutsu::state::CallState::Failed => 1,
