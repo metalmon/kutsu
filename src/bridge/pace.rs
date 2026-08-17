@@ -64,6 +64,29 @@ impl Downlink {
         self.fill_target = self.prebuffer;
     }
 
+    /// Barge-in with a short fade instead of a hard cut: ramp the next `fade_ms`
+    /// of buffered audio linearly down to silence and drop everything after it,
+    /// so the phone hears a smooth stop rather than a click on an abrupt
+    /// `clear()`. The downsampler keeps its FIR state so the faded tail plays
+    /// through it continuously (then rings out into silence). Re-arms a full
+    /// prefill for the next turn. Falls back to `clear()` when nothing is
+    /// buffered.
+    pub fn interrupt_fade(&mut self, fade_ms: u32) {
+        let n = ((fade_ms as usize) * SAMPLES_PER_MS).min(self.buf.len());
+        if n == 0 {
+            self.clear();
+            return;
+        }
+        let mut faded: VecDeque<i16> = VecDeque::with_capacity(n);
+        for (i, &s) in self.buf.iter().take(n).enumerate() {
+            let gain = 1.0 - (i as f32 / n as f32); // 1.0 -> ~0.0 across the head
+            faded.push_back((s as f32 * gain) as i16);
+        }
+        self.buf = faded;
+        self.playing = true; // play the faded tail out immediately, no re-prefill
+        self.fill_target = self.prebuffer;
+    }
+
     /// Arm/disarm underrun accounting for an active model turn. A rising edge
     /// (false -> true) re-arms a fresh prefill so each turn's audio is buffered
     /// before playout (absorbs Gemini-path jitter within the turn). Called from
@@ -139,6 +162,29 @@ impl Downlink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupt_fade_drops_buffered_bulk() {
+        let mut d = Downlink::new(0, 0);
+        d.push(&[8000i16; 480 * 10]); // 200 ms of loud audio
+        let _ = d.next_frame(); // start playing
+        d.interrupt_fade(25); // keep ~25 ms faded head, drop the rest
+        // Only ~1-2 frames of (fading) signal remain, not ~10.
+        let mut signal_frames = 0;
+        for _ in 0..10 {
+            if d.next_frame().iter().any(|&s| s.abs() > 500) {
+                signal_frames += 1;
+            }
+        }
+        assert!(signal_frames <= 2, "fade must drop the buffered bulk, got {signal_frames}");
+    }
+
+    #[test]
+    fn interrupt_fade_on_empty_buffer_is_a_clear() {
+        let mut d = Downlink::new(140, 60);
+        d.interrupt_fade(25); // nothing buffered -> behaves like clear()/re-arm
+        assert!(!d.pending());
+    }
 
     #[test]
     fn pending_reflects_buffered_audio() {

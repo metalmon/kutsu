@@ -252,7 +252,9 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
                 Some(Event::Interrupted) => {
                     downlink.set_expecting(false);
                     last_audio = None;
-                    downlink.clear();
+                    // Fade the buffered head to silence (25 ms) instead of a hard
+                    // cut, so barge-in/reconnect-flush stops without a click.
+                    downlink.interrupt_fade(25);
                 }
                 Some(Event::TurnComplete) => {
                     downlink.set_expecting(false);
@@ -436,28 +438,33 @@ mod tests {
         assert!(pcm.iter().any(|&s| s.abs() > 1000), "expected audio to be playing before barge-in");
 
         // Barge-in while ~18 more frames (360 ms) of loud audio remain buffered.
+        // `interrupt_fade` ramps the buffered head down to silence over ~25 ms and
+        // DROPS the ~17 remaining frames, so the phone hears a short fade then
+        // clean silence — not the full 360 ms burst.
         ends.gemini_events_tx.send(Event::Interrupted).await.unwrap();
-        // Same reasoning: the next tick is a full 20 ms away, so this is
-        // processed deterministically before any further tick -- `clear()` runs
-        // before the next `next_frame()` call.
         tokio::task::yield_now().await;
 
-        // The tick immediately after `clear()` still carries the downsampler's
-        // FIR ring-out (~8 samples of decaying signal at the head of the frame;
-        // see pace.rs's own `clear_flushes_pending_audio` test, which discards
-        // this exact frame for the same reason). Discard it, then check the next
-        // one. With no further audio queued, that second frame must be clean
-        // silence. Without a working `clear()` the buffer would still hold ~17
-        // frames of loud audio at this point, so it would still be loud --
-        // silence here is proof `clear()` actually dropped the pending audio,
-        // not a vacuous check (the buffer is nowhere near draining naturally).
-        tokio::time::advance(std::time::Duration::from_millis(20)).await;
-        let _ = ends.phone_out_rx.recv().await.unwrap(); // ring-out frame, discarded
-
-        tokio::time::advance(std::time::Duration::from_millis(20)).await;
-        let frame = ends.phone_out_rx.recv().await.unwrap();
-        let pcm = g711::decode(G711Kind::Ulaw, &frame);
-        assert!(pcm.iter().all(|&s| s.abs() < 64), "expected silence after barge-in");
+        // Within a few frames the level must decay to silence (proving the bulk
+        // was dropped — without a working interrupt_fade it would stay loud for
+        // ~17 frames), and at most a couple of frames may still carry the fading
+        // head (proving it's a fade, and that the bulk is gone).
+        let mut reached_silence = false;
+        let mut loud_frames = 0;
+        for _ in 0..6 {
+            tokio::time::advance(std::time::Duration::from_millis(20)).await;
+            let frame = ends.phone_out_rx.recv().await.unwrap();
+            let pcm = g711::decode(G711Kind::Ulaw, &frame);
+            let peak = pcm.iter().map(|&s| s.abs()).max().unwrap_or(0);
+            if peak < 64 {
+                reached_silence = true;
+                break;
+            }
+            if peak > 1000 {
+                loud_frames += 1;
+            }
+        }
+        assert!(reached_silence, "audio must fade to silence within a few frames of barge-in");
+        assert!(loud_frames <= 2, "barge-in must drop the buffered bulk (only a short fade remains), got {loud_frames} loud frames");
 
         drop(ends);
         let _ = h.await;
