@@ -25,6 +25,17 @@ fn env_f32(k: &str, d: f32) -> f32 {
     std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
 }
 
+fn env_bool(k: &str, d: bool) -> bool {
+    std::env::var(k)
+        .ok()
+        .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(d)
+}
+
 /// Build (ServerConfig, SipConfig) from environment. This is the single
 /// source of env -> config for every entry point (`kutsu call`, its
 /// integration test, and `run_live`, which starts from this and overrides
@@ -48,13 +59,19 @@ pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
         voice: env_or("KUTSU_VOICE", "Autonoe"),
         voice_gender: Gender::parse(&env_or("KUTSU_VOICE_GENDER", "female")),
         language: env_or("KUTSU_LANGUAGE", "en-US"),
-        net_check: NetCheckConfig::default(),
-        max_concurrent_channels: 3,
+        net_check: NetCheckConfig {
+            enabled: env_bool("KUTSU_NETCHECK_ENABLED", true),
+            samples: env_u32("KUTSU_NETCHECK_SAMPLES", 10),
+            max_rtt_ms: env_u32("KUTSU_NETCHECK_MAX_RTT_MS", 300),
+            max_jitter_ms: env_u32("KUTSU_NETCHECK_MAX_JITTER_MS", 50),
+            max_loss_pct: env_f32("KUTSU_NETCHECK_MAX_LOSS_PCT", 2.0),
+        },
+        max_concurrent_channels: env_u32("KUTSU_MAX_CONCURRENT_CHANNELS", 3) as usize,
         greet_after_silence_ms: env_u64("KUTSU_GREET_AFTER_SILENCE_MS", DEFAULT_GREET_AFTER_SILENCE_MS),
         transcript_dir: non_empty("KUTSU_TRANSCRIPT_DIR").map(std::path::PathBuf::from),
         dump_uplink_dir: non_empty("KUTSU_DUMP_UPLINK_DIR").map(std::path::PathBuf::from),
         dump_downlink_dir: non_empty("KUTSU_DUMP_DOWNLINK_DIR").map(std::path::PathBuf::from),
-        max_call_secs: 600,
+        max_call_secs: env_u64("KUTSU_MAX_CALL_SECS", 600),
         quality: QualityConfig {
             prebuffer_ms: env_u32("KUTSU_QUALITY_PREBUFFER_MS", 180),
             resume_ms: env_u32("KUTSU_QUALITY_RESUME_MS", 60),
@@ -76,8 +93,8 @@ pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
         server: env_or("KUTSU_SIP_SERVER", "192.168.88.243:5060"),
         username: env_or("KUTSU_SIP_USER", "kutsu"),
         password: env_or("KUTSU_SIP_PASS", "kutsupw"),
-        from_user: None,
-        local_ip: None,
+        from_user: non_empty("KUTSU_SIP_FROM_USER"),
+        local_ip: non_empty("KUTSU_SIP_LOCAL_IP").and_then(|s| s.parse().ok()),
         register: false,
         transport: SipTransportKind::Udp,
     };
