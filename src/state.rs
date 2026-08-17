@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use crate::gemini_live::TranscriptEntry;
+use crate::gemini_live::{AffectEntry, TranscriptEntry};
 
 /// Lifecycle state of a call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -50,6 +50,8 @@ pub struct CallRecord {
     pub number: String,
     pub state: CallState,
     pub transcript: Vec<TranscriptEntry>,
+    /// Emotions detected during the call (affective dialog), in order.
+    pub affect: Vec<AffectEntry>,
     pub goal: Option<Value>,
     pub error: Option<String>,
     pub started_ms: u64,
@@ -94,6 +96,13 @@ impl CallStore {
     pub fn append_transcript(&self, call_id: &str, entry: TranscriptEntry) {
         if let Some(r) = self.inner.lock().unwrap().get_mut(call_id) {
             r.transcript.push(entry);
+        }
+    }
+
+    /// Append one detected-emotion event to the call's record.
+    pub fn append_affect(&self, call_id: &str, entry: AffectEntry) {
+        if let Some(r) = self.inner.lock().unwrap().get_mut(call_id) {
+            r.affect.push(entry);
         }
     }
 
@@ -154,7 +163,7 @@ impl CallStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gemini_live::{Role, TranscriptEntry};
+    use crate::gemini_live::{AffectEntry, Role, TranscriptEntry};
 
     fn rec(id: &str) -> CallRecord {
         CallRecord {
@@ -162,6 +171,7 @@ mod tests {
             number: "600".into(),
             state: CallState::Ringing,
             transcript: vec![],
+            affect: vec![],
             goal: None,
             error: None,
             started_ms: 1000,
@@ -171,6 +181,18 @@ mod tests {
             attempt: 1,
             retry_of: None,
         }
+    }
+
+    #[test]
+    fn append_affect_records_emotion_in_order() {
+        let store = CallStore::new();
+        store.insert(rec("c1"));
+        store.append_affect("c1", AffectEntry { role: Role::User, label: "interest".into(), ts_ms: 7 });
+        store.append_affect("c1", AffectEntry { role: Role::Model, label: "calmness".into(), ts_ms: 9 });
+        let r = store.get("c1").unwrap();
+        assert_eq!(r.affect.len(), 2);
+        assert_eq!(r.affect[0].label, "interest");
+        assert_eq!(r.affect[1].role, Role::Model);
     }
 
     #[test]

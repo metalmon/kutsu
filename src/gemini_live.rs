@@ -31,12 +31,24 @@ pub enum Event {
     Interrupted,
     TurnComplete,
     EndCall { goal: Value },
+    /// An emotion the model detected (from `enableAffectiveDialog`) for the user
+    /// or the model itself. The model already adapts its tone; kutsu records this
+    /// so the emotional arc is visible in the CallRecord / via MCP.
+    Affect { role: Role, label: String },
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct TranscriptEntry {
     pub role: Role,
     pub text: String,
+    pub ts_ms: u64,
+}
+
+/// One detected-emotion event, recorded alongside the transcript.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AffectEntry {
+    pub role: Role,
+    pub label: String,
     pub ts_ms: u64,
 }
 
@@ -317,7 +329,9 @@ async fn run_driver(
                     }
                     // Affective structured events are not consumed yet.
                     Some(CrateEvent::Affect { role, label }) => {
-                        tracing::debug!(?role, ?label, "gemini: affect event (ignored)");
+                        had_activity = true;
+                        tracing::debug!(?role, ?label, "gemini: affect detected");
+                        let _ = events.send(Event::Affect { role, label: label.0 }).await;
                     }
                     Some(CrateEvent::Interrupted) => {
                         had_activity = true;

@@ -172,6 +172,7 @@ impl Enqueuer {
             number: number.clone(),
             state: CallState::Queued,
             transcript: vec![],
+            affect: vec![],
             goal: None,
             error: None,
             started_ms: now_ms(),
@@ -716,6 +717,9 @@ async fn run_call(
                 }
                 Some(Event::EndCall { goal: g }) => { goal = Some(g); break CallState::Completed; }
                 Some(Event::TurnComplete) => {}
+                Some(Event::Affect { role, label }) => {
+                    store.append_affect(&call_id, crate::gemini_live::AffectEntry { role, label, ts_ms: now_ms() });
+                }
                 Some(_) => {} // OutputAudio/Interrupted: consumed by the bridge, not forwarded
                 None => events_open = false, // bridge closed events_out; stop polling (the bridge_task arm ends the call)
             },
