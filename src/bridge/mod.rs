@@ -190,11 +190,23 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
     // Downlink: 24 kHz buffer + 20 ms pacer + barge-in, on this task.
     let mut downlink = pace::Downlink::new(prebuffer_ms, resume_ms);
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
+    // Media pacer: on a late tick, resume the 20 ms cadence from now rather than
+    // firing a catch-up burst (the default `Burst`). Bursting bunches RTP egress
+    // and makes the callee's jitter buffer stutter even at 0 packet loss.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Inter-chunk gap clock: wall-clock time between consecutive OutputAudio
     // events within a turn, tracked for the `max_gap_ms` quality metric.
     let mut last_audio: Option<tokio::time::Instant> = None;
     let mut max_gap_ms = 0u64;
+    // Downlink SEND-timing diagnostic: wall-clock gap between consecutive pacer
+    // ticks (should be ~20ms). A default `tokio::interval` uses
+    // MissedTickBehavior::Burst, so a missed tick under load fires a catch-up
+    // burst → uneven RTP egress → jittery playout even at 0 packet loss.
+    let mut last_tick: Option<tokio::time::Instant> = None;
+    let mut max_tick_gap_ms = 0u64;
+    let mut late_ticks = 0u64;
+    let mut tick_count = 0u64;
 
     // Optional downlink dump: `-downlink-24k.wav` is the raw model audio from
     // Gemini (pre-resample); `-downlink-8k.wav` is what we send to the phone
@@ -257,6 +269,14 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
                 None => break BridgeEnd::GeminiClosed,
             },
             _ = ticker.tick() => {
+                let tnow = tokio::time::Instant::now();
+                if let Some(prev) = last_tick {
+                    let g = tnow.duration_since(prev).as_millis() as u64;
+                    if g > max_tick_gap_ms { max_tick_gap_ms = g; }
+                    if g >= 30 { late_ticks += 1; }
+                }
+                last_tick = Some(tnow);
+                tick_count += 1;
                 let pcm8 = downlink.next_frame();
                 if let Some(w) = dl_dump8.as_mut() { let _ = w.write(&pcm8); }
                 let payload = g711::encode(codec, &pcm8);
@@ -280,6 +300,7 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
     };
     // Harmless no-op if the uplink task already finished (the `&mut uplink`
     // branch above); required to stop it on the other two exit paths.
+    tracing::info!(max_tick_gap_ms, late_ticks, tick_count, "downlink pacer send-timing");
     uplink.abort();
     if let Some(w) = dl_dump24.take() { let _ = w.finalize(); }
     if let Some(w) = dl_dump8.take() { let _ = w.finalize(); }

@@ -78,7 +78,27 @@ enum Command {
     },
 }
 
+/// On Windows the default multimedia timer resolution is ~15.6 ms, which
+/// quantises the bridge's 20 ms media pacer into uneven ticks → jittery RTP
+/// egress and audible stutter at the callee even with zero packet loss. Raise
+/// it to 1 ms for the process lifetime. No-op on other platforms.
+#[cfg(windows)]
+fn raise_timer_resolution() {
+    #[link(name = "winmm")]
+    unsafe extern "system" {
+        fn timeBeginPeriod(u_period: u32) -> u32;
+    }
+    // 1 ms period, never released — kutsu is a real-time media server for its
+    // whole lifetime, so `timeEndPeriod` on exit is unnecessary.
+    unsafe {
+        timeBeginPeriod(1);
+    }
+}
+#[cfg(not(windows))]
+fn raise_timer_resolution() {}
+
 fn main() -> anyhow::Result<()> {
+    raise_timer_resolution();
     let cli = Cli::parse();
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
