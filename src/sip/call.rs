@@ -239,8 +239,25 @@ pub(crate) async fn run_call(
         }
     });
 
-    // Main loop: pump SIP/media, forward inbound audio, honour hangup.
-    let mut uplink_stats = UplinkStats::new();
+    // Inbound receiver on its own local task. ezk-rtc's inbound jitter buffer is
+    // a tiny fixed 10 ms window (`RX_BUFFER_DURATION` in ezk-rtc's queue.rs) that
+    // drops packets when the consumer falls behind. Draining `receiver.recv()` in
+    // a dedicated tight loop — rather than sharing a `select!` with `call.run()`,
+    // where it is polled only once per loop iteration — keeps the buffer emptied
+    // promptly so packets don't age out of the window (≈14% uplink loss observed
+    // otherwise, all inside ezk, not on the wire). Mirrors the outbound `out_task`.
+    let in_task = tokio::task::spawn_local(async move {
+        let mut uplink_stats = UplinkStats::new();
+        while let Some(rtp) = receiver.recv().await {
+            uplink_stats.observe(rtp.sequence_number.0);
+            uplink_quality.publish(&uplink_stats.snapshot());
+            // Drop-on-full: never block the receive loop on a stalled bridge.
+            let _ = in_tx.try_send(rtp.payload);
+        }
+    });
+
+    // Main loop: pump SIP/media and honour hangup. Inbound RTP is drained by
+    // `in_task` above; outbound by `out_task`.
     let reason = loop {
         tokio::select! {
             r = call.run() => match r {
@@ -259,12 +276,6 @@ pub(crate) async fn run_call(
                     detail: e.to_string(),
                 },
             },
-            Some(rtp) = receiver.recv() => {
-                uplink_stats.observe(rtp.sequence_number.0);
-                uplink_quality.publish(&uplink_stats.snapshot());
-                // Drop-on-full: never block the media loop on a stalled bridge.
-                let _ = in_tx.try_send(rtp.payload);
-            }
             _ = &mut hup_rx => {
                 let _ = call.terminate().await;
                 break TermReason::LocalHangup;
@@ -272,6 +283,7 @@ pub(crate) async fn run_call(
         }
     };
     out_task.abort();
+    in_task.abort();
     let _ = ev_tx.send(SipEvent::Terminated(reason)).await;
 }
 
