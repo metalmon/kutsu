@@ -199,6 +199,16 @@ async fn run_driver(
     let mut vad = crate::vad::Vad::new(server.vad);
     let mut audio_frames_sent: u64 = 0;
 
+    // Deferred end. `end_call` is NON_BLOCKING: the model calls the tool and
+    // KEEPS speaking its goodbye, so ending the driver on the tool call drops
+    // the rest of the goodbye audio (heard as "only the first word"). Instead we
+    // mark `ending`, keep forwarding the goodbye, and end on the turn's
+    // `TurnComplete` — so the full goodbye reaches the bridge and the engine's
+    // drain plays it out before hangup. `ending_deadline` caps the wait so a
+    // missing `TurnComplete` can't hang the call.
+    let mut ending: Option<Value> = None;
+    let mut ending_deadline = tokio::time::Instant::now() + Duration::from_secs(86_400);
+
     let (ended_by, goal): (EndedBy, Option<Value>) = loop {
         tokio::select! {
             // Arm the greeting the moment the call is answered (once).
@@ -221,6 +231,13 @@ async fn run_driver(
                 if session.send_client_text(GREET_CUE).await.is_err() {
                     break (EndedBy::RemoteClose, None);
                 }
+            }
+            // Fallback end: after `end_call`, the goodbye turn never signalled
+            // completion within the cap — end now so teardown can't hang.
+            _ = tokio::time::sleep_until(ending_deadline), if ending.is_some() => {
+                let goal = ending.take().unwrap();
+                let _ = events.send(Event::EndCall { goal: goal.clone() }).await;
+                break (EndedBy::ModelEndCall, Some(goal));
             }
             // Uplink: VAD only READS the frame; the audio forwarded to Gemini is
             // byte-transparent (no alter/delay/drop).
@@ -315,15 +332,31 @@ async fn run_driver(
                             transcript.extend(entries);
                         }
                         let _ = events.send(Event::TurnComplete).await;
+                        // The goodbye turn that followed `end_call` has finished:
+                        // the full goodbye audio is now forwarded, so end here and
+                        // let the engine's drain play it out before hangup.
+                        if let Some(goal) = ending.take() {
+                            let _ = events.send(Event::EndCall { goal: goal.clone() }).await;
+                            break (EndedBy::ModelEndCall, Some(goal));
+                        }
                     }
                     Some(CrateEvent::ToolCall { name, id, args }) => {
                         if name == "end_call" {
+                            // NON_BLOCKING: ack the tool but DON'T end yet — the
+                            // model keeps speaking the goodbye. Defer the end to the
+                            // turn's `TurnComplete` (or the cap) so the whole goodbye
+                            // reaches the phone. Guard so a second call is a no-op.
                             let _ = session.send_tool_response(&id).await;
-                            let _ = events.send(Event::EndCall { goal: args.clone() }).await;
-                            break (EndedBy::ModelEndCall, Some(args));
+                            if ending.is_none() {
+                                ending = Some(args);
+                                ending_deadline =
+                                    tokio::time::Instant::now() + Duration::from_secs(10);
+                                greeted = true; // never greet while wrapping up
+                            }
+                        } else {
+                            // Other tools: ignored (kutsu only wires end_call).
+                            tracing::debug!(%name, "gemini: unhandled tool call (ignored)");
                         }
-                        // Other tools: ignored (kutsu only wires end_call).
-                        tracing::debug!(%name, "gemini: unhandled tool call (ignored)");
                     }
                     // A terminal close (reconnection exhausted / unrecoverable)
                     // or the end of the stream ends the call.
@@ -558,6 +591,9 @@ mod tests {
             br#"{"serverContent":{"outputTranscription":{"text":"Hi there","finished":true}}}"#.to_vec());
         fake.push_data(
             br#"{"toolCall":{"functionCalls":[{"id":"c1","name":"end_call","args":{"disposition":"done"}}]}}"#.to_vec());
+        // NON_BLOCKING end_call: the goodbye turn completes AFTER the tool call;
+        // the driver ends on this, not on the tool call itself.
+        fake.push_data(br#"{"serverContent":{"turnComplete":true}}"#.to_vec());
         let sent = fake.sent.clone();
         let session = session_over(fake, no_reconnect()).await;
 
@@ -597,6 +633,46 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         assert!(acked, "the end_call tool ack must be written before teardown");
+    }
+
+    #[tokio::test]
+    async fn end_call_defers_until_goodbye_turn_completes() {
+        // NON_BLOCKING end_call: the model calls the tool FIRST, then keeps
+        // speaking the goodbye. The driver must forward that post-tool audio and
+        // end on the turn's completion — not truncate the goodbye on the tool
+        // call (the "only the first word" bug).
+        let mut fake = FakeTransport::new(true);
+        fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        fake.push_data(
+            br#"{"toolCall":{"functionCalls":[{"id":"c1","name":"end_call","args":{"disposition":"done"}}]}}"#.to_vec());
+        // Goodbye audio arrives AFTER the tool call — must still be forwarded.
+        fake.push_data(
+            br#"{"serverContent":{"modelTurn":{"parts":[{"inlineData":{"mimeType":"audio/pcm;rate=24000","data":"AAECBAgQ"}}]}}}"#.to_vec());
+        // Turn completes → the driver ends here (goodbye fully forwarded).
+        fake.push_data(br#"{"serverContent":{"turnComplete":true}}"#.to_vec());
+        let session = session_over(fake, no_reconnect()).await;
+
+        let (_atx, arx) = mpsc::channel::<Vec<i16>>(8);
+        let (etx, mut erx) = mpsc::channel::<Event>(64);
+        let (_htx, hrx) = mpsc::channel::<()>(1);
+        let (_answered_tx, answered_rx) = watch::channel(true);
+
+        let outcome = run_driver(session, &server(), answered_rx, arx, etx, hrx).await;
+
+        // Order matters: the goodbye audio (after end_call) must be emitted, and
+        // EndCall must come AFTER it — never before.
+        let mut audio_after_end = false;
+        let mut end_after_audio = false;
+        while let Ok(ev) = erx.try_recv() {
+            match ev {
+                Event::OutputAudio(_) => audio_after_end = true,
+                Event::EndCall { .. } => end_after_audio = audio_after_end,
+                _ => {}
+            }
+        }
+        assert!(audio_after_end, "goodbye audio arriving after end_call must reach the bridge");
+        assert!(end_after_audio, "EndCall must be emitted only after the goodbye audio, not before");
+        assert!(matches!(outcome.ended_by, EndedBy::ModelEndCall));
     }
 
     // --- answered gate: greeting must never fire before the call is answered. --
