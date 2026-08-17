@@ -14,7 +14,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
 use ::gemini_live::session::{ClientConfig, Event as CrateEvent, Session as CrateSession};
-use ::gemini_live::transport::{ProxyConfig, Transport};
+use ::gemini_live::transport::ProxyConfig;
 use ::gemini_live::types::{Model as GeminiModel, SetupConfig};
 
 pub use ::gemini_live::types::Role;
@@ -31,7 +31,6 @@ pub enum Event {
     Interrupted,
     TurnComplete,
     EndCall { goal: Value },
-    Warning(String),
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -103,8 +102,10 @@ const GREET_CUE: &str =
     "The call has connected and the other party has not spoken yet. \
      Greet them now and begin the conversation as instructed.";
 
-/// Map kutsu's config-level model onto the crate's model enum.
-fn map_model(m: crate::config::Model) -> GeminiModel {
+/// Map kutsu's config-level model onto the crate's model enum. `pub(crate)` so
+/// the network preflight (`net_check`) builds the same endpoint URL the session
+/// uses via the crate's `endpoint_url`.
+pub(crate) fn map_model(m: crate::config::Model) -> GeminiModel {
     match m {
         crate::config::Model::HalfCascade => GeminiModel::HalfCascade,
         crate::config::Model::NativeAudio => GeminiModel::NativeAudio,
@@ -149,10 +150,11 @@ fn client_config(server: &ServerConfig, scenario: &ScenarioConfig) -> ClientConf
 /// preserving the old `run_session` semantics with the connection lifecycle now
 /// sourced from the crate.
 ///
-/// Generic over the transport so tests can drive it against a scripted
-/// `FakeTransport`; production always uses the real `WsTransport`.
-async fn run_driver<T: Transport>(
-    mut session: CrateSession<T>,
+/// The crate `Session` owns its transport + reconnect loop in an internal task,
+/// so this reads `recv_event()` (cancel-safe) and enqueues via `send_*(&self)`.
+/// Tests drive it over a scripted `FakeTransport`-backed `Session`.
+async fn run_driver(
+    mut session: CrateSession,
     server: &ServerConfig,
     mut answered: watch::Receiver<bool>,
     mut audio_in: mpsc::Receiver<Vec<i16>>,
@@ -246,7 +248,9 @@ async fn run_driver<T: Transport>(
                 }
             }
             // Downlink: the crate's unified event stream (spans reconnects).
-            ev = session.next_event() => {
+            // `recv_event` is a cancel-safe mpsc receive — racing it here can
+            // never disturb the reconnect loop (which runs in the crate's task).
+            ev = session.recv_event() => {
                 match ev {
                     Some(CrateEvent::SessionOpened { is_reconnect, resumed }) => {
                         if is_reconnect {
@@ -493,8 +497,8 @@ mod tests {
     async fn session_over(
         fake: FakeTransport,
         reconnect: Reconnector<FakeTransport>,
-    ) -> CrateSession<FakeTransport> {
-        CrateSession::connect_with_reconnector(cfg(), fake, reconnect).await.unwrap()
+    ) -> CrateSession {
+        CrateSession::connect_with_transport(cfg(), fake, reconnect).await.unwrap()
     }
 
     // --- Session handle plumbing ---------------------------------------------
@@ -545,7 +549,10 @@ mod tests {
 
     #[tokio::test]
     async fn transcript_and_end_call_flow() {
-        let mut fake = FakeTransport::new(false);
+        // Live connection (pending_when_empty): after the scripted frames the
+        // transport stays open, mirroring production — so the end_call ack is
+        // written in the live phase, not discarded by a premature reconnect.
+        let mut fake = FakeTransport::new(true);
         fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
         fake.push_data(
             br#"{"serverContent":{"outputTranscription":{"text":"Hi there","finished":true}}}"#.to_vec());
@@ -578,8 +585,18 @@ mod tests {
         assert_eq!(outcome.goal.as_ref().unwrap()["disposition"], "done");
         // The model turn was folded into the outcome transcript at end.
         assert!(outcome.transcript.iter().any(|e| e.role == Role::Model && e.text == "Hi there"));
-        // We acked the tool call.
-        assert!(sent.lock().unwrap().iter().any(|s| s.contains("tool_response")));
+        // The end_call ack is enqueued to the crate's driver task and written
+        // asynchronously; after run_driver drops the session the detached task
+        // drains the queued command and writes it before exiting.
+        let mut acked = false;
+        for _ in 0..1000 {
+            if sent.lock().unwrap().iter().any(|s| s.contains("tool_response")) {
+                acked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(acked, "the end_call tool ack must be written before teardown");
     }
 
     // --- answered gate: greeting must never fire before the call is answered. --

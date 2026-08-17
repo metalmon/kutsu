@@ -716,7 +716,6 @@ async fn run_call(
                 }
                 Some(Event::EndCall { goal: g }) => { goal = Some(g); break CallState::Completed; }
                 Some(Event::TurnComplete) => {}
-                Some(Event::Warning(w)) => tracing::warn!(%call_id, "gemini warning: {w}"),
                 Some(_) => {} // OutputAudio/Interrupted: consumed by the bridge, not forwarded
                 None => events_open = false, // bridge closed events_out; stop polling (the bridge_task arm ends the call)
             },

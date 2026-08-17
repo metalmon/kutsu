@@ -300,7 +300,6 @@ async fn run_live(
                 goal = Some(g);
                 break;
             }
-            Ok(Some(kutsu::gemini_live::Event::Warning(w))) => eprintln!("warn: {w}"),
             Ok(Some(_)) => {}
             Ok(None) => break,   // session task ended
             Err(_) => {
