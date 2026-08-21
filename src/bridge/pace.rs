@@ -123,6 +123,14 @@ impl Downlink {
         !self.buf.is_empty()
     }
 
+    /// True once the prefill target has been met and real (buffered) audio is
+    /// being emitted, false while holding for prefill/resume or after a
+    /// mid-turn underrun. The bridge watches the false->true edge to time the
+    /// per-turn prebuffer latency (audio received -> audio reaching the phone).
+    pub fn playing(&self) -> bool {
+        self.playing
+    }
+
     /// Produce one 20 ms frame (160 samples @ 8 kHz).
     pub fn next_frame(&mut self) -> Vec<i16> {
         if !self.playing {

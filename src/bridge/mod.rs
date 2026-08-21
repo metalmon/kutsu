@@ -199,6 +199,15 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
     // events within a turn, tracked for the `max_gap_ms` quality metric.
     let mut last_audio: Option<tokio::time::Instant> = None;
     let mut max_gap_ms = 0u64;
+    // Per-turn downlink latency: time from the first OutputAudio of a turn to the
+    // first real (buffered) frame actually paced to the phone -- i.e. our
+    // prebuffer/resume cost, the latency lever we control (vs the external
+    // Gemini/proxy round-trip). Timed off the pace buffer's playing false->true
+    // edge; reset each turn on TurnComplete/Interrupted.
+    let mut turn_recv_at: Option<tokio::time::Instant> = None;
+    let mut turn_onset_logged = false;
+    let mut max_onset_ms = 0u64;
+    let mut onset_count = 0u64;
     // Downlink SEND-timing diagnostic: wall-clock gap between consecutive pacer
     // ticks (should be ~20ms). A default `tokio::interval` uses
     // MissedTickBehavior::Burst, so a missed tick under load fires a catch-up
@@ -246,12 +255,18 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
                         }
                     }
                     last_audio = Some(now);
+                    if turn_recv_at.is_none() {
+                        turn_recv_at = Some(now);
+                        turn_onset_logged = false;
+                    }
                     if let Some(w) = dl_dump24.as_mut() { let _ = w.write(&pcm24); }
                     downlink.push(&pcm24);
                 }
                 Some(Event::Interrupted) => {
                     downlink.set_expecting(false);
                     last_audio = None;
+                    turn_recv_at = None;
+                    turn_onset_logged = false;
                     // Fade the buffered head to silence (25 ms) instead of a hard
                     // cut, so barge-in/reconnect-flush stops without a click.
                     downlink.interrupt_fade(25);
@@ -259,6 +274,8 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
                 Some(Event::TurnComplete) => {
                     downlink.set_expecting(false);
                     last_audio = None;
+                    turn_recv_at = None;
+                    turn_onset_logged = false;
                     if events_out.send(Event::TurnComplete).await.is_err() {
                         // Engine dropped its event receiver; keep bridging audio.
                     }
@@ -279,7 +296,20 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
                 }
                 last_tick = Some(tnow);
                 tick_count += 1;
+                let before_playing = downlink.playing();
                 let pcm8 = downlink.next_frame();
+                // playing false->true = prefill met, first real frame of a turn
+                // reaches the phone now. Time it against when the turn's audio
+                // first arrived from Gemini.
+                if !before_playing && downlink.playing() {
+                    if let (Some(t0), false) = (turn_recv_at, turn_onset_logged) {
+                        let onset = tnow.duration_since(t0).as_millis() as u64;
+                        if onset > max_onset_ms { max_onset_ms = onset; }
+                        onset_count += 1;
+                        tracing::info!(call_id = %call_id_dl, downlink_onset_ms = onset, "downlink audio onset");
+                        turn_onset_logged = true;
+                    }
+                }
                 if let Some(w) = dl_dump8.as_mut() { let _ = w.write(&pcm8); }
                 let payload = g711::encode(codec, &pcm8);
                 quality.underruns.store(downlink.underruns(), Ordering::Relaxed);
@@ -302,7 +332,7 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
     };
     // Harmless no-op if the uplink task already finished (the `&mut uplink`
     // branch above); required to stop it on the other two exit paths.
-    tracing::info!(max_tick_gap_ms, late_ticks, tick_count, "downlink pacer send-timing");
+    tracing::info!(max_tick_gap_ms, late_ticks, tick_count, max_onset_ms, onset_count, "downlink pacer send-timing");
     uplink.abort();
     if let Some(w) = dl_dump24.take() { let _ = w.finalize(); }
     if let Some(w) = dl_dump8.take() { let _ = w.finalize(); }
