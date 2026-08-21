@@ -40,6 +40,15 @@ impl Vad {
     /// Current adaptive noise floor (for onset logging/tuning).
     pub fn noise_floor(&self) -> f32 { self.noise_floor }
 
+    /// Whether the most recently observed frame is above the speech threshold
+    /// (same rule as [`Vad::classify`], but a stateless read of the last frame).
+    /// Used to profile utterance duration for answering-machine detection — a
+    /// short first utterance ("алло") vs a long continuous greeting (voicemail).
+    pub fn is_speech_frame(&self) -> bool {
+        let threshold = (self.cfg.min_rms as f32).max(self.noise_floor * self.cfg.ratio);
+        self.last_rms >= threshold
+    }
+
     /// Feed one incoming callee frame. Returns true exactly once — on the frame
     /// that confirms speech onset. Once fired, always returns false.
     pub fn observe(&mut self, frame: &[i16]) -> bool {

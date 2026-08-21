@@ -320,6 +320,21 @@ impl Endpoint {
             BytesPrint(&message.tp_info.buffer)
         );
 
+        // kutsu local patch: surface call-progress at INFO. ezk-sip-ua's
+        // OutboundCall hides 18x provisionals from the app, but for
+        // answering-machine / carrier-announcement detection we want to see the
+        // SIP response codes and whether a provisional carries early media
+        // (a body on a 18x). Grep the `sip_progress` target. See docs/backlog.md.
+        if let MessageLine::Response(ref status) = message.line {
+            log::info!(
+                target: "sip_progress",
+                "SIP <= {} from {} ({} body bytes)",
+                status.code.into_u16(),
+                message.tp_info.source,
+                message.body.len(),
+            );
+        }
+
         let mut base_headers = match BaseHeaders::extract_from(&message.headers) {
             Ok(base_headers) => base_headers,
             Err(e) => {

@@ -211,6 +211,18 @@ async fn run_driver(
     let mut vad = crate::vad::Vad::new(server.vad);
     let mut audio_frames_sent: u64 = 0;
 
+    // AMD (answering-machine detection) signal gathering — logged once per call.
+    // Profiles the callee's FIRST utterance after answer: its onset (ms after
+    // answer) and its duration. A human says a short "алло" (~0.3-0.8 s) then
+    // waits; a voicemail/auto-answer plays a long continuous greeting (2-5 s+).
+    // See docs/backlog.md (AMD). `answered_at` anchors onset timing.
+    let mut answered_at: Option<tokio::time::Instant> =
+        if greet_armed { Some(tokio::time::Instant::now()) } else { None };
+    let mut onset_at: Option<tokio::time::Instant> = None;
+    let mut last_speech_at: Option<tokio::time::Instant> = None;
+    let mut utterance_silence: u32 = 0;
+    let mut amd_logged = false;
+
     // Deferred end. `end_call` is NON_BLOCKING: the model calls the tool and
     // KEEPS speaking its goodbye, so ending the driver on the tool call drops
     // the rest of the goodbye audio (heard as "only the first word"). Instead we
@@ -228,6 +240,7 @@ async fn run_driver(
                 match changed {
                     Ok(()) if *answered.borrow() => {
                         greet_armed = true;
+                        answered_at = Some(tokio::time::Instant::now());
                         greet_deadline = tokio::time::Instant::now()
                             + Duration::from_millis(server.greet_after_silence_ms);
                     }
@@ -256,14 +269,46 @@ async fn run_driver(
             frame = audio_in.recv() => {
                 match frame {
                     Some(pcm) => {
+                        let now = tokio::time::Instant::now();
                         if vad.observe(&pcm) {
                             callee_active = true;
                             resume_needed = true;
+                            onset_at = Some(now);
+                            last_speech_at = Some(now);
+                            let onset_ms =
+                                answered_at.map(|a| now.duration_since(a).as_millis() as u64);
                             tracing::info!(
                                 rms = vad.last_rms(),
                                 floor = vad.noise_floor(),
+                                ?onset_ms,
                                 "gemini: callee speech onset — greeting suppressed"
                             );
+                        }
+                        // AMD signal: measure the first utterance's length once
+                        // (~500 ms of trailing silence marks its end).
+                        if !amd_logged {
+                            if let Some(start) = onset_at {
+                                if vad.is_speech_frame() {
+                                    last_speech_at = Some(now);
+                                    utterance_silence = 0;
+                                } else {
+                                    utterance_silence += 1;
+                                    if utterance_silence >= 25 {
+                                        let dur_ms = last_speech_at
+                                            .map(|t| t.duration_since(start).as_millis() as u64)
+                                            .unwrap_or(0);
+                                        let onset_ms = answered_at
+                                            .map(|a| start.duration_since(a).as_millis() as u64);
+                                        tracing::info!(
+                                            target: "amd_probe",
+                                            ?onset_ms,
+                                            first_utterance_ms = dur_ms,
+                                            "amd: callee first-utterance profile"
+                                        );
+                                        amd_logged = true;
+                                    }
+                                }
+                            }
                         }
                         if session.send_audio(&pcm).await.is_err() {
                             break (EndedBy::RemoteClose, None);
