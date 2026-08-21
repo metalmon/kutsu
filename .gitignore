@@ -8,3 +8,6 @@ kutsu.toml
 *.log
 uplink-dump/
 downlink-dump/
+# Per-call runtime output (audio dumps + transcripts)
+/dumps/
+/transcripts/

@@ -11,6 +11,7 @@
 
 mod call;
 mod outcome;
+mod register;
 mod uplink;
 
 pub use outcome::{outcome_from_status, CallOutcome};
@@ -38,6 +39,8 @@ pub enum SipError {
     NotAnswered,
     #[error("media error: {0}")]
     Media(String),
+    #[error("register failed: {0}")]
+    Register(String),
     #[error("sip runtime unavailable")]
     RuntimeGone,
 }
@@ -308,16 +311,33 @@ async fn sip_thread_main(
     active: Arc<AtomicUsize>,
     ready_tx: oneshot::Sender<Result<(), SipError>>,
 ) {
-    let (endpoint, bound) = match call::build_endpoint(local_ip).await {
-        Ok(pair) => {
-            let _ = ready_tx.send(Ok(()));
-            pair
-        }
+    let (endpoint, bound) = match call::build_endpoint(local_ip, cfg.local_port.unwrap_or(0)).await {
+        Ok(pair) => pair,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
             return;
         }
     };
+
+    // Optionally bind a REGISTER before serving calls. The handle must stay
+    // alive for the whole command loop: dropping it unregisters the binding.
+    // A background task (spawned by ezk) refreshes it until then.
+    let _registration = if cfg.register {
+        match register::start_registration(endpoint.clone(), &cfg, server).await {
+            Ok(reg) => {
+                tracing::info!(user = %cfg.username, "SIP REGISTER binding active");
+                Some(reg)
+            }
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let _ = ready_tx.send(Ok(()));
 
     let mut seq: u64 = 0;
     while let Some(cmd) = cmd_rx.recv().await {
@@ -406,7 +426,10 @@ mod tests {
             password: "p".into(),
             from_user: None,
             local_ip: Some("127.0.0.1".parse().unwrap()),
+            local_port: None,
+            sip_domain: None,
             register: false,
+            register_expiry_secs: None,
             transport: Default::default(),
         };
         let t = SipTransport::new(&cfg).await.expect("bind");

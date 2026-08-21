@@ -95,7 +95,10 @@ pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
         password: env_or("KUTSU_SIP_PASS", "kutsupw"),
         from_user: non_empty("KUTSU_SIP_FROM_USER"),
         local_ip: non_empty("KUTSU_SIP_LOCAL_IP").and_then(|s| s.parse().ok()),
-        register: false,
+        local_port: non_empty("KUTSU_SIP_LOCAL_PORT").and_then(|s| s.parse().ok()),
+        sip_domain: non_empty("KUTSU_SIP_DOMAIN"),
+        register: env_bool("KUTSU_SIP_REGISTER", false),
+        register_expiry_secs: non_empty("KUTSU_SIP_REGISTER_EXPIRY").and_then(|s| s.parse().ok()),
         transport: SipTransportKind::Udp,
     };
     Ok((server, sip))

@@ -34,11 +34,31 @@ pub struct SipConfig {
     /// `server`) when absent.
     #[serde(default)]
     pub local_ip: Option<IpAddr>,
+    /// Local UDP port to bind the SIP transport to. `None` (or `0`) lets the OS
+    /// pick an ephemeral port. Set a fixed port for trunks that authorize by a
+    /// static source `IP:port` (e.g. Novofon's IP-authorized SIP trunk): the
+    /// outbound source port must then match the configured origination address.
+    #[serde(default)]
+    pub local_port: Option<u16>,
 
-    // --- extension seams; parsed but not yet wired ---
-    /// Send a REGISTER binding before calling. Not yet implemented.
+    /// SIP domain (host part) for the request/To/From URIs and the REGISTER
+    /// registrar, e.g. `sip.novofon.ru`. When set, outbound URIs carry this
+    /// domain (resolved via DNS by the stack) instead of the numeric `server`
+    /// address — required by trunks that route/authorize by SIP domain. When
+    /// absent, the URIs use `server`'s host (backwards-compatible IP behaviour).
+    #[serde(default)]
+    pub sip_domain: Option<String>,
+    /// Register a binding with the trunk before placing calls (REGISTER +
+    /// digest, refreshed until shutdown). Required by registration-based trunks
+    /// (login/password), e.g. Novofon's standard SIP account.
     #[serde(default)]
     pub register: bool,
+    /// Requested REGISTER binding expiry, seconds. `None` uses the stack
+    /// default. Trunks often prefer a short value (Novofon ~120).
+    #[serde(default)]
+    pub register_expiry_secs: Option<u64>,
+
+    // --- extension seams; parsed but not yet wired ---
     /// Transport kind. Only `Udp` implemented. Not yet wired.
     #[serde(default)]
     pub transport: SipTransportKind,
@@ -278,6 +298,30 @@ mod tests {
         assert_eq!(c.transport, SipTransportKind::Udp);
         assert!(!c.register);
         assert!(c.local_ip.is_none());
+        assert!(c.local_port.is_none());
+    }
+
+    #[test]
+    fn sip_config_parses_local_port() {
+        let json = r#"{"server":"s:5060","username":"u","password":"p","local_port":5060}"#;
+        let c: SipConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.local_port, Some(5060));
+    }
+
+    #[test]
+    fn sip_config_register_defaults_off_and_parses() {
+        let base = r#"{"server":"s:5060","username":"u","password":"p"}"#;
+        let c: SipConfig = serde_json::from_str(base).unwrap();
+        assert!(!c.register);
+        assert!(c.sip_domain.is_none());
+        assert!(c.register_expiry_secs.is_none());
+
+        let json = r#"{"server":"37.139.38.224:5060","username":"06733","password":"p",
+            "sip_domain":"sip.novofon.ru","register":true,"register_expiry_secs":120}"#;
+        let c: SipConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.sip_domain.as_deref(), Some("sip.novofon.ru"));
+        assert!(c.register);
+        assert_eq!(c.register_expiry_secs, Some(120));
     }
 
     #[test]

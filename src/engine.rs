@@ -876,7 +876,10 @@ mod tests {
             password: "test".into(),
             from_user: None,
             local_ip: Some("127.0.0.1".parse().unwrap()),
+            local_port: None,
+            sip_domain: None,
             register: false,
+            register_expiry_secs: None,
             transport: Default::default(),
         };
         (server, sip_cfg)

@@ -11,6 +11,7 @@ use ezk_rtc::OpenSslContext;
 use ezk_sip_auth::{DigestAuthenticator, DigestCredentials, DigestUser};
 use ezk_sip_core::Endpoint;
 use ezk_sip_types::header::typed::Contact;
+use ezk_sip_types::host::{Host, HostPort};
 use ezk_sip_types::uri::{NameAddr, SipUri};
 use ezk_sip_types::Method;
 use ezk_sip_ua::dialog::DialogLayer;
@@ -25,7 +26,12 @@ use crate::sip::{
 
 /// Build the shared endpoint with one UDP transport. `add_allow` is MANDATORY —
 /// an empty Allow header panics ezk on serialization ("tried to use empty vector").
-pub(crate) async fn build_endpoint(local_ip: IpAddr) -> Result<(Endpoint, SocketAddr), SipError> {
+/// `local_port` of `0` binds an OS-chosen ephemeral port; a non-zero value pins
+/// the SIP source port (required by trunks that authorize by static `IP:port`).
+pub(crate) async fn build_endpoint(
+    local_ip: IpAddr,
+    local_port: u16,
+) -> Result<(Endpoint, SocketAddr), SipError> {
     let mut builder = Endpoint::builder();
     builder.add_layer(DialogLayer::default());
     for m in [
@@ -38,14 +44,29 @@ pub(crate) async fn build_endpoint(local_ip: IpAddr) -> Result<(Endpoint, Socket
         builder.add_allow(m);
     }
     let transport = builder
-        .bind_udp(SocketAddr::new(local_ip, 0))
+        .bind_udp(SocketAddr::new(local_ip, local_port))
         .await
         .map_err(SipError::Bind)?;
     let bound = transport.bound();
     Ok((builder.build(), bound))
 }
 
-fn make_auth(cfg: &SipConfig) -> DigestAuthenticator {
+/// Build the SIP-URI host:port for request/To/From URIs and the registrar.
+/// With a configured `domain` (a DNS name the stack resolves), the URIs carry
+/// that domain (required by trunks that route/authorize by SIP domain, e.g.
+/// Novofon `sip.novofon.ru`); otherwise they fall back to the numeric `server`
+/// host (backwards-compatible IP behaviour). The port always comes from `server`.
+pub(crate) fn uri_host_port(server: SocketAddr, domain: Option<&str>) -> HostPort {
+    match domain {
+        Some(d) if !d.is_empty() => HostPort {
+            host: Host::Name(BytesStr::from(d)),
+            port: Some(server.port()),
+        },
+        _ => server.into(),
+    }
+}
+
+pub(crate) fn make_auth(cfg: &SipConfig) -> DigestAuthenticator {
     let mut creds = DigestCredentials::new();
     creds.set_default(DigestUser::new(
         cfg.username.clone(),
@@ -73,16 +94,16 @@ fn build_media(local_ip: IpAddr) -> Result<RtcMediaBackend, SipError> {
 }
 
 fn make_uris(
-    server: SocketAddr,
+    uri_host: HostPort,
     from_user: &str,
     bound: SocketAddr,
     number: &str,
 ) -> (NameAddr, Contact, SipUri) {
-    let id = NameAddr::uri(SipUri::new(server.into()).user(BytesStr::from(from_user)));
+    let id = NameAddr::uri(SipUri::new(uri_host.clone()).user(BytesStr::from(from_user)));
     let contact = Contact::new(NameAddr::uri(
         SipUri::new(bound.into()).user(BytesStr::from(from_user)),
     ));
-    let target = SipUri::new(server.into()).user(BytesStr::from(number));
+    let target = SipUri::new(uri_host).user(BytesStr::from(number));
     (id, contact, target)
 }
 
@@ -113,7 +134,8 @@ pub(crate) async fn run_call(
             return;
         }
     };
-    let (id, contact, target) = make_uris(server, cfg.from_user(), bound, &number);
+    let uri_host = uri_host_port(server, cfg.sip_domain.as_deref());
+    let (id, contact, target) = make_uris(uri_host, cfg.from_user(), bound, &number);
 
     let mut outbound = match OutboundCall::make(endpoint, make_auth(&cfg), id, contact, target, media)
         .await
