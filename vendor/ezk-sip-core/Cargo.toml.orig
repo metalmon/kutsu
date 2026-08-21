@@ -1,0 +1,50 @@
+[package]
+name = "ezk-sip-core"
+version = "0.9.1"
+description = "SIP core crate providing abstrations over transport and transactions"
+categories = ["network-programming", "multimedia"]
+keywords = ["sip"]
+readme = "README.md"
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+internal.workspace = true
+sip-types.workspace = true
+stun-types.workspace = true
+stun.workspace = true
+
+tracing = "0.1"
+bytes = "1"
+tokio = { version = "1", features = [
+  "net",
+  "rt-multi-thread",
+  "sync",
+  "macros",
+  "io-util",
+] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
+log = "0.4"
+thiserror = "2"
+parking_lot = "0.12"
+rand = "0.10"
+bytesstr = "1"
+downcast-rs = "2"
+hickory-resolver = "0.26.0"
+multimap = "0.10"
+
+tokio-rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+tokio-native-tls = { workspace = true, optional = true }
+
+[features]
+tls-rustls = ["dep:tokio-rustls", "dep:rustls-pki-types"]
+tls-native-tls = ["dep:tokio-native-tls"]

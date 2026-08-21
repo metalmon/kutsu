@@ -7,6 +7,9 @@ license = "MIT"
 
 [workspace]
 members = ["crates/gemini-live"]
+# vendor/ezk-sip-core is a patched fork used only via [patch.crates-io] below,
+# not a workspace member.
+exclude = ["vendor"]
 
 [lib]
 name = "kutsu"
@@ -69,6 +72,13 @@ ezk-sip-types = "0.6"
 # recipe yields a self-contained binary needing no OpenSSL on the deploy host.
 vendor-openssl = ["ezk-rtc/vendor-openssl"]
 live-tests = []
+
+[patch.crates-io]
+# Local fork of ezk-sip-core 0.9.1: `create_via` now emits a bare `rport` param
+# so SIP responses route back through NAT to the actual source IP:port (RFC 3581)
+# instead of the private Via sent-by. Required by Novofon (honors Via/rport, does
+# not blindly latch). See vendor/ezk-sip-core and memory novofon-nat-rport.
+ezk-sip-core = { path = "vendor/ezk-sip-core" }
 
 [dev-dependencies]
 tempfile = "3"
