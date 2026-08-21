@@ -218,6 +218,7 @@ mod tests {
             quality: crate::config::QualityConfig::default(),
             retry: crate::config::RetryConfig::default(),
             vad: VadConfig::default(),
+            agc: crate::config::AgcConfig::default(),
             resume_cue: RESUME_CUE.into(),
         };
         let sip = SipConfig {

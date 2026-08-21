@@ -687,6 +687,7 @@ async fn run_call(
         call_id: call_id.clone(),
         uplink_dump: server.dump_uplink_dir.clone(),
         downlink_dump: server.dump_downlink_dir.clone(),
+        agc_cfg: server.agc,
     };
     let mut bridge_task = tokio::spawn(bridge::run(ports));
 
@@ -868,6 +869,7 @@ mod tests {
             quality: crate::config::QualityConfig::default(),
             retry: crate::config::RetryConfig::default(),
             vad: VadConfig::default(),
+            agc: crate::config::AgcConfig::default(),
             resume_cue: RESUME_CUE.into(),
         };
         let sip_cfg = SipConfig {

@@ -87,6 +87,12 @@ pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
             onset_frames: env_u32("KUTSU_VAD_ONSET_FRAMES", 3),
             warmup_frames: env_u32("KUTSU_VAD_WARMUP_FRAMES", 10),
         },
+        agc: crate::config::AgcConfig {
+            enabled: env_bool("KUTSU_AGC_ENABLED", true),
+            target_dbfs: env_f32("KUTSU_AGC_TARGET_DBFS", -18.0),
+            max_gain_db: env_f32("KUTSU_AGC_MAX_GAIN_DB", 30.0),
+            noise_floor_rms: env_f32("KUTSU_AGC_NOISE_FLOOR_RMS", 200.0),
+        },
         resume_cue: env_or("KUTSU_RESUME_CUE", RESUME_CUE),
     };
     let sip = SipConfig {

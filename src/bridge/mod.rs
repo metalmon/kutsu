@@ -6,6 +6,7 @@
 //!
 //! Not yet implemented.
 
+mod agc;
 mod g711;
 mod resample;
 mod pace;
@@ -113,6 +114,8 @@ pub struct BridgePorts {
     /// If set, directory to write per-call downlink WAV dumps into
     /// (`<call>-downlink-24k.wav` from Gemini + `<call>-downlink-8k.wav` to phone).
     pub downlink_dump: Option<std::path::PathBuf>,
+    /// Adaptive gain applied to the uplink before it reaches Gemini.
+    pub agc_cfg: crate::config::AgcConfig,
 }
 
 /// Why the bridge stopped.
@@ -140,6 +143,7 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
         call_id,
         uplink_dump,
         downlink_dump,
+        agc_cfg,
     } = ports;
 
     // Uplink: transparent, continuous, never-manipulated forward (spec §2).
@@ -169,8 +173,13 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
                 }
             }
         });
+        let mut agc = agc::Agc::new(agc_cfg);
         while let Some(payload) = phone_in.recv().await {
-            let pcm8 = g711::decode(codec, &payload);
+            let mut pcm8 = g711::decode(codec, &payload);
+            // Normalise the (often quiet) real-trunk uplink toward a target level
+            // so Gemini's speech detection fires reliably; everything downstream
+            // (level metric, resample, dumps, VAD, Gemini) sees the result.
+            agc.process(&mut pcm8);
             uplink_quality.add_uplink_level(&pcm8);
             let pcm16 = resample::up_8k_16k(&pcm8);
             // Synchronous `hound` writes on this async uplink task, between
@@ -385,6 +394,7 @@ mod tests {
                 quality: QualityShared::new(),
                 call_id: "c1".to_string(),
                 uplink_dump: None, downlink_dump: None,
+                agc_cfg: crate::config::AgcConfig { enabled: false, ..Default::default() },
             },
             Ends { phone_in_tx, phone_out_rx, gemini_in_rx, gemini_events_tx, events_out_rx },
         )

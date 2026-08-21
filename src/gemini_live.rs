@@ -547,7 +547,8 @@ mod tests {
             greet_after_silence_ms: 0, transcript_dir: None, dump_uplink_dir: None, dump_downlink_dir: None,
             max_call_secs: 600, quality: crate::config::QualityConfig::default(),
             retry: crate::config::RetryConfig::default(),
-            vad: VadConfig::default(), resume_cue: RESUME_CUE.into() }
+            vad: VadConfig::default(), agc: crate::config::AgcConfig::default(),
+            resume_cue: RESUME_CUE.into() }
     }
 
     /// A crate `SetupConfig` for tests (its content is irrelevant to the driver

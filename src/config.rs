@@ -165,6 +165,8 @@ pub struct ServerConfig {
     pub retry: RetryConfig,
     /// Energy-VAD tuning for detecting that the callee has started speaking.
     pub vad: VadConfig,
+    /// Adaptive gain applied to the uplink (callee → Gemini).
+    pub agc: AgcConfig,
     /// Instruction sent to the model when a session reconnects with lost context.
     pub resume_cue: String,
 }
@@ -192,6 +194,32 @@ impl Default for QualityConfig {
         // tuned against a zero-jitter LAN PBX; on a live Novofon→mobile call 800
         // dropped starvation from ~1460 ms to ~0 with no audible latency cost.
         Self { prebuffer_ms: 800, resume_ms: 400, abort_underruns: 40 }
+    }
+}
+
+/// Adaptive gain control for the uplink (callee → Gemini). Real trunks arrive
+/// quiet (~-32 dBFS), which under-triggers Gemini's speech detection; AGC lifts
+/// soft speech toward `target_dbfs` so it is reliably detected, while holding
+/// gain on near-silence (below `noise_floor_rms`) so background noise is not
+/// amplified into false speech.
+#[derive(Debug, Clone, Copy)]
+pub struct AgcConfig {
+    /// Master toggle. When false the uplink is passed through untouched.
+    pub enabled: bool,
+    /// Target output level in dBFS (0 = full scale). Sustained speech is driven
+    /// toward this level.
+    pub target_dbfs: f32,
+    /// Ceiling on applied gain, in dB — bounds how far very quiet input is
+    /// boosted (prevents blowing up a nearly-silent line).
+    pub max_gain_db: f32,
+    /// Frames with RMS below this are treated as silence/noise: gain is held
+    /// (not driven up toward the target), so background is not amplified.
+    pub noise_floor_rms: f32,
+}
+
+impl Default for AgcConfig {
+    fn default() -> Self {
+        Self { enabled: true, target_dbfs: -18.0, max_gain_db: 30.0, noise_floor_rms: 200.0 }
     }
 }
 
@@ -365,6 +393,7 @@ mod tests {
             quality: QualityConfig::default(),
             retry: RetryConfig::default(),
             vad: VadConfig::default(),
+            agc: AgcConfig::default(),
             resume_cue: RESUME_CUE.into(),
         };
         assert_eq!(c.max_call_secs, 600);
