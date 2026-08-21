@@ -1,7 +1,7 @@
 //! Per-call ezk driving loop (runs on the SIP runtime thread).
 
 use std::net::{IpAddr, SocketAddr};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use bytesstr::BytesStr;
@@ -250,12 +250,28 @@ pub(crate) async fn run_call(
     // RtpSender::send waits for transport-Connected, which the main call.run()
     // loop supplies — so the two must run concurrently).
     let out_task = tokio::task::spawn_local(async move {
+        // RTP media time = a MONOTONIC 20 ms/frame clock, NOT `Instant::now()`.
+        // ezk derives the packet's RTP timestamp from `media_time`; the downlink
+        // is a continuous 20 ms G.711 stream (the pacer emits one frame — audio
+        // or silence — per tick), so the timestamp must advance by exactly one
+        // frame (160 samples @ 8 kHz) per packet. Stamping `Instant::now()` per
+        // packet folds the pacer/scheduler jitter into the RTP timestamps, which
+        // a tolerant LAN PBX ignored but a real carrier's jitter buffer renders
+        // as stutter/dropouts. Anchoring to a fixed clock removes that.
+        //
+        // `send_at` also defaults to `media_time`; with the pacer's
+        // `MissedTickBehavior::Delay` the real cadence only ever drifts *slower*
+        // than 20 ms, so `media_time` stays at/behind `now` and packets still go
+        // out immediately (no added latency).
+        let frame = Duration::from_millis(20);
+        let mut media_time: Option<Instant> = None;
         while let Some(payload) = out_rx.recv().await {
-            if sender
-                .send(SendRtpPacket::new(Instant::now(), pt, payload))
-                .await
-                .is_err()
-            {
+            let mt = match media_time {
+                Some(prev) => prev + frame,
+                None => Instant::now(),
+            };
+            media_time = Some(mt);
+            if sender.send(SendRtpPacket::new(mt, pt, payload)).await.is_err() {
                 break;
             }
         }
