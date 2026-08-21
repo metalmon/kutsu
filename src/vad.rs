@@ -52,10 +52,16 @@ impl Vad {
     /// Feed one incoming callee frame. Returns true exactly once — on the frame
     /// that confirms speech onset. Once fired, always returns false.
     pub fn observe(&mut self, frame: &[i16]) -> bool {
-        if self.fired || frame.is_empty() { return false; }
+        if frame.is_empty() { return false; }
         let sumsq: f64 = frame.iter().map(|&s| (s as f64) * (s as f64)).sum();
         let rms = (sumsq / frame.len() as f64).sqrt() as f32;
         self.last_rms = rms;
+        // Onset fires only once, but keep `last_rms` fresh on every later frame
+        // so `is_speech_frame()` (utterance profiling / AMD) tracks live energy
+        // instead of freezing at the loud onset value.
+        if self.fired {
+            return false;
+        }
 
         if self.frames_seen < self.cfg.warmup_frames {
             let is_seed_frame = self.frames_seen == 0;
