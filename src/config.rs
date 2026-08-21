@@ -184,7 +184,14 @@ pub struct QualityConfig {
 
 impl Default for QualityConfig {
     fn default() -> Self {
-        Self { prebuffer_ms: 180, resume_ms: 60, abort_underruns: 40 }
+        // Tuned for a real trunk: Gemini delivers audio in bursts ≥ prebuffer
+        // (so a large prebuffer builds a jitter cushion without adding turn-start
+        // latency — measured onset stays ~0), and that cushion rides out the
+        // multi-hundred-ms mid-turn gaps in Gemini's delivery over the network
+        // that a smaller buffer rendered as dropouts. The earlier 180/60 was
+        // tuned against a zero-jitter LAN PBX; on a live Novofon→mobile call 800
+        // dropped starvation from ~1460 ms to ~0 with no audible latency cost.
+        Self { prebuffer_ms: 800, resume_ms: 400, abort_underruns: 40 }
     }
 }
 
@@ -334,8 +341,8 @@ mod tests {
     #[test]
     fn quality_config_defaults() {
         let q = QualityConfig::default();
-        assert_eq!(q.prebuffer_ms, 180);
-        assert_eq!(q.resume_ms, 60);
+        assert_eq!(q.prebuffer_ms, 800);
+        assert_eq!(q.resume_ms, 400);
         assert_eq!(q.abort_underruns, 40);
     }
 
