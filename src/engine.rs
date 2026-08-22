@@ -579,6 +579,35 @@ async fn run_call(
 ) {
     let _cancel_guard = CancelGuard { cancels: cancels.clone(), call_id: call_id.clone() };
     tracing::info!(%call_id, attempt, retry_of = ?retry_of, "dispatching call");
+
+    // 0. Network preflight (fail-closed): probe the Gemini leg BEFORE dialing so
+    // a bad network refuses the call instead of burning a PSTN call on it. Gated
+    // by net_check.enabled (KUTSU_NETCHECK_ENABLED). Note: this covers only the
+    // Gemini leg, not the callee's RTP/cellular leg — see the mid-call RTP abort
+    // below and docs/backlog.md.
+    if server.net_check.enabled {
+        match crate::net_check::preflight(&server).await {
+            Ok(health) => {
+                let v = crate::net_check::verdict(&health, &server.net_check);
+                tracing::info!(%call_id, health = %health.summary(), verdict = ?v, "network preflight");
+                if v == crate::net_check::Verdict::Unusable {
+                    store.finalize(&call_id, CallState::Failed, None,
+                        Some(format!("network preflight unusable: {}", health.summary())),
+                        Some(CallOutcome::Failed), now_ms());
+                    bump_counter_outcome(&counters, CallOutcome::Failed);
+                    return;
+                }
+            }
+            Err(e) => {
+                store.finalize(&call_id, CallState::Failed, None,
+                    Some(format!("network preflight failed: {e}")),
+                    Some(CallOutcome::Failed), now_ms());
+                bump_counter_outcome(&counters, CallOutcome::Failed);
+                return;
+            }
+        }
+    }
+
     // 1. INVITE.
     let call = match sip.place_call(&number).await {
         Ok(c) => c,
@@ -776,6 +805,20 @@ async fn run_call(
                         q.underruns, q.starved_ms
                     ));
                     break CallState::Failed;
+                }
+                // Mid-call RTP gate: abort on sustained high uplink packet loss
+                // (a failing callee/cellular leg — the preflight covered only the
+                // Gemini leg). Cumulative; needs >~5 s of RTP before it judges.
+                let up_total = q.uplink_received + q.uplink_lost;
+                if up_total > 250 {
+                    let loss_pct = q.uplink_lost as f32 / up_total as f32 * 100.0;
+                    if loss_pct > 10.0 {
+                        abort_reason = Some(format!(
+                            "aborted: uplink RTP loss {loss_pct:.1}% ({} lost / {up_total})",
+                            q.uplink_lost
+                        ));
+                        break CallState::Failed;
+                    }
                 }
             }
         }
