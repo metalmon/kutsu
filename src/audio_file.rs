@@ -37,8 +37,10 @@ pub fn read_pcm16(path: &Path, expected_rate: u32) -> Result<Vec<i16>> {
             return Err(Error::Config("raw PCM file has odd byte length".into()));
         }
         Ok(bytes
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| i16::from_le_bytes(*b))
             .collect())
     }
 }
