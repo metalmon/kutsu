@@ -689,22 +689,22 @@ mod tests {
     #[test]
     fn transcript_accumulator_concatenates_deltas_and_flushes_per_turn() {
         let mut acc = TranscriptAccumulator::default();
-        acc.on_delta(Role::User, "Да");
-        acc.on_delta(Role::User, ", удобно");
-        acc.on_delta(Role::Model, "Здравствуй");
-        acc.on_delta(Role::Model, "те!");
+        acc.on_delta(Role::User, "Yes");
+        acc.on_delta(Role::User, ", sure");
+        acc.on_delta(Role::Model, "Hel");
+        acc.on_delta(Role::Model, "lo!");
         let t1 = acc.flush(100);
         assert_eq!(t1.len(), 2);
         assert_eq!(t1[0].role, Role::User);
-        assert_eq!(t1[0].text, "Да, удобно");
+        assert_eq!(t1[0].text, "Yes, sure");
         assert_eq!(t1[1].role, Role::Model);
-        assert_eq!(t1[1].text, "Здравствуйте!");
+        assert_eq!(t1[1].text, "Hello!");
         assert!(acc.flush(200).is_empty());
-        acc.on_delta(Role::Model, "До свидания");
+        acc.on_delta(Role::Model, "Goodbye");
         let t2 = acc.flush(300);
         assert_eq!(t2.len(), 1);
         assert_eq!(t2[0].role, Role::Model);
-        assert_eq!(t2[0].text, "До свидания");
+        assert_eq!(t2[0].text, "Goodbye");
     }
 
     // --- end_call + transcript flow (was run_session's transcript_and_end_call) --
