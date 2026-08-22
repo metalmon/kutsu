@@ -64,9 +64,13 @@ fn main() -> anyhow::Result<()> {
         pairs.push((verdict.class, *actual));
     }
 
+    println!(
+        "\n{}",
+        kutsu::amd::eval::render_confusion(&kutsu::amd::eval::confusion(&pairs))
+    );
     let m = kutsu::amd::eval::binary_metrics(&pairs);
     println!(
-        "\nmachine-vs-human: precision={:.3} recall={:.3} f1={:.3} (n={})",
+        "machine-vs-human: precision={:.3} recall={:.3} f1={:.3} (n={})",
         m.precision,
         m.recall,
         m.f1,

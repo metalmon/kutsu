@@ -44,6 +44,33 @@ pub fn binary_metrics(pairs: &[(AmdClass, AmdClass)]) -> BinaryMetrics {
     }
 }
 
+/// Confusion counts indexed `[actual][predicted]` over [`AmdClass::ALL`].
+pub fn confusion(pairs: &[(AmdClass, AmdClass)]) -> [[u32; 4]; 4] {
+    let mut m = [[0u32; 4]; 4];
+    for (pred, actual) in pairs {
+        m[actual.index()][pred.index()] += 1;
+    }
+    m
+}
+
+/// Render a confusion matrix (rows = actual, columns = predicted) as text.
+pub fn render_confusion(m: &[[u32; 4]; 4]) -> String {
+    let mut s = String::from("confusion (rows=actual, cols=predicted):\n");
+    s.push_str(&format!("{:>10}", ""));
+    for c in AmdClass::ALL {
+        s.push_str(&format!("{:>10}", c.label()));
+    }
+    s.push('\n');
+    for actual in AmdClass::ALL {
+        s.push_str(&format!("{:>10}", actual.label()));
+        for pred in AmdClass::ALL {
+            s.push_str(&format!("{:>10}", m[actual.index()][pred.index()]));
+        }
+        s.push('\n');
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +101,22 @@ mod tests {
         let m = binary_metrics(&pairs);
         assert_eq!(m.precision, 0.0);
         assert_eq!(m.recall, 0.0);
+    }
+
+    #[test]
+    fn confusion_counts_by_actual_then_predicted() {
+        let pairs = vec![
+            (Human, Human),         // actual human, predicted human
+            (Voicemail, Human),     // actual human, predicted voicemail
+            (Voicemail, Voicemail), // actual voicemail, predicted voicemail
+            (Hold, Ivr),            // actual ivr, predicted hold
+        ];
+        let m = confusion(&pairs);
+        assert_eq!(m[Human.index()][Human.index()], 1);
+        assert_eq!(m[Human.index()][Voicemail.index()], 1);
+        assert_eq!(m[Voicemail.index()][Voicemail.index()], 1);
+        assert_eq!(m[Ivr.index()][Hold.index()], 1);
+        // A cell with no observations stays zero.
+        assert_eq!(m[Hold.index()][Hold.index()], 0);
     }
 }

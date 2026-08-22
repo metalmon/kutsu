@@ -24,9 +24,37 @@ pub enum AmdClass {
 }
 
 impl AmdClass {
+    /// All variants, in a stable order — the axes of the confusion matrix.
+    pub const ALL: [AmdClass; 4] = [
+        AmdClass::Human,
+        AmdClass::Voicemail,
+        AmdClass::Ivr,
+        AmdClass::Hold,
+    ];
+
     /// The actionable axis: anything that is not a live human is a machine.
     pub fn is_machine(&self) -> bool {
         !matches!(self, AmdClass::Human)
+    }
+
+    /// Position in [`AmdClass::ALL`] — the confusion-matrix index.
+    pub fn index(self) -> usize {
+        match self {
+            AmdClass::Human => 0,
+            AmdClass::Voicemail => 1,
+            AmdClass::Ivr => 2,
+            AmdClass::Hold => 3,
+        }
+    }
+
+    /// Short lowercase label for reports.
+    pub fn label(self) -> &'static str {
+        match self {
+            AmdClass::Human => "human",
+            AmdClass::Voicemail => "voicemail",
+            AmdClass::Ivr => "ivr",
+            AmdClass::Hold => "hold",
+        }
     }
 }
 
