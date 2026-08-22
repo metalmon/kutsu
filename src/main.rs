@@ -467,8 +467,21 @@ async fn run_call_cli(number: String, scenario_path: Option<std::path::PathBuf>)
         detail.map(|d| format!(" — {d}")).unwrap_or_default(),
     );
     engine.shutdown().await;
+    // Exit non-zero for any technical/dial failure so scripts can branch on it.
+    // This preserves the pre-disposition CLI contract, where every unanswered
+    // dial outcome collapsed into `CallState::Failed` -> exit 1. Answered
+    // outcomes (Completed/Voicemail/Announcement/Ivr/Hold) and an operator
+    // Cancelled are exit 0.
+    use kutsu::state::Disposition;
     match disposition {
-        Some(kutsu::state::Disposition::Failed) => 1,
+        Some(
+            Disposition::Failed
+            | Disposition::Busy
+            | Disposition::NoAnswer
+            | Disposition::Rejected
+            | Disposition::NotFound
+            | Disposition::Unavailable,
+        ) => 1,
         _ => 0,
     }
 }
