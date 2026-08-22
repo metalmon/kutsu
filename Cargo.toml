@@ -87,9 +87,10 @@ live-tests = []
 # Offline AMD evaluation harness (dev only; the `amd-eval` binary). Never
 # enabled for the release build.
 amd-eval = []
-# Silero neural VAD backend (ONNX via `ort`). Off by default; the `ort` dep is
-# wired in Task 7. Enabled in a prod build only if it wins the harness.
-amd-silero = []
+# NOTE: the `amd-silero` feature (Silero neural VAD via `ort`/onnx) is deferred;
+# it lands with the Silero framer itself (needs the ONNX model asset + a
+# validated ort build). The `amd-eval` binary already stubs the `silero` framer
+# name with a clear error until then.
 
 [patch.crates-io]
 # Local fork of ezk-sip-core 0.9.1: `create_via` now emits a bare `rport` param

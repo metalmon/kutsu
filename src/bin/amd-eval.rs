@@ -31,10 +31,8 @@ struct Cli {
 fn make_framer(name: &str) -> anyhow::Result<Box<dyn SpeechFramer>> {
     match name {
         "energy" => Ok(Box::new(EnergyFramer::new(VadConfig::default()))),
-        #[cfg(feature = "amd-silero")]
-        "silero" => Ok(Box::new(kutsu::amd::framer::SileroFramer::new()?)),
-        #[cfg(not(feature = "amd-silero"))]
-        "silero" => anyhow::bail!("silero framer needs a build with --features amd-silero"),
+        // The Silero backend is deferred (see the amd-harness plan, Task 7).
+        "silero" => anyhow::bail!("silero framer not yet implemented"),
         other => anyhow::bail!("unknown framer: {other}"),
     }
 }
