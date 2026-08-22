@@ -30,7 +30,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         # Lint kutsu's own code only; the gemini-live submodule has its own CI
-        # (--no-deps skips the workspace path dep).
+        # (--no-deps skips the workspace path dep). `--all-features` includes
+        # `amd-silero`, so `ort` pulls a prebuilt onnxruntime from its CDN here.
         run: cargo clippy -p kutsu --all-targets --all-features --no-deps -- -D warnings
       - name: Test
         run: cargo test --all-features

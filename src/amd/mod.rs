@@ -12,6 +12,8 @@ pub mod framer;
 pub mod corpus;
 #[cfg(feature = "amd-eval")]
 pub mod eval;
+#[cfg(feature = "amd-silero")]
+pub mod silero;
 
 /// What the far end is, from the callee-audio profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
