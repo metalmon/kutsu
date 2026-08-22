@@ -24,8 +24,9 @@ jobs:
         run: |
           sudo apt-get update
           # cmake -> bundled libsrtp2; clang/libclang -> bindgen; perl+make (present)
-          # drive the vendored OpenSSL source build.
-          sudo apt-get install -y cmake clang llvm libclang-dev
+          # drive the vendored OpenSSL source build; libdbus-1-dev -> the rtkit
+          # path of audio_thread_priority (RT priority without CAP_SYS_NICE).
+          sudo apt-get install -y cmake clang llvm libclang-dev libdbus-1-dev
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

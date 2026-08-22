@@ -17,8 +17,9 @@ jobs:
         run: |
           sudo apt-get update
           # System OpenSSL keeps CI fast (release builds vendor it instead);
-          # cmake -> libsrtp2, clang/libclang -> bindgen.
-          sudo apt-get install -y cmake clang libclang-dev libssl-dev pkg-config
+          # cmake -> libsrtp2, clang/libclang -> bindgen, libdbus-1-dev -> the
+          # rtkit path of audio_thread_priority.
+          sudo apt-get install -y cmake clang libclang-dev libssl-dev pkg-config libdbus-1-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
