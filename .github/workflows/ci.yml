@@ -29,6 +29,7 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        # Lint kutsu's own code; the gemini-live submodule has its own CI.
+        run: cargo clippy -p kutsu --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all-features
