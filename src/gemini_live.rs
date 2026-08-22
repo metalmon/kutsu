@@ -17,9 +17,9 @@ use ::gemini_live::session::{ClientConfig, Event as CrateEvent, Session as Crate
 use ::gemini_live::transport::ProxyConfig;
 use ::gemini_live::types::{Model as GeminiModel, SetupConfig};
 
-pub use ::gemini_live::types::Role;
 use crate::config::{ScenarioConfig, ServerConfig};
 use crate::error::Result;
+pub use ::gemini_live::types::Role;
 
 /// Bridge-facing event stream produced by a running session. This is kutsu's
 /// own enum (the bridge/engine consume it); its *source* is the crate's
@@ -27,14 +27,23 @@ use crate::error::Result;
 #[derive(Debug)]
 pub enum Event {
     OutputAudio(Vec<i16>),
-    Transcript { role: Role, text: String, final_: bool },
+    Transcript {
+        role: Role,
+        text: String,
+        final_: bool,
+    },
     Interrupted,
     TurnComplete,
-    EndCall { goal: Value },
+    EndCall {
+        goal: Value,
+    },
     /// An emotion the model detected (from `enableAffectiveDialog`) for the user
     /// or the model itself. The model already adapts its tone; kutsu records this
     /// so the emotional arc is visible in the CallRecord / via MCP.
-    Affect { role: Role, label: String },
+    Affect {
+        role: Role,
+        label: String,
+    },
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -81,11 +90,19 @@ impl TranscriptAccumulator {
         let mut out = Vec::new();
         let u = self.user.trim();
         if !u.is_empty() {
-            out.push(TranscriptEntry { role: Role::User, text: u.to_string(), ts_ms });
+            out.push(TranscriptEntry {
+                role: Role::User,
+                text: u.to_string(),
+                ts_ms,
+            });
         }
         let m = self.model.trim();
         if !m.is_empty() {
-            out.push(TranscriptEntry { role: Role::Model, text: m.to_string(), ts_ms });
+            out.push(TranscriptEntry {
+                role: Role::Model,
+                text: m.to_string(),
+                ts_ms,
+            });
         }
         self.user.clear();
         self.model.clear();
@@ -110,8 +127,7 @@ pub struct CallOutcome {
 
 /// Kickoff cue sent as a user turn when the callee stays silent. It only hands
 /// the turn to the model — the greeting wording comes from the system prompt.
-const GREET_CUE: &str =
-    "The call has connected and the other party has not spoken yet. \
+const GREET_CUE: &str = "The call has connected and the other party has not spoken yet. \
      Greet them now and begin the conversation as instructed.";
 
 /// Map kutsu's config-level model onto the crate's model enum. `pub(crate)` so
@@ -135,7 +151,11 @@ fn client_config(server: &ServerConfig, scenario: &ScenarioConfig) -> ClientConf
     let setup = SetupConfig {
         model,
         voice: server.voice.clone(),
-        language: if native { None } else { Some(server.language.clone()) },
+        language: if native {
+            None
+        } else {
+            Some(server.language.clone())
+        },
         system_instruction: crate::proto::assemble_system_instruction(server, scenario),
         temperature: 0.8,
         goal_schema: scenario.goal_schema.clone(),
@@ -216,8 +236,11 @@ async fn run_driver(
     // answer) and its duration. A human says a short "алло" (~0.3-0.8 s) then
     // waits; a voicemail/auto-answer plays a long continuous greeting (2-5 s+).
     // See docs/backlog.md (AMD). `answered_at` anchors onset timing.
-    let mut answered_at: Option<tokio::time::Instant> =
-        if greet_armed { Some(tokio::time::Instant::now()) } else { None };
+    let mut answered_at: Option<tokio::time::Instant> = if greet_armed {
+        Some(tokio::time::Instant::now())
+    } else {
+        None
+    };
     let mut onset_at: Option<tokio::time::Instant> = None;
     let mut last_speech_at: Option<tokio::time::Instant> = None;
     let mut utterance_silence: u32 = 0;
@@ -286,8 +309,8 @@ async fn run_driver(
                         }
                         // AMD signal: measure the first utterance's length once
                         // (~500 ms of trailing silence marks its end).
-                        if !amd_logged {
-                            if let Some(start) = onset_at {
+                        if !amd_logged
+                            && let Some(start) = onset_at {
                                 if vad.is_speech_frame() {
                                     last_speech_at = Some(now);
                                     utterance_silence = 0;
@@ -309,12 +332,11 @@ async fn run_driver(
                                     }
                                 }
                             }
-                        }
                         if session.send_audio(&pcm).await.is_err() {
                             break (EndedBy::RemoteClose, None);
                         }
                         audio_frames_sent += 1;
-                        if audio_frames_sent % 100 == 0 {
+                        if audio_frames_sent.is_multiple_of(100) {
                             tracing::debug!(audio_frames_sent, "gemini: audio streaming");
                         }
                     }
@@ -436,7 +458,11 @@ async fn run_driver(
         transcript.extend(entries);
     }
 
-    CallOutcome { ended_by, goal, transcript }
+    CallOutcome {
+        ended_by,
+        goal,
+        transcript,
+    }
 }
 
 /// Connect (warm) to Gemini Live and drive the call. `Session::connect` is the
@@ -455,7 +481,11 @@ async fn connect_and_drive(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "gemini: initial connect failed");
-            return CallOutcome { ended_by: EndedBy::Error, goal: None, transcript: Vec::new() };
+            return CallOutcome {
+                ended_by: EndedBy::Error,
+                goal: None,
+                transcript: Vec::new(),
+            };
         }
     };
     run_driver(session, &server, answered, audio_in, events, hangup_rx).await
@@ -479,9 +509,16 @@ pub async fn start(
     let server = server.clone();
     let scenario = scenario.clone();
 
-    let join = tokio::spawn(connect_and_drive(server, scenario, answered, audio_rx, event_tx, hangup_rx));
+    let join = tokio::spawn(connect_and_drive(
+        server, scenario, answered, audio_rx, event_tx, hangup_rx,
+    ));
 
-    Ok(Session { audio_in: audio_tx, events: event_rx, join, hangup_tx })
+    Ok(Session {
+        audio_in: audio_tx,
+        events: event_rx,
+        join,
+        hangup_tx,
+    })
 }
 
 /// Public session handle returned by `start`.
@@ -498,14 +535,19 @@ impl Session {
     }
     pub async fn join(self) -> CallOutcome {
         self.join.await.unwrap_or(CallOutcome {
-            ended_by: EndedBy::Error, goal: None, transcript: Vec::new(),
+            ended_by: EndedBy::Error,
+            goal: None,
+            transcript: Vec::new(),
         })
     }
 
     /// Decompose into a control handle + the audio sink + the event stream.
     pub fn split(self) -> (SessionHandle, mpsc::Sender<Vec<i16>>, mpsc::Receiver<Event>) {
         (
-            SessionHandle { join: self.join, hangup_tx: self.hangup_tx },
+            SessionHandle {
+                join: self.join,
+                hangup_tx: self.hangup_tx,
+            },
             self.audio_in,
             self.events,
         )
@@ -541,36 +583,59 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn server() -> ServerConfig {
-        ServerConfig { api_key: "K".into(), proxy: None, model: Model::HalfCascade,
-            voice: "Autonoe".into(), voice_gender: crate::config::Gender::Female, language: "en-US".into(),
-            net_check: NetCheckConfig::default(), max_concurrent_channels: 3,
-            greet_after_silence_ms: 0, transcript_dir: None, dump_uplink_dir: None, dump_downlink_dir: None,
-            max_call_secs: 600, quality: crate::config::QualityConfig::default(),
+        ServerConfig {
+            api_key: "K".into(),
+            proxy: None,
+            model: Model::HalfCascade,
+            voice: "Autonoe".into(),
+            voice_gender: crate::config::Gender::Female,
+            language: "en-US".into(),
+            net_check: NetCheckConfig::default(),
+            max_concurrent_channels: 3,
+            greet_after_silence_ms: 0,
+            transcript_dir: None,
+            dump_uplink_dir: None,
+            dump_downlink_dir: None,
+            max_call_secs: 600,
+            quality: crate::config::QualityConfig::default(),
             retry: crate::config::RetryConfig::default(),
-            vad: VadConfig::default(), agc: crate::config::AgcConfig::default(),
-            resume_cue: RESUME_CUE.into() }
+            vad: VadConfig::default(),
+            agc: crate::config::AgcConfig::default(),
+            resume_cue: RESUME_CUE.into(),
+        }
     }
 
     /// A crate `SetupConfig` for tests (its content is irrelevant to the driver
     /// assertions; RESUME_CUE/GREET_CUE are sourced from `ServerConfig`).
     fn setup() -> SetupConfig {
         SetupConfig {
-            model: GModel::HalfCascade, voice: "Autonoe".into(), language: Some("en-US".into()),
-            system_instruction: "hi".into(), temperature: 0.8,
-            goal_schema: serde_json::json!({"type":"object"}), resume_handle: None,
+            model: GModel::HalfCascade,
+            voice: "Autonoe".into(),
+            language: Some("en-US".into()),
+            system_instruction: "hi".into(),
+            temperature: 0.8,
+            goal_schema: serde_json::json!({"type":"object"}),
+            resume_handle: None,
         }
     }
 
     fn cfg() -> ClientConfig {
-        ClientConfig { model: GModel::HalfCascade, api_key: "K".into(), proxy: None,
-            setup: setup(), max_reconnect_attempts: None }
+        ClientConfig {
+            model: GModel::HalfCascade,
+            api_key: "K".into(),
+            proxy: None,
+            setup: setup(),
+            max_reconnect_attempts: None,
+        }
     }
 
     /// A reconnector that never yields a transport (reconnection fails).
     fn no_reconnect() -> Reconnector<FakeTransport> {
         Box::new(|| {
             Box::pin(async {
-                Err(SessionError::Transport(TransportError::Connect("no reconnect".into())))
+                Err(SessionError::Transport(TransportError::Connect(
+                    "no reconnect".into(),
+                )))
             })
         })
     }
@@ -581,7 +646,9 @@ mod tests {
         Box::new(move || {
             let t = slot.take();
             Box::pin(async move {
-                t.ok_or(SessionError::Transport(TransportError::Connect("drained".into())))
+                t.ok_or(SessionError::Transport(TransportError::Connect(
+                    "drained".into(),
+                )))
             })
         })
     }
@@ -591,7 +658,9 @@ mod tests {
         fake: FakeTransport,
         reconnect: Reconnector<FakeTransport>,
     ) -> CrateSession {
-        CrateSession::connect_with_transport(cfg(), fake, reconnect).await.unwrap()
+        CrateSession::connect_with_transport(cfg(), fake, reconnect)
+            .await
+            .unwrap()
     }
 
     // --- Session handle plumbing ---------------------------------------------
@@ -602,15 +671,27 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel::<Event>(4);
         let (hangup_tx, mut hangup_rx) = mpsc::channel::<()>(1);
         let join = tokio::spawn(async {
-            CallOutcome { ended_by: EndedBy::RemoteClose, goal: None, transcript: vec![] }
+            CallOutcome {
+                ended_by: EndedBy::RemoteClose,
+                goal: None,
+                transcript: vec![],
+            }
         });
-        let session = Session { audio_in: audio_tx, events: event_rx, join, hangup_tx };
+        let session = Session {
+            audio_in: audio_tx,
+            events: event_rx,
+            join,
+            hangup_tx,
+        };
 
         let (handle, gemini_in, mut gemini_events) = session.split();
         gemini_in.send(vec![0i16; 4]).await.unwrap();
         assert!(audio_rx.recv().await.is_some());
         event_tx.send(Event::TurnComplete).await.unwrap();
-        assert!(matches!(gemini_events.recv().await, Some(Event::TurnComplete)));
+        assert!(matches!(
+            gemini_events.recv().await,
+            Some(Event::TurnComplete)
+        ));
         handle.hangup().await;
         assert!(hangup_rx.recv().await.is_some());
         let outcome = handle.join().await;
@@ -648,7 +729,9 @@ mod tests {
         let mut fake = FakeTransport::new(true);
         fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
         fake.push_data(
-            br#"{"serverContent":{"outputTranscription":{"text":"Hi there","finished":true}}}"#.to_vec());
+            br#"{"serverContent":{"outputTranscription":{"text":"Hi there","finished":true}}}"#
+                .to_vec(),
+        );
         fake.push_data(
             br#"{"toolCall":{"functionCalls":[{"id":"c1","name":"end_call","args":{"disposition":"done"}}]}}"#.to_vec());
         // NON_BLOCKING end_call: the goodbye turn completes AFTER the tool call;
@@ -670,8 +753,15 @@ mod tests {
         let mut saw_end = false;
         while let Ok(ev) = erx.try_recv() {
             match ev {
-                Event::Transcript { role: Role::Model, text, .. } if text == "Hi there" => saw_transcript = true,
-                Event::EndCall { goal } => { assert_eq!(goal["disposition"], "done"); saw_end = true; }
+                Event::Transcript {
+                    role: Role::Model,
+                    text,
+                    ..
+                } if text == "Hi there" => saw_transcript = true,
+                Event::EndCall { goal } => {
+                    assert_eq!(goal["disposition"], "done");
+                    saw_end = true;
+                }
                 _ => {}
             }
         }
@@ -680,19 +770,32 @@ mod tests {
         assert!(matches!(outcome.ended_by, EndedBy::ModelEndCall));
         assert_eq!(outcome.goal.as_ref().unwrap()["disposition"], "done");
         // The model turn was folded into the outcome transcript at end.
-        assert!(outcome.transcript.iter().any(|e| e.role == Role::Model && e.text == "Hi there"));
+        assert!(
+            outcome
+                .transcript
+                .iter()
+                .any(|e| e.role == Role::Model && e.text == "Hi there")
+        );
         // The end_call ack is enqueued to the crate's driver task and written
         // asynchronously; after run_driver drops the session the detached task
         // drains the queued command and writes it before exiting.
         let mut acked = false;
         for _ in 0..1000 {
-            if sent.lock().unwrap().iter().any(|s| s.contains("tool_response")) {
+            if sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s.contains("tool_response"))
+            {
                 acked = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        assert!(acked, "the end_call tool ack must be written before teardown");
+        assert!(
+            acked,
+            "the end_call tool ack must be written before teardown"
+        );
     }
 
     #[tokio::test]
@@ -730,8 +833,14 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(audio_after_end, "goodbye audio arriving after end_call must reach the bridge");
-        assert!(end_after_audio, "EndCall must be emitted only after the goodbye audio, not before");
+        assert!(
+            audio_after_end,
+            "goodbye audio arriving after end_call must reach the bridge"
+        );
+        assert!(
+            end_after_audio,
+            "EndCall must be emitted only after the goodbye audio, not before"
+        );
         assert!(matches!(outcome.ended_by, EndedBy::ModelEndCall));
     }
 
@@ -753,9 +862,10 @@ mod tests {
         let (_htx, hrx) = mpsc::channel::<()>(1);
         let (_answered_tx, answered_rx) = watch::channel(false);
 
-        let run = tokio::spawn(async move {
-            run_driver(session, &srv, answered_rx, arx, etx, hrx).await
-        });
+        let run =
+            tokio::spawn(
+                async move { run_driver(session, &srv, answered_rx, arx, etx, hrx).await },
+            );
 
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
@@ -779,16 +889,25 @@ mod tests {
         let (_htx, hrx) = mpsc::channel::<()>(1);
         let (answered_tx, answered_rx) = watch::channel(false);
 
-        let run = tokio::spawn(async move {
-            run_driver(session, &srv, answered_rx, arx, etx, hrx).await
-        });
+        let run =
+            tokio::spawn(
+                async move { run_driver(session, &srv, answered_rx, arx, etx, hrx).await },
+            );
 
         tokio::task::yield_now().await;
         answered_tx.send(true).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let greet_count = sent.lock().unwrap().iter().filter(|s| s.contains(GREET_CUE)).count();
-        assert_eq!(greet_count, 1, "exactly one GREET_CUE must be sent after answered");
+        let greet_count = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.contains(GREET_CUE))
+            .count();
+        assert_eq!(
+            greet_count, 1,
+            "exactly one GREET_CUE must be sent after answered"
+        );
         run.abort();
     }
 
@@ -805,15 +924,20 @@ mod tests {
         let (_htx, hrx) = mpsc::channel::<()>(1);
         let (answered_tx, answered_rx) = watch::channel(false);
 
-        let run = tokio::spawn(async move {
-            run_driver(session, &srv, answered_rx, arx, etx, hrx).await
-        });
+        let run =
+            tokio::spawn(
+                async move { run_driver(session, &srv, answered_rx, arx, etx, hrx).await },
+            );
 
         tokio::task::yield_now().await;
         answered_tx.send(true).unwrap();
         // Quiet frames first to seed the VAD floor, then a loud burst (onset).
-        for _ in 0..2 { atx.send(vec![0i16; 320]).await.unwrap(); }
-        for _ in 0..6 { atx.send(vec![6000i16; 320]).await.unwrap(); }
+        for _ in 0..2 {
+            atx.send(vec![0i16; 320]).await.unwrap();
+        }
+        for _ in 0..6 {
+            atx.send(vec![6000i16; 320]).await.unwrap();
+        }
         tokio::task::yield_now().await;
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -834,7 +958,9 @@ mod tests {
         // (resumed=false), so context was lost -> RESUME_CUE must be sent.
         let mut first = FakeTransport::new(false);
         first.push_data(br#"{"setupComplete":{}}"#.to_vec());
-        first.push_data(br#"{"serverContent":{"inputTranscription":{"text":"hi","finished":false}}}"#.to_vec());
+        first.push_data(
+            br#"{"serverContent":{"inputTranscription":{"text":"hi","finished":false}}}"#.to_vec(),
+        );
         first.push_close(1011, "server restart");
         // Second transport stays open so the session doesn't immediately end.
         let second = FakeTransport::new(true);
@@ -856,7 +982,10 @@ mod tests {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(50), erx.recv()).await {
-                Ok(Some(Event::Interrupted)) => { interrupted += 1; break; }
+                Ok(Some(Event::Interrupted)) => {
+                    interrupted += 1;
+                    break;
+                }
                 Ok(Some(_)) => {}
                 Ok(None) => break,
                 Err(_) => {}
@@ -865,11 +994,15 @@ mod tests {
         assert_eq!(interrupted, 1, "exactly one Interrupted flush on reconnect");
         let expected = client_content(&server().resume_cue);
         assert!(
-            second_sent.lock().unwrap().iter().any(|s| *s == expected),
+            second_sent.lock().unwrap().contains(&expected),
             "RESUME_CUE must be sent on lost context"
         );
         assert!(
-            !second_sent.lock().unwrap().iter().any(|s| s.contains(GREET_CUE)),
+            !second_sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s.contains(GREET_CUE)),
             "no GREET_CUE on reconnect"
         );
         run.abort();
@@ -881,7 +1014,9 @@ mod tests {
         // the model restores context itself, so no cue of any kind is sent.
         let mut first = FakeTransport::new(false);
         first.push_data(br#"{"setupComplete":{}}"#.to_vec());
-        first.push_data(br#"{"serverContent":{"inputTranscription":{"text":"hi","finished":false}}}"#.to_vec());
+        first.push_data(
+            br#"{"serverContent":{"inputTranscription":{"text":"hi","finished":false}}}"#.to_vec(),
+        );
         first.push_data(br#"{"sessionResumptionUpdate":{"newHandle":"H1"}}"#.to_vec());
         first.push_close(1011, "server restart");
         let second = FakeTransport::new(true);
@@ -901,7 +1036,10 @@ mod tests {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(50), erx.recv()).await {
-                Ok(Some(Event::Interrupted)) => { interrupted += 1; break; }
+                Ok(Some(Event::Interrupted)) => {
+                    interrupted += 1;
+                    break;
+                }
                 Ok(Some(_)) => {}
                 Ok(None) => break,
                 Err(_) => {}
@@ -911,11 +1049,15 @@ mod tests {
         let cue = client_content(&server().resume_cue);
         // The reopened setup carries the handle, but no client-content cue is sent.
         assert!(
-            !second_sent.lock().unwrap().iter().any(|s| *s == cue),
+            !second_sent.lock().unwrap().contains(&cue),
             "no RESUME_CUE when the reopen resumed from a stored handle"
         );
         assert!(
-            !second_sent.lock().unwrap().iter().any(|s| s.contains(GREET_CUE)),
+            !second_sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s.contains(GREET_CUE)),
             "no GREET_CUE on reconnect"
         );
         run.abort();
@@ -945,7 +1087,10 @@ mod tests {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(50), erx.recv()).await {
-                Ok(Some(Event::Interrupted)) => { interrupted += 1; break; }
+                Ok(Some(Event::Interrupted)) => {
+                    interrupted += 1;
+                    break;
+                }
                 Ok(Some(_)) => {}
                 Ok(None) => break,
                 Err(_) => {}
@@ -954,7 +1099,7 @@ mod tests {
         assert_eq!(interrupted, 1, "the reconnect still flushes the pacer once");
         let cue = client_content(&server().resume_cue);
         assert!(
-            !second_sent.lock().unwrap().iter().any(|s| *s == cue),
+            !second_sent.lock().unwrap().contains(&cue),
             "no RESUME_CUE without a pending turn"
         );
         run.abort();
@@ -987,16 +1132,24 @@ mod tests {
         // point were dropped; so we assert none were forwarded as realtime input.
         // (The drain runs on the buffered backlog at reopen; here the backlog is
         // whatever was queued before the reopen was processed.)
-        for _ in 0..5 { atx.send(vec![1234i16; 320]).await.unwrap(); }
+        for _ in 0..5 {
+            atx.send(vec![1234i16; 320]).await.unwrap();
+        }
 
         let mut interrupted = 0;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(50), erx.recv()).await {
-                Ok(Some(Event::Interrupted)) => { interrupted += 1; }
+                Ok(Some(Event::Interrupted)) => {
+                    interrupted += 1;
+                }
                 Ok(Some(_)) => {}
                 Ok(None) => break,
-                Err(_) => if interrupted > 0 { break },
+                Err(_) => {
+                    if interrupted > 0 {
+                        break;
+                    }
+                }
             }
         }
         assert_eq!(interrupted, 1, "exactly one Interrupted flush on reconnect");
@@ -1005,7 +1158,11 @@ mod tests {
         drop(atx);
         run.abort();
         assert!(
-            !second_sent.lock().unwrap().iter().any(|s| s.contains("realtime_input")),
+            !second_sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s.contains("realtime_input")),
             "stale uplink frames must be drained, not forwarded on the reopened transport"
         );
     }

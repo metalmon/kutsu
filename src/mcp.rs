@@ -27,7 +27,7 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::task_manager::{TaskExit, TaskManager, TaskOptions};
-use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
+use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -95,7 +95,10 @@ fn call_status_label(state: crate::state::CallState) -> &'static str {
 /// Used by the `place_call` task branch.
 fn is_terminal_state(state: crate::state::CallState) -> bool {
     use crate::state::CallState;
-    !matches!(state, CallState::Queued | CallState::Ringing | CallState::InProgress)
+    !matches!(
+        state,
+        CallState::Queued | CallState::Ringing | CallState::InProgress
+    )
 }
 
 /// Poll the call store until `call_id` reaches a terminal [`CallState`],
@@ -107,10 +110,10 @@ fn is_terminal_state(state: crate::state::CallState) -> bool {
 /// this in `place_call_inner`.
 async fn watch_call_to_terminal(engine: &Engine, call_id: &str) -> crate::state::CallState {
     loop {
-        if let Some(rec) = engine.store().get(call_id) {
-            if is_terminal_state(rec.state) {
-                return rec.state;
-            }
+        if let Some(rec) = engine.store().get(call_id)
+            && is_terminal_state(rec.state)
+        {
+            return rec.state;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -119,13 +122,19 @@ async fn watch_call_to_terminal(engine: &Engine, call_id: &str) -> crate::state:
 #[tool_router]
 impl KutsuServer {
     pub fn new(engine: Arc<Engine>) -> Self {
-        Self { engine, tasks: Arc::new(TaskManager::new()), tool_router: Self::tool_router() }
+        Self {
+            engine,
+            tasks: Arc::new(TaskManager::new()),
+            tool_router: Self::tool_router(),
+        }
     }
 
-    #[tool(description = "Place an outbound phone call and bridge it to the AI agent. \
+    #[tool(
+        description = "Place an outbound phone call and bridge it to the AI agent. \
         For task-capable clients this runs as an MCP task (poll tasks/get for the \
         transcript+goal on completion). For plain clients it returns a call_id \
-        immediately; poll get_call_status until terminal, then get_call_transcript.")]
+        immediately; poll get_call_status until terminal, then get_call_transcript."
+    )]
     async fn place_call(
         &self,
         Parameters(a): Parameters<PlaceCallArgs>,
@@ -135,8 +144,9 @@ impl KutsuServer {
         // signal the framework enforces at the call_tool boundary
         // (`handler/server.rs`). A direct method call (e.g. Task 6/7 tests) has
         // no RequestContext client capabilities and takes the immediate branch.
-        let client_supports_tasks =
-            context.client_capabilities().is_some_and(|c| c.supports_tasks());
+        let client_supports_tasks = context
+            .client_capabilities()
+            .is_some_and(|c| c.supports_tasks());
         self.place_call_inner(a, client_supports_tasks).await
     }
 
@@ -158,8 +168,10 @@ impl KutsuServer {
         let now = crate::engine::now_ms();
         let eligible = a.schedule_at.filter(|t| *t > now).unwrap_or(now);
         let scheduled = eligible > now;
-        let call_id =
-            self.engine.place_call_at(a.to_number, scenario, eligible, 1, a.retry_of).await;
+        let call_id = self
+            .engine
+            .place_call_at(a.to_number, scenario, eligible, 1, a.retry_of)
+            .await;
 
         // Plain clients, and any scheduled call (even for task-capable
         // clients): immediate `{call_id, server_time_unix}` result. A
@@ -226,8 +238,12 @@ impl KutsuServer {
                                     "server_time_unix": server_time_unix,
                                 })
                             })
-                            .unwrap_or_else(|| serde_json::json!({ "server_time_unix": server_time_unix }));
-                        Ok(CallToolResult::success(vec![ContentBlock::text(body.to_string())]))
+                            .unwrap_or_else(
+                                || serde_json::json!({ "server_time_unix": server_time_unix }),
+                            );
+                        Ok(CallToolResult::success(vec![ContentBlock::text(
+                            body.to_string(),
+                        )]))
                     }
                     CallState::Failed => {
                         let msg = engine
@@ -249,12 +265,18 @@ impl KutsuServer {
         Ok(CallToolResponse::Task(CreateTaskResult::new(task)))
     }
 
-    #[tool(description = "Get the current state of a call by call_id (lightweight; no transcript).")]
+    #[tool(
+        description = "Get the current state of a call by call_id (lightweight; no transcript)."
+    )]
     async fn get_call_status(
         &self,
         Parameters(a): Parameters<CallIdArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let rec = self.engine.store().get(&a.call_id).ok_or_else(|| unknown_call(&a.call_id))?;
+        let rec = self
+            .engine
+            .store()
+            .get(&a.call_id)
+            .ok_or_else(|| unknown_call(&a.call_id))?;
         let pos = self.engine.queued_position(&a.call_id);
         let body = serde_json::json!({
             "call_id": rec.call_id, "state": rec.state, "number": rec.number,
@@ -262,7 +284,9 @@ impl KutsuServer {
             "error": rec.error, "queued_position": pos, "quality": rec.quality,
             "server_time_unix": crate::engine::now_ms(),
         });
-        Ok(CallToolResult::success(vec![ContentBlock::text(body.to_string())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            body.to_string(),
+        )]))
     }
 
     #[tool(description = "Get the full transcript and filled goal of a call by call_id.")]
@@ -270,12 +294,18 @@ impl KutsuServer {
         &self,
         Parameters(a): Parameters<CallIdArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let rec = self.engine.store().get(&a.call_id).ok_or_else(|| unknown_call(&a.call_id))?;
+        let rec = self
+            .engine
+            .store()
+            .get(&a.call_id)
+            .ok_or_else(|| unknown_call(&a.call_id))?;
         let body = serde_json::json!({
             "call_id": rec.call_id, "state": rec.state,
             "transcript": rec.transcript, "goal": rec.goal, "quality": rec.quality,
         });
-        Ok(CallToolResult::success(vec![ContentBlock::text(body.to_string())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            body.to_string(),
+        )]))
     }
 
     #[tool(description = "End (hang up / cancel) a running or queued call by call_id.")]
@@ -289,7 +319,8 @@ impl KutsuServer {
         let signalled = self.engine.end_call(&a.call_id);
         let state = self.engine.store().get(&a.call_id).map(|r| r.state);
         Ok(CallToolResult::success(vec![ContentBlock::text(
-            serde_json::json!({ "call_id": a.call_id, "signalled": signalled, "state": state }).to_string(),
+            serde_json::json!({ "call_id": a.call_id, "signalled": signalled, "state": state })
+                .to_string(),
         )]))
     }
 }
@@ -301,12 +332,17 @@ impl ServerHandler for KutsuServer {
         // 3.1.2, so struct-literal construction (even with
         // `..Default::default()`) is rejected outside the defining crate;
         // use its builder methods instead.
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_tasks().build())
-            .with_instructions(
-                "Outbound calling: place_call → poll get_call_status → \
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tasks()
+                .build(),
+        )
+        .with_instructions(
+            "Outbound calling: place_call → poll get_call_status → \
                  get_call_transcript; end_call to hang up. Task-capable clients \
                  may instead auto-poll place_call as an MCP task.",
-            )
+        )
     }
 
     // SEP-2663 task methods. The framework has no `task_manager()` hook in
@@ -319,7 +355,9 @@ impl ServerHandler for KutsuServer {
         request: GetTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, ErrorData> {
-        self.tasks.get_task(&request.task_id).map(GetTaskResult::new)
+        self.tasks
+            .get_task(&request.task_id)
+            .map(GetTaskResult::new)
     }
 
     async fn update_task(
@@ -327,7 +365,8 @@ impl ServerHandler for KutsuServer {
         request: UpdateTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
-        self.tasks.update_task(&request.task_id, request.input_responses)
+        self.tasks
+            .update_task(&request.task_id, request.input_responses)
     }
 
     async fn cancel_task(
@@ -342,7 +381,7 @@ impl ServerHandler for KutsuServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Model, NetCheckConfig, ServerConfig, SipConfig, VadConfig, RESUME_CUE};
+    use crate::config::{Model, NetCheckConfig, RESUME_CUE, ServerConfig, SipConfig, VadConfig};
 
     /// Build a valid engine for tests, bound to loopback so `SipTransport::new`
     /// binds offline (no real trunk) — mirrors `engine::tests::test_configs`.
@@ -358,7 +397,8 @@ mod tests {
             max_concurrent_channels: cap,
             greet_after_silence_ms: 4000,
             transcript_dir: None,
-            dump_uplink_dir: None, dump_downlink_dir: None,
+            dump_uplink_dir: None,
+            dump_downlink_dir: None,
             max_call_secs: 600,
             quality: crate::config::QualityConfig::default(),
             retry: crate::config::RetryConfig::default(),
@@ -414,9 +454,19 @@ mod tests {
         let engine = test_engine(1).await;
         let srv = KutsuServer::new(Arc::new(engine));
 
-        let names: Vec<_> = srv.tool_router.list_all().into_iter().map(|t| t.name.to_string()).collect();
+        let names: Vec<_> = srv
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
         assert_eq!(names.len(), 4);
-        for n in ["place_call", "get_call_status", "get_call_transcript", "end_call"] {
+        for n in [
+            "place_call",
+            "get_call_status",
+            "get_call_transcript",
+            "end_call",
+        ] {
             assert!(names.contains(&n.to_string()), "missing {n}");
         }
     }
@@ -429,23 +479,37 @@ mod tests {
         // Direct call: no client capability → immediate `{call_id}` branch.
         let out = complete(srv.place_call_inner(args("600"), false).await.unwrap());
         let text = first_text(&out);
-        let call_id =
-            serde_json::from_str::<serde_json::Value>(&text).unwrap()["call_id"].as_str().unwrap().to_string();
+        let call_id = serde_json::from_str::<serde_json::Value>(&text).unwrap()["call_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(!call_id.is_empty());
 
-        let status =
-            srv.get_call_status(Parameters(CallIdArgs { call_id: call_id.clone() })).await.unwrap();
+        let status = srv
+            .get_call_status(Parameters(CallIdArgs {
+                call_id: call_id.clone(),
+            }))
+            .await
+            .unwrap();
         let status_json = serde_json::from_str::<serde_json::Value>(&first_text(&status)).unwrap();
         assert_eq!(status_json["call_id"], call_id);
         assert!(status_json.get("state").is_some());
 
-        let tr = srv.get_call_transcript(Parameters(CallIdArgs { call_id: call_id.clone() })).await.unwrap();
+        let tr = srv
+            .get_call_transcript(Parameters(CallIdArgs {
+                call_id: call_id.clone(),
+            }))
+            .await
+            .unwrap();
         let tr_json = serde_json::from_str::<serde_json::Value>(&first_text(&tr)).unwrap();
         assert_eq!(tr_json["call_id"], call_id);
         assert!(tr_json.get("transcript").is_some());
 
         drop(srv);
-        Arc::into_inner(engine).expect("only strong ref left").shutdown().await;
+        Arc::into_inner(engine)
+            .expect("only strong ref left")
+            .shutdown()
+            .await;
     }
 
     #[tokio::test]
@@ -454,16 +518,28 @@ mod tests {
         let srv = KutsuServer::new(engine.clone());
 
         for r in [
-            srv.get_call_status(Parameters(CallIdArgs { call_id: "x".into() })).await,
-            srv.get_call_transcript(Parameters(CallIdArgs { call_id: "x".into() })).await,
-            srv.end_call(Parameters(CallIdArgs { call_id: "x".into() })).await,
+            srv.get_call_status(Parameters(CallIdArgs {
+                call_id: "x".into(),
+            }))
+            .await,
+            srv.get_call_transcript(Parameters(CallIdArgs {
+                call_id: "x".into(),
+            }))
+            .await,
+            srv.end_call(Parameters(CallIdArgs {
+                call_id: "x".into(),
+            }))
+            .await,
         ] {
             let err = r.unwrap_err();
             assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         }
 
         drop(srv);
-        Arc::into_inner(engine).expect("only strong ref left").shutdown().await;
+        Arc::into_inner(engine)
+            .expect("only strong ref left")
+            .shutdown()
+            .await;
     }
 
     #[test]
@@ -493,13 +569,19 @@ mod tests {
         use crate::state::CallState;
         let engine = Arc::new(test_engine(0).await);
         let call_id = engine
-            .place_call("600".into(), ScenarioConfig {
-                system_prompt: "hi".into(),
-                goal_schema: serde_json::json!({ "type": "object" }),
-                context: None,
-            })
+            .place_call(
+                "600".into(),
+                ScenarioConfig {
+                    system_prompt: "hi".into(),
+                    goal_schema: serde_json::json!({ "type": "object" }),
+                    context: None,
+                },
+            )
             .await;
-        assert_eq!(engine.store().get(&call_id).unwrap().state, CallState::Queued);
+        assert_eq!(
+            engine.store().get(&call_id).unwrap().state,
+            CallState::Queued
+        );
 
         // Cancel shortly after the watcher begins polling.
         let e2 = engine.clone();
@@ -552,8 +634,16 @@ mod tests {
         let out = complete(resp);
         let text = first_text(&out);
         let json = serde_json::from_str::<serde_json::Value>(&text).unwrap();
-        assert!(json.get("call_id").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()));
-        assert!(json.get("server_time_unix").and_then(|v| v.as_u64()).is_some());
+        assert!(
+            json.get("call_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty())
+        );
+        assert!(
+            json.get("server_time_unix")
+                .and_then(|v| v.as_u64())
+                .is_some()
+        );
 
         srv.tasks.shutdown();
     }

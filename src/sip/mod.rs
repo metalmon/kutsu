@@ -14,13 +14,13 @@ mod outcome;
 mod register;
 mod uplink;
 
-pub use outcome::{outcome_from_status, CallOutcome};
+pub use outcome::{CallOutcome, outcome_from_status};
 pub use uplink::{UplinkQuality, UplinkQualityShared, UplinkStats};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
 
 use bytes::Bytes;
@@ -74,7 +74,10 @@ pub enum TermReason {
     LocalHangup,
     /// The call failed before or during setup/teardown. `outcome` is the
     /// classified SIP result; `detail` is the human-readable status line.
-    Failed { outcome: CallOutcome, detail: String },
+    Failed {
+        outcome: CallOutcome,
+        detail: String,
+    },
 }
 
 /// Lifecycle event for a live call.
@@ -162,7 +165,10 @@ impl SipCall {
 
     /// Decompose into owned channel ends. Consumes the call.
     pub fn split(mut self) -> SipCallParts {
-        let hangup = self.hangup.take().expect("SipCall always has a hangup sender until split");
+        let hangup = self
+            .hangup
+            .take()
+            .expect("SipCall always has a hangup sender until split");
         SipCallParts {
             call_id: self.call_id,
             events: self.events,
@@ -182,7 +188,14 @@ impl SipCall {
         hangup: oneshot::Sender<()>,
         uplink_quality: std::sync::Arc<UplinkQualityShared>,
     ) -> Self {
-        Self { call_id, events, rtp_in, rtp_out, hangup: Some(hangup), uplink_quality }
+        Self {
+            call_id,
+            events,
+            rtp_in,
+            rtp_out,
+            hangup: Some(hangup),
+            uplink_quality,
+        }
     }
 }
 
@@ -317,7 +330,8 @@ async fn sip_thread_main(
     active: Arc<AtomicUsize>,
     ready_tx: oneshot::Sender<Result<(), SipError>>,
 ) {
-    let (endpoint, bound) = match call::build_endpoint(local_ip, cfg.local_port.unwrap_or(0)).await {
+    let (endpoint, bound) = match call::build_endpoint(local_ip, cfg.local_port.unwrap_or(0)).await
+    {
         Ok(pair) => pair,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
@@ -406,18 +420,41 @@ mod tests {
         let (in_tx, in_rx) = mpsc::channel(4);
         let (out_tx, mut out_rx) = mpsc::channel::<bytes::Bytes>(4);
         let (hup_tx, mut hup_rx) = oneshot::channel();
-        let call = SipCall::from_parts("c1".into(), ev_rx, in_rx, out_tx, hup_tx, UplinkQualityShared::new());
+        let call = SipCall::from_parts(
+            "c1".into(),
+            ev_rx,
+            in_rx,
+            out_tx,
+            hup_tx,
+            UplinkQualityShared::new(),
+        );
 
         let mut parts = call.split();
         assert_eq!(parts.call_id, "c1");
         // events end round-trips
-        ev_tx.send(SipEvent::Answered { codec: NegotiatedCodec { pt: 0, kind: G711Kind::Ulaw, ptime_ms: 20 } }).await.unwrap();
-        assert!(matches!(parts.events.recv().await, Some(SipEvent::Answered { .. })));
+        ev_tx
+            .send(SipEvent::Answered {
+                codec: NegotiatedCodec {
+                    pt: 0,
+                    kind: G711Kind::Ulaw,
+                    ptime_ms: 20,
+                },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            parts.events.recv().await,
+            Some(SipEvent::Answered { .. })
+        ));
         // audio_in end round-trips
         in_tx.send(bytes::Bytes::from_static(b"in")).await.unwrap();
         assert_eq!(parts.audio_in.recv().await.as_deref(), Some(&b"in"[..]));
         // audio_out end round-trips
-        parts.audio_out.send(bytes::Bytes::from_static(b"x")).await.unwrap();
+        parts
+            .audio_out
+            .send(bytes::Bytes::from_static(b"x"))
+            .await
+            .unwrap();
         assert!(out_rx.recv().await.is_some());
         // hangup end works
         parts.hangup.send(()).unwrap();

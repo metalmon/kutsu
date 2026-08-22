@@ -13,8 +13,8 @@ use ezk_sip_types::uri::SipUri;
 use ezk_sip_ua::{RegistrarConfig, Registration};
 
 use crate::config::SipConfig;
-use crate::sip::call::{make_auth, uri_host_port};
 use crate::sip::SipError;
+use crate::sip::call::{make_auth, uri_host_port};
 
 /// Send an initial REGISTER (handling the `401`/`407` digest challenge via the
 /// same credentials used for `INVITE`) and, on success, return the live

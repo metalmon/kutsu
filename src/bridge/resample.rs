@@ -32,7 +32,7 @@ fn lowpass() -> &'static [f32] {
         let pi = std::f32::consts::PI;
         let mut h = vec![0f32; N];
         let mut sum = 0f32;
-        for i in 0..N {
+        for (i, hi) in h.iter_mut().enumerate() {
             let x = i as f32 - mid;
             let sinc = if x == 0.0 {
                 2.0 * fc_norm
@@ -40,8 +40,8 @@ fn lowpass() -> &'static [f32] {
                 (2.0 * pi * fc_norm * x).sin() / (pi * x)
             };
             let w = 0.54 - 0.46 * (2.0 * pi * i as f32 / (N as f32 - 1.0)).cos(); // Hamming
-            h[i] = sinc * w;
-            sum += h[i];
+            *hi = sinc * w;
+            sum += *hi;
         }
         for v in &mut h {
             *v /= sum; // normalize DC gain to 1
@@ -74,8 +74,8 @@ impl Downsampler {
             self.win[taps - 1] = s;
             if self.phase == 0 {
                 let mut acc = 0f32;
-                for j in 0..taps {
-                    acc += h[j] * self.win[j] as f32;
+                for (j, &hj) in h.iter().enumerate() {
+                    acc += hj * self.win[j] as f32;
                 }
                 out.push(acc.round().clamp(-32768.0, 32767.0) as i16);
             }
@@ -110,7 +110,10 @@ mod tests {
         assert_eq!(out.len(), 160);
         // After the filter warms up, DC passes through (gain ~1).
         let tail = &out[80..];
-        assert!(tail.iter().all(|&s| (s - 2000).abs() < 60), "DC not preserved: {tail:?}");
+        assert!(
+            tail.iter().all(|&s| (s - 2000).abs() < 60),
+            "DC not preserved: {tail:?}"
+        );
     }
 
     fn tone(freq: f32, n: usize) -> Vec<i16> {
@@ -138,7 +141,10 @@ mod tests {
         let pass_rms = rms(&pass[40..]);
         let block_rms = rms(&block[40..]);
         assert!(pass_rms > 3000.0, "in-band tone attenuated: {pass_rms}");
-        assert!(block_rms < pass_rms * 0.2, "out-of-band not attenuated: pass={pass_rms} block={block_rms}");
+        assert!(
+            block_rms < pass_rms * 0.2,
+            "out-of-band not attenuated: pass={pass_rms} block={block_rms}"
+        );
     }
 
     #[test]

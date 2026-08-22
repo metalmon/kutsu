@@ -32,7 +32,10 @@ fn first_text(r: &CallToolResult) -> String {
 }
 
 fn call_args(pairs: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect()
 }
 
 #[tokio::test]
@@ -42,8 +45,11 @@ async fn place_call_via_mcp_completes() {
     // call` CLI and tests/engine_call.rs use, so this test and those agree.
     let (server_cfg, sip_cfg) = kutsu::main_support::configs_from_env().expect("configs from env");
     let scenario = kutsu::main_support::default_scenario();
-    let engine =
-        Arc::new(Engine::new(Arc::new(server_cfg), &sip_cfg).await.expect("engine up"));
+    let engine = Arc::new(
+        Engine::new(Arc::new(server_cfg), &sip_cfg)
+            .await
+            .expect("engine up"),
+    );
 
     let handler = KutsuServer::new(engine.clone());
 
@@ -71,8 +77,14 @@ async fn place_call_via_mcp_completes() {
     // identical. Arguments are a `serde_json::Map<String, Value>`
     // (`JsonObject`).
     let place_args = call_args(&[
-        ("to_number", serde_json::Value::String(env_or("KUTSU_SIP_EXT", "600"))),
-        ("system_prompt", serde_json::Value::String(scenario.system_prompt.clone())),
+        (
+            "to_number",
+            serde_json::Value::String(env_or("KUTSU_SIP_EXT", "600")),
+        ),
+        (
+            "system_prompt",
+            serde_json::Value::String(scenario.system_prompt.clone()),
+        ),
         ("goal_schema", scenario.goal_schema.clone()),
     ]);
     let place_result = client
@@ -81,8 +93,10 @@ async fn place_call_via_mcp_completes() {
         .expect("place_call call_tool succeeds");
     let place_body: serde_json::Value =
         serde_json::from_str(&first_text(&place_result)).expect("place_call result is JSON");
-    let call_id =
-        place_body["call_id"].as_str().expect("place_call result has call_id").to_string();
+    let call_id = place_body["call_id"]
+        .as_str()
+        .expect("place_call result has call_id")
+        .to_string();
     assert!(!call_id.is_empty());
     eprintln!("[mcp_stdio] placed call_id={call_id}");
 
@@ -95,18 +109,23 @@ async fn place_call_via_mcp_completes() {
     for _ in 0..MAX_POLLS {
         let status_result = client
             .call_tool(
-                CallToolRequestParams::new("get_call_status")
-                    .with_arguments(call_args(&[(
-                        "call_id",
-                        serde_json::Value::String(call_id.clone()),
-                    )])),
+                CallToolRequestParams::new("get_call_status").with_arguments(call_args(&[(
+                    "call_id",
+                    serde_json::Value::String(call_id.clone()),
+                )])),
             )
             .await
             .expect("get_call_status call_tool succeeds");
         let status_body: serde_json::Value =
             serde_json::from_str(&first_text(&status_result)).expect("status result is JSON");
-        let state = status_body["state"].as_str().unwrap_or_default().to_string();
-        if matches!(state.as_str(), "completed" | "failed" | "hung_up" | "cancelled") {
+        let state = status_body["state"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if matches!(
+            state.as_str(),
+            "completed" | "failed" | "hung_up" | "cancelled"
+        ) {
             terminal_state = Some(state);
             break;
         }
@@ -120,8 +139,10 @@ async fn place_call_via_mcp_completes() {
     // quality is out of scope, mirroring engine_call.rs).
     let tr_result = client
         .call_tool(
-            CallToolRequestParams::new("get_call_transcript")
-                .with_arguments(call_args(&[("call_id", serde_json::Value::String(call_id.clone()))])),
+            CallToolRequestParams::new("get_call_transcript").with_arguments(call_args(&[(
+                "call_id",
+                serde_json::Value::String(call_id.clone()),
+            )])),
         )
         .await
         .expect("get_call_transcript call_tool succeeds");
@@ -143,5 +164,8 @@ async fn place_call_via_mcp_completes() {
     // and `server.cancel()` drops the last clone the background task held.
     let _ = client.cancel().await;
     let _ = server.cancel().await;
-    Arc::into_inner(engine).expect("only strong ref left").shutdown().await;
+    Arc::into_inner(engine)
+        .expect("only strong ref left")
+        .shutdown()
+        .await;
 }

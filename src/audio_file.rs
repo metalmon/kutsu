@@ -8,26 +8,38 @@ use crate::error::{Error, Result};
 /// Read a mono PCM16 file. `.wav` is parsed and validated against `expected_rate`;
 /// any other extension is treated as headerless raw PCM16 at the expected rate.
 pub fn read_pcm16(path: &Path, expected_rate: u32) -> Result<Vec<i16>> {
-    let is_wav = path.extension().map(|e| e.eq_ignore_ascii_case("wav")).unwrap_or(false);
+    let is_wav = path
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("wav"))
+        .unwrap_or(false);
     if is_wav {
         let reader = hound::WavReader::open(path).map_err(hound_err)?;
         let spec = reader.spec();
         if spec.channels != 1 || spec.bits_per_sample != 16 {
             return Err(Error::Config(format!(
-                "expected mono PCM16, got {} channels / {} bits", spec.channels, spec.bits_per_sample)));
+                "expected mono PCM16, got {} channels / {} bits",
+                spec.channels, spec.bits_per_sample
+            )));
         }
         if spec.sample_rate != expected_rate {
             return Err(Error::Config(format!(
                 "expected {} Hz, got {} Hz (resampling is not this layer's job)",
-                expected_rate, spec.sample_rate)));
+                expected_rate, spec.sample_rate
+            )));
         }
-        reader.into_samples::<i16>().collect::<std::result::Result<Vec<_>, _>>().map_err(hound_err)
+        reader
+            .into_samples::<i16>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(hound_err)
     } else {
         let bytes = std::fs::read(path)?;
         if bytes.len() % 2 != 0 {
             return Err(Error::Config("raw PCM file has odd byte length".into()));
         }
-        Ok(bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect())
+        Ok(bytes
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect())
     }
 }
 

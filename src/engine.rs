@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::bridge::{self, BridgePorts};
 use crate::config::{QualityConfig, ScenarioConfig, ServerConfig, SipConfig};
@@ -73,7 +73,11 @@ fn reconcile_final_state(end_state: CallState, ended_by: EndedBy) -> CallState {
 /// a late `ModelEndCall` can override `end_state` to `Completed` even after
 /// the quality-abort arm fired; don't leave a stale error on a completed call.
 fn finalize_error(final_state: CallState, abort_reason: Option<String>) -> Option<String> {
-    if final_state == CallState::Failed { abort_reason } else { None }
+    if final_state == CallState::Failed {
+        abort_reason
+    } else {
+        None
+    }
 }
 
 /// Map the reconciled `final_state` of an in-call terminal finalize to a
@@ -243,7 +247,8 @@ impl Engine {
     pub async fn new(server: Arc<ServerConfig>, sip_cfg: &SipConfig) -> Result<Self, EngineError> {
         let sip = SipTransport::new(sip_cfg).await?;
         let store = CallStore::new();
-        let queue: Arc<Mutex<Box<dyn QueueStore>>> = Arc::new(Mutex::new(Box::new(MemQueue::new())));
+        let queue: Arc<Mutex<Box<dyn QueueStore>>> =
+            Arc::new(Mutex::new(Box::new(MemQueue::new())));
         let running = Arc::new(AtomicUsize::new(0));
         let wake = Arc::new(Notify::new());
         let cancels = Arc::new(Mutex::new(HashMap::new()));
@@ -319,7 +324,8 @@ impl Engine {
     /// `retry_of`) and wakes the dispatcher. Always succeeds; SIP/other
     /// failures surface later via `CallState::Failed`.
     pub async fn place_call(&self, number: String, scenario: ScenarioConfig) -> String {
-        self.place_call_at(number, scenario, now_ms(), 1, None).await
+        self.place_call_at(number, scenario, now_ms(), 1, None)
+            .await
     }
 
     /// Enqueue an outbound call eligible for dispatch at `eligible_at_ms`
@@ -336,7 +342,9 @@ impl Engine {
         attempt: u32,
         retry_of: Option<String>,
     ) -> String {
-        self.enqueuer.place_call_at(number, scenario, eligible_at_ms, attempt, retry_of).await
+        self.enqueuer
+            .place_call_at(number, scenario, eligible_at_ms, attempt, retry_of)
+            .await
     }
 
     /// 1-based position of a pending call in real dispatch order
@@ -360,7 +368,8 @@ impl Engine {
         let mut q = self.queue.lock().unwrap();
         if q.remove(call_id).is_some() {
             drop(q);
-            self.store.finalize(call_id, CallState::Cancelled, None, None, None, now_ms());
+            self.store
+                .finalize(call_id, CallState::Cancelled, None, None, None, now_ms());
             bump_counter(&self.counters, CallState::Cancelled);
             return true;
         }
@@ -412,12 +421,18 @@ async fn dispatcher(
             // holding the queue lock, so `end_call` observes this call in
             // exactly one place (queue OR cancels), never neither.
             let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-            cancels.lock().unwrap().insert(entry.call_id.clone(), cancel_tx);
+            cancels
+                .lock()
+                .unwrap()
+                .insert(entry.call_id.clone(), cancel_tx);
             running.fetch_add(1, Ordering::Relaxed);
             // Panic-safe slot release: the guard's Drop does the paired
             // `running -= 1` + `wake.notify_one()` on both normal completion and
             // panic unwind, so a `run_call` panic can never leak capacity.
-            let slot = RunningGuard { running: running.clone(), wake: wake.clone() };
+            let slot = RunningGuard {
+                running: running.clone(),
+                wake: wake.clone(),
+            };
             drop(q);
 
             store.set_state(&entry.call_id, CallState::Ringing);
@@ -428,7 +443,14 @@ async fn dispatcher(
             let cancels = cancels.clone();
             let counters = counters.clone();
             let enqueuer = enqueuer.clone();
-            let PendingEntry { call_id, number, scenario, attempt, retry_of, .. } = entry;
+            let PendingEntry {
+                call_id,
+                number,
+                scenario,
+                attempt,
+                retry_of,
+                ..
+            } = entry;
             tokio::spawn(async move {
                 let _slot = slot; // released (decrement + wake) on task exit / panic
                 run_call(
@@ -595,7 +617,10 @@ async fn run_call(
     attempt: u32,
     retry_of: Option<String>,
 ) {
-    let _cancel_guard = CancelGuard { cancels: cancels.clone(), call_id: call_id.clone() };
+    let _cancel_guard = CancelGuard {
+        cancels: cancels.clone(),
+        call_id: call_id.clone(),
+    };
     tracing::info!(%call_id, attempt, retry_of = ?retry_of, "dispatching call");
 
     // 0. Network preflight (fail-closed): probe the Gemini leg BEFORE dialing so
@@ -609,17 +634,27 @@ async fn run_call(
                 let v = crate::net_check::verdict(&health, &server.net_check);
                 tracing::info!(%call_id, health = %health.summary(), verdict = ?v, "network preflight");
                 if v == crate::net_check::Verdict::Unusable {
-                    store.finalize(&call_id, CallState::Failed, None,
+                    store.finalize(
+                        &call_id,
+                        CallState::Failed,
+                        None,
                         Some(format!("network preflight unusable: {}", health.summary())),
-                        Some(CallOutcome::Failed), now_ms());
+                        Some(CallOutcome::Failed),
+                        now_ms(),
+                    );
                     bump_counter_outcome(&counters, CallOutcome::Failed);
                     return;
                 }
             }
             Err(e) => {
-                store.finalize(&call_id, CallState::Failed, None,
+                store.finalize(
+                    &call_id,
+                    CallState::Failed,
+                    None,
                     Some(format!("network preflight failed: {e}")),
-                    Some(CallOutcome::Failed), now_ms());
+                    Some(CallOutcome::Failed),
+                    now_ms(),
+                );
                 bump_counter_outcome(&counters, CallOutcome::Failed);
                 return;
             }
@@ -630,13 +665,27 @@ async fn run_call(
     let call = match sip.place_call(&number).await {
         Ok(c) => c,
         Err(e) => {
-            store.finalize(&call_id, CallState::Failed, None, Some(e.to_string()), Some(CallOutcome::Failed), now_ms());
+            store.finalize(
+                &call_id,
+                CallState::Failed,
+                None,
+                Some(e.to_string()),
+                Some(CallOutcome::Failed),
+                now_ms(),
+            );
             bump_counter_outcome(&counters, CallOutcome::Failed);
             return;
         }
     };
     // 2. Decompose into owned channel ends.
-    let SipCallParts { events: mut sip_events, audio_in, audio_out, hangup: sip_hangup, uplink_quality, .. } = call.split();
+    let SipCallParts {
+        events: mut sip_events,
+        audio_in,
+        audio_out,
+        hangup: sip_hangup,
+        uplink_quality,
+        ..
+    } = call.split();
 
     // 3. Warm-start Gemini DURING the ring window. `answered` starts `false`,
     // so Task 1's gate keeps the greeting armed only once we fire it on the
@@ -662,7 +711,14 @@ async fn run_call(
                 // Remote/local hangup before answer is effectively no-answer.
                 _ => (CallOutcome::NoAnswer, format!("{reason:?}")),
             };
-            store.finalize(&call_id, CallState::Failed, None, Some(detail), Some(outcome), now_ms());
+            store.finalize(
+                &call_id,
+                CallState::Failed,
+                None,
+                Some(detail),
+                Some(outcome),
+                now_ms(),
+            );
             bump_counter_outcome(&counters, outcome);
             // Busy is the only auto-retried outcome (NoAnswer and all others
             // finalize terminally here). The finalized record above is linked
@@ -687,7 +743,14 @@ async fn run_call(
                 s.hangup().await;
             }
             drop(warm);
-            store.finalize(&call_id, CallState::Failed, None, Some("sip closed before answer".into()), Some(CallOutcome::Failed), now_ms());
+            store.finalize(
+                &call_id,
+                CallState::Failed,
+                None,
+                Some("sip closed before answer".into()),
+                Some(CallOutcome::Failed),
+                now_ms(),
+            );
             bump_counter_outcome(&counters, CallOutcome::Failed);
             return;
         }
@@ -707,7 +770,14 @@ async fn run_call(
         Ok(s) => s,
         Err(e) => {
             let _ = sip_hangup.send(());
-            store.finalize(&call_id, CallState::Failed, None, Some(format!("gemini connect: {e}")), Some(CallOutcome::Failed), now_ms());
+            store.finalize(
+                &call_id,
+                CallState::Failed,
+                None,
+                Some(format!("gemini connect: {e}")),
+                Some(CallOutcome::Failed),
+                now_ms(),
+            );
             bump_counter_outcome(&counters, CallOutcome::Failed);
             return;
         }
@@ -835,18 +905,15 @@ async fn run_call(
                 while uplink_hist.len() > UPLINK_WINDOW_TICKS {
                     uplink_hist.pop_front();
                 }
-                if uplink_hist.len() >= UPLINK_WINDOW_TICKS {
-                    if let (Some(&oldest), Some(&current)) = (uplink_hist.front(), uplink_hist.back()) {
-                        if let Some(loss_pct) = window_loss_pct(oldest, current) {
-                            if loss_pct > server.net_check.uplink_loss_abort_pct {
+                if uplink_hist.len() >= UPLINK_WINDOW_TICKS
+                    && let (Some(&oldest), Some(&current)) = (uplink_hist.front(), uplink_hist.back())
+                        && let Some(loss_pct) = window_loss_pct(oldest, current)
+                            && loss_pct > server.net_check.uplink_loss_abort_pct {
                                 abort_reason = Some(format!(
                                     "aborted: uplink RTP loss {loss_pct:.1}% over ~{UPLINK_WINDOW_TICKS}s window"
                                 ));
                                 break CallState::Failed;
                             }
-                        }
-                    }
-                }
             }
         }
     };
@@ -884,9 +951,15 @@ async fn run_call(
     let q = merge_quality(quality.snapshot(), uplink_quality.snapshot());
     store.set_quality(&call_id, q);
     counters.underruns.fetch_add(q.underruns, Ordering::Relaxed);
-    counters.starved_ms.fetch_add(q.starved_ms, Ordering::Relaxed);
-    counters.uplink_received.fetch_add(q.uplink_received, Ordering::Relaxed);
-    counters.uplink_lost.fetch_add(q.uplink_lost, Ordering::Relaxed);
+    counters
+        .starved_ms
+        .fetch_add(q.starved_ms, Ordering::Relaxed);
+    counters
+        .uplink_received
+        .fetch_add(q.uplink_received, Ordering::Relaxed);
+    counters
+        .uplink_lost
+        .fetch_add(q.uplink_lost, Ordering::Relaxed);
     // Uplink level in dBFS (0 dBFS = full-scale PCM16); -inf when silent.
     let uplink_dbfs = if q.uplink_rms > 0 {
         20.0 * (q.uplink_rms as f64 / 32768.0).log10()
@@ -919,14 +992,14 @@ async fn run_call(
     }
 
     // 10. Persist. Owner-only permissions: the transcript may contain PII.
-    if let Some(dir) = &server.transcript_dir {
-        if let Some(rec) = store.get(&call_id) {
-            let path = dir.join(format!("{call_id}.json"));
-            if let Ok(json) = serde_json::to_string_pretty(&rec) {
-                if let Err(e) = write_owner_only(&path, json.as_bytes()) {
-                    tracing::warn!(%call_id, "failed to write transcript: {e}");
-                }
-            }
+    if let Some(dir) = &server.transcript_dir
+        && let Some(rec) = store.get(&call_id)
+    {
+        let path = dir.join(format!("{call_id}.json"));
+        if let Ok(json) = serde_json::to_string_pretty(&rec)
+            && let Err(e) = write_owner_only(&path, json.as_bytes())
+        {
+            tracing::warn!(%call_id, "failed to write transcript: {e}");
         }
     }
 }
@@ -938,7 +1011,12 @@ async fn run_call(
 #[cfg(unix)]
 fn write_owner_only(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
     std::io::Write::write_all(&mut f, data)
 }
 #[cfg(not(unix))]
@@ -949,7 +1027,7 @@ fn write_owner_only(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Model, NetCheckConfig, VadConfig, RESUME_CUE};
+    use crate::config::{Model, NetCheckConfig, RESUME_CUE, VadConfig};
 
     #[test]
     fn window_loss_pct_needs_enough_samples_then_reports_windowed_loss() {
@@ -979,7 +1057,8 @@ mod tests {
             max_concurrent_channels: cap,
             greet_after_silence_ms: 4000,
             transcript_dir: None,
-            dump_uplink_dir: None, dump_downlink_dir: None,
+            dump_uplink_dir: None,
+            dump_downlink_dir: None,
             max_call_secs: 600,
             quality: crate::config::QualityConfig::default(),
             retry: crate::config::RetryConfig::default(),
@@ -1027,7 +1106,9 @@ mod tests {
         // The cap invariant holds regardless of how fast a call fails.
         let cap = 1usize;
         let (server, sip_cfg) = test_configs(cap);
-        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
+        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg)
+            .await
+            .unwrap();
         let a = engine.place_call("600".into(), test_scenario()).await;
         let b = engine.place_call("601".into(), test_scenario()).await;
         // Sample the invariants repeatedly across the settling window, using
@@ -1040,7 +1121,11 @@ mod tests {
         //   3. Both placed calls always exist in the store (nothing lost).
         for _ in 0..20 {
             let m = engine.metrics_snapshot();
-            assert!(m.active <= cap, "running {} must never exceed cap {cap}", m.active);
+            assert!(
+                m.active <= cap,
+                "running {} must never exceed cap {cap}",
+                m.active
+            );
             let store_active = [&a, &b]
                 .iter()
                 .filter(|id| {
@@ -1050,7 +1135,10 @@ mod tests {
                     )
                 })
                 .count();
-            assert!(store_active <= cap, "dispatched calls {store_active} must never exceed cap {cap}");
+            assert!(
+                store_active <= cap,
+                "dispatched calls {store_active} must never exceed cap {cap}"
+            );
             assert!(
                 engine.store().get(&a).is_some() && engine.store().get(&b).is_some(),
                 "both placed calls remain accounted for in the store"
@@ -1067,7 +1155,9 @@ mod tests {
         // per Task 6's queue), which pause() does not advance — pausing would
         // decouple the dispatcher's timer from `now_ms()` and never fire.
         let (server2, sip_cfg2) = test_configs(3);
-        let engine2 = Engine::new(std::sync::Arc::new(server2), &sip_cfg2).await.unwrap();
+        let engine2 = Engine::new(std::sync::Arc::new(server2), &sip_cfg2)
+            .await
+            .unwrap();
         let future_ms = now_ms() + 200;
         let c = engine2
             .place_call_at("602".into(), test_scenario(), future_ms, 1, None)
@@ -1091,7 +1181,9 @@ mod tests {
     async fn place_call_queues_when_at_cap() {
         // cap = 0: every call must sit in Queued forever (no permit available).
         let (server, sip_cfg) = test_configs(0);
-        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
+        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg)
+            .await
+            .unwrap();
         let id = engine.place_call("600".into(), test_scenario()).await;
         // No permit → the spawned run_call is parked before INVITE; state stays Queued.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1104,7 +1196,9 @@ mod tests {
     #[tokio::test]
     async fn end_call_cancels_a_queued_call() {
         let (server, sip_cfg) = test_configs(0); // cap 0 → parked in Queued
-        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
+        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg)
+            .await
+            .unwrap();
         let id = engine.place_call("600".into(), test_scenario()).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(engine.store().get(&id).unwrap().state, CallState::Queued);
@@ -1119,7 +1213,9 @@ mod tests {
     #[tokio::test]
     async fn end_call_unknown_id_is_false() {
         let (server, sip_cfg) = test_configs(1);
-        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
+        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg)
+            .await
+            .unwrap();
         assert!(!engine.end_call("nope"));
         engine.shutdown().await;
     }
@@ -1127,7 +1223,9 @@ mod tests {
     #[tokio::test]
     async fn metrics_snapshot_has_quality_fields() {
         let (server, sip_cfg) = test_configs(1);
-        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
+        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg)
+            .await
+            .unwrap();
         let m = engine.metrics_snapshot();
         assert_eq!(m.underruns_total, 0);
         assert_eq!(m.starved_ms_total, 0);
@@ -1138,7 +1236,9 @@ mod tests {
     #[tokio::test]
     async fn metrics_snapshot_exposes_uplink_totals() {
         let (server, sip_cfg) = test_configs(1);
-        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
+        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg)
+            .await
+            .unwrap();
         let m = engine.metrics_snapshot();
         assert_eq!(m.uplink_received_total, 0);
         assert_eq!(m.uplink_lost_total, 0);
@@ -1148,7 +1248,9 @@ mod tests {
     #[tokio::test]
     async fn metrics_snapshot_counts_placed_and_queued() {
         let (server, sip_cfg) = test_configs(0); // cap 0 → calls park in Queued
-        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg).await.unwrap();
+        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg)
+            .await
+            .unwrap();
         let _a = engine.place_call("600".into(), test_scenario()).await;
         let _b = engine.place_call("601".into(), test_scenario()).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1162,14 +1264,20 @@ mod tests {
 
     #[test]
     fn should_abort_disabled_never_aborts() {
-        let cfg = crate::config::QualityConfig { abort_underruns: 0, ..crate::config::QualityConfig::default() };
+        let cfg = crate::config::QualityConfig {
+            abort_underruns: 0,
+            ..crate::config::QualityConfig::default()
+        };
         assert!(!should_abort(&cfg, 0));
         assert!(!should_abort(&cfg, 1_000_000));
     }
 
     #[test]
     fn should_abort_trips_at_threshold_not_before() {
-        let cfg = crate::config::QualityConfig { abort_underruns: 40, ..crate::config::QualityConfig::default() };
+        let cfg = crate::config::QualityConfig {
+            abort_underruns: 40,
+            ..crate::config::QualityConfig::default()
+        };
         assert!(!should_abort(&cfg, 0));
         assert!(!should_abort(&cfg, 39));
         assert!(should_abort(&cfg, 40));
@@ -1180,12 +1288,25 @@ mod tests {
     fn reconcile_final_state_table() {
         // A model-initiated end always wins as Completed, regardless of what
         // the select loop landed on (it may have raced GeminiClosed -> Failed).
-        for end_state in [CallState::Failed, CallState::HungUp, CallState::Completed, CallState::Cancelled] {
-            assert_eq!(reconcile_final_state(end_state, EndedBy::ModelEndCall), CallState::Completed);
+        for end_state in [
+            CallState::Failed,
+            CallState::HungUp,
+            CallState::Completed,
+            CallState::Cancelled,
+        ] {
+            assert_eq!(
+                reconcile_final_state(end_state, EndedBy::ModelEndCall),
+                CallState::Completed
+            );
         }
         // Any other ended_by leaves end_state untouched.
         for ended_by in [EndedBy::CallerHangup, EndedBy::RemoteClose, EndedBy::Error] {
-            for end_state in [CallState::Failed, CallState::HungUp, CallState::Completed, CallState::Cancelled] {
+            for end_state in [
+                CallState::Failed,
+                CallState::HungUp,
+                CallState::Completed,
+                CallState::Cancelled,
+            ] {
                 assert_eq!(reconcile_final_state(end_state, ended_by), end_state);
             }
         }
@@ -1193,18 +1314,30 @@ mod tests {
 
     #[test]
     fn finalize_error_only_attached_when_failed() {
-        assert_eq!(finalize_error(CallState::Failed, Some("boom".into())), Some("boom".into()));
+        assert_eq!(
+            finalize_error(CallState::Failed, Some("boom".into())),
+            Some("boom".into())
+        );
         assert_eq!(finalize_error(CallState::Failed, None), None);
         // A reconciled Completed (e.g. late ModelEndCall overriding an aborted
         // end_state) must not carry a stale abort error.
-        assert_eq!(finalize_error(CallState::Completed, Some("boom".into())), None);
+        assert_eq!(
+            finalize_error(CallState::Completed, Some("boom".into())),
+            None
+        );
         assert_eq!(finalize_error(CallState::HungUp, Some("boom".into())), None);
-        assert_eq!(finalize_error(CallState::Cancelled, Some("boom".into())), None);
+        assert_eq!(
+            finalize_error(CallState::Cancelled, Some("boom".into())),
+            None
+        );
     }
 
     #[test]
     fn should_retry_busy_stops_at_max() {
-        let cfg = crate::config::RetryConfig { busy_max_attempts: 3, busy_retry_interval_ms: 1000 };
+        let cfg = crate::config::RetryConfig {
+            busy_max_attempts: 3,
+            busy_retry_interval_ms: 1000,
+        };
         assert!(should_retry_busy(1, &cfg));
         assert!(should_retry_busy(2, &cfg));
         assert!(!should_retry_busy(3, &cfg)); // 3rd attempt is the last; no 4th
@@ -1217,7 +1350,11 @@ mod tests {
         use crate::sip::{G711Kind, NegotiatedCodec};
         let (ev_tx, mut ev_rx) = mpsc::channel::<SipEvent>(8);
         let (aud_tx, mut aud_rx) = mpsc::channel::<Vec<i16>>(64);
-        let codec = NegotiatedCodec { pt: 0, kind: G711Kind::Ulaw, ptime_ms: 20 };
+        let codec = NegotiatedCodec {
+            pt: 0,
+            kind: G711Kind::Ulaw,
+            ptime_ms: 20,
+        };
         // Driver: let several silence ticks elapse under paused time, then answer.
         let driver = async {
             for _ in 0..5 {
@@ -1240,7 +1377,10 @@ mod tests {
             assert_eq!(f.len(), 320);
             frames += 1;
         }
-        assert!(frames >= 5, "expected >=5 silence frames during ring, got {frames}");
+        assert!(
+            frames >= 5,
+            "expected >=5 silence frames during ring, got {frames}"
+        );
     }
 
     #[tokio::test]
@@ -1271,7 +1411,10 @@ mod tests {
         // session (None) means the silence branch is disabled: no busy-spin.
         let (ev_tx, mut ev_rx) = mpsc::channel::<SipEvent>(8);
         drop(ev_tx);
-        assert!(matches!(ring_wait(&mut ev_rx, None).await, RingOutcome::Closed));
+        assert!(matches!(
+            ring_wait(&mut ev_rx, None).await,
+            RingOutcome::Closed
+        ));
     }
 
     #[test]
@@ -1279,9 +1422,18 @@ mod tests {
         // HungUp is a successful connection (caller/model ended a connected
         // call) — same success bucket as Completed per `bump_counter`, not a
         // technical failure.
-        assert_eq!(finalize_outcome(CallState::Completed), Some(CallOutcome::Completed));
-        assert_eq!(finalize_outcome(CallState::HungUp), Some(CallOutcome::Completed));
-        assert_eq!(finalize_outcome(CallState::Failed), Some(CallOutcome::Failed));
+        assert_eq!(
+            finalize_outcome(CallState::Completed),
+            Some(CallOutcome::Completed)
+        );
+        assert_eq!(
+            finalize_outcome(CallState::HungUp),
+            Some(CallOutcome::Completed)
+        );
+        assert_eq!(
+            finalize_outcome(CallState::Failed),
+            Some(CallOutcome::Failed)
+        );
         assert_eq!(finalize_outcome(CallState::Cancelled), None);
     }
 }

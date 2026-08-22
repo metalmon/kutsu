@@ -14,7 +14,12 @@ use clap::{Parser, Subcommand};
 )]
 struct Cli {
     /// Log output format: text (dev, default) or json (machine-parseable / SIEM).
-    #[arg(long = "log-format", env = "KUTSU_LOG_FORMAT", default_value = "text", global = true)]
+    #[arg(
+        long = "log-format",
+        env = "KUTSU_LOG_FORMAT",
+        default_value = "text",
+        global = true
+    )]
     log_format: String,
     #[command(subcommand)]
     command: Option<Command>,
@@ -103,13 +108,23 @@ fn main() -> anyhow::Result<()> {
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr);
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
     match cli.log_format.as_str() {
-        "json" => { let _ = builder.json().try_init(); }
-        _ => { let _ = builder.try_init(); }
+        "json" => {
+            let _ = builder.json().try_init();
+        }
+        _ => {
+            let _ = builder.try_init();
+        }
     }
     match cli.command {
-        Some(Command::Mcp { transport, bind, auth_token }) => {
+        Some(Command::Mcp {
+            transport,
+            bind,
+            auth_token,
+        }) => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(run_mcp(transport, bind, auth_token))
         }
@@ -127,8 +142,16 @@ fn main() -> anyhow::Result<()> {
         }) => {
             let rt = tokio::runtime::Runtime::new()?;
             let code = rt.block_on(run_live(
-                scenario, audio_in, audio_out, transcript, goal_out, model, voice, tail,
-                no_net_check, greet_after_silence_ms,
+                scenario,
+                audio_in,
+                audio_out,
+                transcript,
+                goal_out,
+                model,
+                voice,
+                tail,
+                no_net_check,
+                greet_after_silence_ms,
             ))?;
             std::process::exit(code);
         }
@@ -153,7 +176,11 @@ fn main() -> anyhow::Result<()> {
 /// transport until it returns (client disconnect / EOF for stdio, a shutdown
 /// signal for streamable-http — see [`kutsu::mcp_http::shutdown_signal`]),
 /// then hang up any still-live calls and best-effort shut down the engine.
-async fn run_mcp(transport: String, bind: String, auth_token: Option<String>) -> anyhow::Result<()> {
+async fn run_mcp(
+    transport: String,
+    bind: String,
+    auth_token: Option<String>,
+) -> anyhow::Result<()> {
     let (server_cfg, sip_cfg) = kutsu::main_support::configs_from_env()?;
     if server_cfg.max_concurrent_channels == 0 {
         tracing::warn!(
@@ -167,7 +194,7 @@ async fn run_mcp(transport: String, bind: String, auth_token: Option<String>) ->
 
     match transport.as_str() {
         "stdio" => {
-            use rmcp::{transport::io::stdio, ServiceExt};
+            use rmcp::{ServiceExt, transport::io::stdio};
             let handler = kutsu::mcp::KutsuServer::new(engine.clone());
             let service = handler.serve(stdio()).await?;
             service.waiting().await?;
@@ -178,8 +205,9 @@ async fn run_mcp(transport: String, bind: String, auth_token: Option<String>) ->
             // requests Host-rejected unless something in front of it (a
             // reverse proxy) rewrites the Host header to a loopback value.
             // This is informational only — we still bind and serve.
-            let is_loopback =
-                bind.starts_with("127.") || bind.starts_with("localhost") || bind.starts_with("[::1]");
+            let is_loopback = bind.starts_with("127.")
+                || bind.starts_with("localhost")
+                || bind.starts_with("[::1]");
             if !is_loopback {
                 tracing::warn!(
                     %bind,
@@ -260,7 +288,8 @@ async fn run_live(
     let mut session = kutsu::gemini_live::start(&server, &scenario, {
         let (_tx, rx) = tokio::sync::watch::channel(true);
         rx
-    }).await?;
+    })
+    .await?;
 
     // 4. Feed audio (32 ms frames at real-time pace) in a task.
     let samples = kutsu::audio_file::read_pcm16(&audio_in, 16000)?;
@@ -321,7 +350,7 @@ async fn run_live(
                 break;
             }
             Ok(Some(_)) => {}
-            Ok(None) => break,   // session task ended
+            Ok(None) => break, // session task ended
             Err(_) => {
                 session.hangup().await;
                 break;
@@ -331,10 +360,10 @@ async fn run_live(
     if let Some(w) = out {
         w.finalize()?;
     }
-    if let Some(g) = &goal {
-        if let Some(p) = goal_out {
-            std::fs::write(p, serde_json::to_vec_pretty(g)?)?;
-        }
+    if let Some(g) = &goal
+        && let Some(p) = goal_out
+    {
+        std::fs::write(p, serde_json::to_vec_pretty(g)?)?;
     }
 
     let outcome = session.join().await;
@@ -348,17 +377,26 @@ async fn run_live(
 async fn run_call_cli(number: String, scenario_path: Option<std::path::PathBuf>) -> i32 {
     let (server, sip_cfg) = match kutsu::main_support::configs_from_env() {
         Ok(x) => x,
-        Err(e) => { eprintln!("config error: {e}"); return 1; }
+        Err(e) => {
+            eprintln!("config error: {e}");
+            return 1;
+        }
     };
     let scenario = match scenario_path {
         Some(p) => {
             let text = match std::fs::read_to_string(&p) {
                 Ok(t) => t,
-                Err(e) => { eprintln!("failed to read scenario {p:?}: {e}"); return 1; }
+                Err(e) => {
+                    eprintln!("failed to read scenario {p:?}: {e}");
+                    return 1;
+                }
             };
             match serde_json::from_str(&text) {
                 Ok(s) => s,
-                Err(e) => { eprintln!("invalid scenario JSON in {p:?}: {e}"); return 1; }
+                Err(e) => {
+                    eprintln!("invalid scenario JSON in {p:?}: {e}");
+                    return 1;
+                }
             }
         }
         None => kutsu::main_support::default_scenario(),
@@ -366,7 +404,10 @@ async fn run_call_cli(number: String, scenario_path: Option<std::path::PathBuf>)
 
     let engine = match kutsu::engine::Engine::new(std::sync::Arc::new(server), &sip_cfg).await {
         Ok(e) => e,
-        Err(e) => { eprintln!("engine init failed: {e}"); return 1; }
+        Err(e) => {
+            eprintln!("engine init failed: {e}");
+            return 1;
+        }
     };
     let id = engine.place_call(number, scenario).await;
 
@@ -378,7 +419,12 @@ async fn run_call_cli(number: String, scenario_path: Option<std::path::PathBuf>)
                 println!("[{:?}] {}", entry.role, entry.text);
             }
             printed = rec.transcript.len();
-            if matches!(rec.state, kutsu::state::CallState::Completed | kutsu::state::CallState::Failed | kutsu::state::CallState::HungUp) {
+            if matches!(
+                rec.state,
+                kutsu::state::CallState::Completed
+                    | kutsu::state::CallState::Failed
+                    | kutsu::state::CallState::HungUp
+            ) {
                 break rec.state;
             }
         }
@@ -392,7 +438,9 @@ async fn run_call_cli(number: String, scenario_path: Option<std::path::PathBuf>)
     let detail = rec.as_ref().and_then(|r| r.error.clone());
     println!(
         "call ended: {final_state:?}{}{}",
-        outcome.map(|o| format!(" (outcome: {o:?})")).unwrap_or_default(),
+        outcome
+            .map(|o| format!(" (outcome: {o:?})"))
+            .unwrap_or_default(),
         detail.map(|d| format!(" — {d}")).unwrap_or_default(),
     );
     engine.shutdown().await;

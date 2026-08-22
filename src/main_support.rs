@@ -1,8 +1,8 @@
 //! Shared config construction for the `kutsu call` CLI and its integration test.
 
 use crate::config::{
-    Gender, Model, NetCheckConfig, Proxy, QualityConfig, RetryConfig, ScenarioConfig, ServerConfig,
-    SipConfig, SipTransportKind, VadConfig, DEFAULT_GREET_AFTER_SILENCE_MS, RESUME_CUE,
+    DEFAULT_GREET_AFTER_SILENCE_MS, Gender, Model, NetCheckConfig, Proxy, QualityConfig,
+    RESUME_CUE, RetryConfig, ScenarioConfig, ServerConfig, SipConfig, SipTransportKind, VadConfig,
 };
 
 fn env_or(k: &str, d: &str) -> String {
@@ -14,15 +14,24 @@ fn non_empty(k: &str) -> Option<String> {
 }
 
 fn env_u32(k: &str, d: u32) -> u32 {
-    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(d)
 }
 
 fn env_u64(k: &str, d: u64) -> u64 {
-    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(d)
 }
 
 fn env_f32(k: &str, d: f32) -> f32 {
-    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(d)
 }
 
 fn env_bool(k: &str, d: bool) -> bool {
@@ -52,7 +61,11 @@ pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
     let server = ServerConfig {
         api_key,
         proxy,
-        model: match env_or("KUTSU_MODEL", "half-cascade").trim().to_ascii_lowercase().as_str() {
+        model: match env_or("KUTSU_MODEL", "half-cascade")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "half-cascade" | "half" | "halfcascade" | "cascade" => Model::HalfCascade,
             _ => Model::NativeAudio,
         },
@@ -68,7 +81,10 @@ pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
             uplink_loss_abort_pct: env_f32("KUTSU_UPLINK_LOSS_ABORT_PCT", 10.0),
         },
         max_concurrent_channels: env_u32("KUTSU_MAX_CONCURRENT_CHANNELS", 3) as usize,
-        greet_after_silence_ms: env_u64("KUTSU_GREET_AFTER_SILENCE_MS", DEFAULT_GREET_AFTER_SILENCE_MS),
+        greet_after_silence_ms: env_u64(
+            "KUTSU_GREET_AFTER_SILENCE_MS",
+            DEFAULT_GREET_AFTER_SILENCE_MS,
+        ),
         transcript_dir: non_empty("KUTSU_TRANSCRIPT_DIR").map(std::path::PathBuf::from),
         dump_uplink_dir: non_empty("KUTSU_DUMP_UPLINK_DIR").map(std::path::PathBuf::from),
         dump_downlink_dir: non_empty("KUTSU_DUMP_DOWNLINK_DIR").map(std::path::PathBuf::from),

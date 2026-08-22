@@ -32,13 +32,24 @@ pub struct Vad {
 
 impl Vad {
     pub fn new(cfg: VadConfig) -> Self {
-        Self { cfg, noise_floor: 0.0, last_rms: 0.0, consec: 0, fired: false, frames_seen: 0 }
+        Self {
+            cfg,
+            noise_floor: 0.0,
+            last_rms: 0.0,
+            consec: 0,
+            fired: false,
+            frames_seen: 0,
+        }
     }
 
     /// RMS of the most recently observed frame (for onset logging/tuning).
-    pub fn last_rms(&self) -> f32 { self.last_rms }
+    pub fn last_rms(&self) -> f32 {
+        self.last_rms
+    }
     /// Current adaptive noise floor (for onset logging/tuning).
-    pub fn noise_floor(&self) -> f32 { self.noise_floor }
+    pub fn noise_floor(&self) -> f32 {
+        self.noise_floor
+    }
 
     /// Whether the most recently observed frame is above the speech threshold
     /// (same rule as [`Vad::classify`], but a stateless read of the last frame).
@@ -52,7 +63,9 @@ impl Vad {
     /// Feed one incoming callee frame. Returns true exactly once — on the frame
     /// that confirms speech onset. Once fired, always returns false.
     pub fn observe(&mut self, frame: &[i16]) -> bool {
-        if frame.is_empty() { return false; }
+        if frame.is_empty() {
+            return false;
+        }
         let sumsq: f64 = frame.iter().map(|&s| (s as f64) * (s as f64)).sum();
         let rms = (sumsq / frame.len() as f64).sqrt() as f32;
         self.last_rms = rms;
@@ -104,22 +117,33 @@ impl Vad {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn frame(amp: i16, n: usize) -> Vec<i16> { vec![amp; n] }
+    fn frame(amp: i16, n: usize) -> Vec<i16> {
+        vec![amp; n]
+    }
     fn cfg() -> VadConfig {
-        VadConfig { min_rms: 200, ratio: 3.0, onset_frames: 3, warmup_frames: 10 }
+        VadConfig {
+            min_rms: 200,
+            ratio: 3.0,
+            onset_frames: 3,
+            warmup_frames: 10,
+        }
     }
 
     #[test]
     fn silence_never_fires() {
         let mut v = Vad::new(cfg());
-        for _ in 0..50 { assert!(!v.observe(&frame(0, 320))); }
+        for _ in 0..50 {
+            assert!(!v.observe(&frame(0, 320)));
+        }
     }
 
     #[test]
     fn speech_after_warmup_fires_once() {
         let mut v = Vad::new(cfg());
         // Warm up on a low, steady background.
-        for _ in 0..10 { assert!(!v.observe(&frame(100, 320))); }
+        for _ in 0..10 {
+            assert!(!v.observe(&frame(100, 320)));
+        }
         // Loud burst: fires exactly on the onset_frames-th frame, never again.
         assert!(!v.observe(&frame(4000, 320)));
         assert!(!v.observe(&frame(4000, 320)));
@@ -130,9 +154,13 @@ mod tests {
     #[test]
     fn single_click_does_not_fire() {
         let mut v = Vad::new(cfg());
-        for _ in 0..10 { assert!(!v.observe(&frame(100, 320))); } // warmup
+        for _ in 0..10 {
+            assert!(!v.observe(&frame(100, 320)));
+        } // warmup
         assert!(!v.observe(&frame(4000, 320))); // one loud frame
-        for _ in 0..10 { assert!(!v.observe(&frame(0, 320))); } // back to silence, consec resets
+        for _ in 0..10 {
+            assert!(!v.observe(&frame(0, 320)));
+        } // back to silence, consec resets
     }
 
     #[test]
@@ -141,7 +169,9 @@ mod tests {
         // A steady, elevated background (well above min_rms but constant)
         // throughout, including warmup: the floor adapts up toward ~1500
         // (threshold ~4500), so the same-level input never reads as speech.
-        for _ in 0..200 { assert!(!v.observe(&frame(1500, 320))); }
+        for _ in 0..200 {
+            assert!(!v.observe(&frame(1500, 320)));
+        }
     }
 
     #[test]
@@ -149,7 +179,9 @@ mod tests {
         let mut v = Vad::new(cfg());
         // A few quiet baseline frames right after pickup establish the floor
         // (the first of these seeds it, since there's no prior contrast yet).
-        for _ in 0..4 { assert!(!v.observe(&frame(80, 320))); }
+        for _ in 0..4 {
+            assert!(!v.observe(&frame(80, 320)));
+        }
         // The callee's "Алло" is a clear jump above that established floor —
         // still inside the warmup window (frames_seen well under
         // warmup_frames=10), but the jump-bail catches it immediately
@@ -164,11 +196,17 @@ mod tests {
     fn quiet_speech_above_low_background_fires() {
         let mut v = Vad::new(cfg());
         // Warm up on a quiet background well below min_rms.
-        for _ in 0..10 { assert!(!v.observe(&frame(80, 320))); }
+        for _ in 0..10 {
+            assert!(!v.observe(&frame(80, 320)));
+        }
         // Quiet "Алло"-level speech (well below the old ratio*min_rms=600
         // trap, but real speech): must still be detected.
         let mut fired = false;
-        for _ in 0..5 { if v.observe(&frame(400, 320)) { fired = true; } }
+        for _ in 0..5 {
+            if v.observe(&frame(400, 320)) {
+                fired = true;
+            }
+        }
         assert!(fired);
     }
 }

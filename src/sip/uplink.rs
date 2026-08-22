@@ -2,8 +2,8 @@
 //! 16-bit sequence space. Pure, single-writer; the SIP receive loop feeds it
 //! each arriving sequence number.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A point-in-time uplink quality snapshot (phone -> us).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -26,9 +26,22 @@ pub struct UplinkStats {
     reordered: u64,
 }
 
+impl Default for UplinkStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UplinkStats {
     pub fn new() -> Self {
-        Self { started: false, cycles: 0, max16: 0, first_ext: 0, received: 0, reordered: 0 }
+        Self {
+            started: false,
+            cycles: 0,
+            max16: 0,
+            first_ext: 0,
+            received: 0,
+            reordered: 0,
+        }
     }
 
     /// Classifies `seq` relative to the running max via a single `0x8000`
@@ -110,7 +123,9 @@ mod tests {
 
     fn run(seqs: &[u16]) -> UplinkQuality {
         let mut s = UplinkStats::new();
-        for &q in seqs { s.observe(q); }
+        for &q in seqs {
+            s.observe(q);
+        }
         s.snapshot()
     }
 
@@ -122,28 +137,56 @@ mod tests {
     #[test]
     fn in_order_has_no_loss() {
         let q = run(&[100, 101, 102, 103, 104]);
-        assert_eq!(q, UplinkQuality { received: 5, lost: 0, reordered: 0 });
+        assert_eq!(
+            q,
+            UplinkQuality {
+                received: 5,
+                lost: 0,
+                reordered: 0
+            }
+        );
     }
 
     #[test]
     fn single_gap_counts_one_lost() {
         // 102 missing.
         let q = run(&[100, 101, 103, 104]);
-        assert_eq!(q, UplinkQuality { received: 4, lost: 1, reordered: 0 });
+        assert_eq!(
+            q,
+            UplinkQuality {
+                received: 4,
+                lost: 1,
+                reordered: 0
+            }
+        );
     }
 
     #[test]
     fn wider_gap_counts_all_lost() {
         // 101..104 missing (4 lost).
         let q = run(&[100, 105]);
-        assert_eq!(q, UplinkQuality { received: 2, lost: 4, reordered: 0 });
+        assert_eq!(
+            q,
+            UplinkQuality {
+                received: 2,
+                lost: 4,
+                reordered: 0
+            }
+        );
     }
 
     #[test]
     fn reorder_does_not_inflate_loss() {
         // 102 arrives late, after 103.
         let q = run(&[100, 101, 103, 102, 104]);
-        assert_eq!(q, UplinkQuality { received: 5, lost: 0, reordered: 1 });
+        assert_eq!(
+            q,
+            UplinkQuality {
+                received: 5,
+                lost: 0,
+                reordered: 1
+            }
+        );
     }
 
     #[test]
@@ -157,14 +200,25 @@ mod tests {
     #[test]
     fn wraparound_has_no_loss() {
         let q = run(&[65534, 65535, 0, 1]);
-        assert_eq!(q, UplinkQuality { received: 4, lost: 0, reordered: 0 });
+        assert_eq!(
+            q,
+            UplinkQuality {
+                received: 4,
+                lost: 0,
+                reordered: 0
+            }
+        );
     }
 
     #[test]
     fn shared_roundtrips_published_snapshot() {
         let shared = UplinkQualityShared::new();
         assert_eq!(shared.snapshot(), UplinkQuality::default());
-        let q = UplinkQuality { received: 50, lost: 3, reordered: 2 };
+        let q = UplinkQuality {
+            received: 50,
+            lost: 3,
+            reordered: 2,
+        };
         shared.publish(&q);
         assert_eq!(shared.snapshot(), q);
     }

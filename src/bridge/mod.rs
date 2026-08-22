@@ -8,11 +8,11 @@
 
 mod agc;
 mod g711;
-mod resample;
 mod pace;
+mod resample;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -55,7 +55,9 @@ impl QualityShared {
     pub fn snapshot(&self) -> crate::state::CallQuality {
         let sumsq = self.uplink_sumsq.load(Ordering::Relaxed);
         let samples = self.uplink_samples.load(Ordering::Relaxed);
-        let uplink_rms = if samples > 0 { ((sumsq / samples) as f64).sqrt() as u64 } else { 0 };
+        let uplink_rms = sumsq
+            .checked_div(samples)
+            .map_or(0, |ms| (ms as f64).sqrt() as u64);
         crate::state::CallQuality {
             underruns: self.underruns.load(Ordering::Relaxed),
             starved_ms: self.starved_ms.load(Ordering::Relaxed),
@@ -83,7 +85,8 @@ impl QualityShared {
     fn add_uplink_level(&self, pcm: &[i16]) {
         let sq: u64 = pcm.iter().map(|&s| (s as i64 * s as i64) as u64).sum();
         self.uplink_sumsq.fetch_add(sq, Ordering::Relaxed);
-        self.uplink_samples.fetch_add(pcm.len() as u64, Ordering::Relaxed);
+        self.uplink_samples
+            .fetch_add(pcm.len() as u64, Ordering::Relaxed);
     }
 }
 
@@ -191,14 +194,22 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
             // Synchronous `hound` writes on this async uplink task, between
             // `recv` and `gemini_in.send`: negligible under normal disk I/O,
             // and only exercised at all when dumping is enabled.
-            if let Some(w) = dump8.as_mut() { let _ = w.write(&pcm8); }
-            if let Some(w) = dump16.as_mut() { let _ = w.write(&pcm16); }
+            if let Some(w) = dump8.as_mut() {
+                let _ = w.write(&pcm8);
+            }
+            if let Some(w) = dump16.as_mut() {
+                let _ = w.write(&pcm16);
+            }
             if gemini_in.send(pcm16).await.is_err() {
                 break; // gemini sink closed
             }
         }
-        if let Some(w) = dump8.take() { let _ = w.finalize(); }
-        if let Some(w) = dump16.take() { let _ = w.finalize(); }
+        if let Some(w) = dump8.take() {
+            let _ = w.finalize();
+        }
+        if let Some(w) = dump16.take() {
+            let _ = w.finalize();
+        }
     });
     tokio::pin!(uplink);
 
@@ -320,15 +331,14 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
                 // playing false->true = prefill met, first real frame of a turn
                 // reaches the phone now. Time it against when the turn's audio
                 // first arrived from Gemini.
-                if !before_playing && downlink.playing() {
-                    if let (Some(t0), false) = (turn_recv_at, turn_onset_logged) {
+                if !before_playing && downlink.playing()
+                    && let (Some(t0), false) = (turn_recv_at, turn_onset_logged) {
                         let onset = tnow.duration_since(t0).as_millis() as u64;
                         if onset > max_onset_ms { max_onset_ms = onset; }
                         onset_count += 1;
                         tracing::info!(call_id = %call_id_dl, downlink_onset_ms = onset, "downlink audio onset");
                         turn_onset_logged = true;
                     }
-                }
                 if let Some(w) = dl_dump8.as_mut() { let _ = w.write(&pcm8); }
                 let payload = g711::encode(codec, &pcm8);
                 quality.underruns.store(downlink.underruns(), Ordering::Relaxed);
@@ -351,10 +361,21 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
     };
     // Harmless no-op if the uplink task already finished (the `&mut uplink`
     // branch above); required to stop it on the other two exit paths.
-    tracing::info!(max_tick_gap_ms, late_ticks, tick_count, max_onset_ms, onset_count, "downlink pacer send-timing");
+    tracing::info!(
+        max_tick_gap_ms,
+        late_ticks,
+        tick_count,
+        max_onset_ms,
+        onset_count,
+        "downlink pacer send-timing"
+    );
     uplink.abort();
-    if let Some(w) = dl_dump24.take() { let _ = w.finalize(); }
-    if let Some(w) = dl_dump8.take() { let _ = w.finalize(); }
+    if let Some(w) = dl_dump24.take() {
+        let _ = w.finalize();
+    }
+    if let Some(w) = dl_dump8.take() {
+        let _ = w.finalize();
+    }
     end
 }
 
@@ -414,11 +435,22 @@ mod tests {
                 resume_ms: 60,
                 quality: QualityShared::new(),
                 call_id: "c1".to_string(),
-                uplink_dump: None, downlink_dump: None,
-                agc_cfg: crate::config::AgcConfig { enabled: false, ..Default::default() },
+                uplink_dump: None,
+                downlink_dump: None,
+                agc_cfg: crate::config::AgcConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
                 cancel,
             },
-            Ends { phone_in_tx, phone_out_rx, gemini_in_rx, gemini_events_tx, events_out_rx, cancel_tx },
+            Ends {
+                phone_in_tx,
+                phone_out_rx,
+                gemini_in_rx,
+                gemini_events_tx,
+                events_out_rx,
+                cancel_tx,
+            },
         )
     }
 
@@ -428,7 +460,10 @@ mod tests {
         let h = tokio::spawn(run(ports));
         // Send 5 frames of 160 G.711 silence bytes.
         for _ in 0..5 {
-            ends.phone_in_tx.send(Bytes::from(vec![0xFFu8; 160])).await.unwrap();
+            ends.phone_in_tx
+                .send(Bytes::from(vec![0xFFu8; 160]))
+                .await
+                .unwrap();
         }
         // Each becomes one PCM16 16 kHz frame of 320 samples, in order, none dropped.
         for _ in 0..5 {
@@ -454,7 +489,10 @@ mod tests {
 
         // Push 200 ms of loud audio -- above wire()'s 140 ms prefill target,
         // so playout actually starts instead of holding for prefill.
-        ends.gemini_events_tx.send(Event::OutputAudio(vec![8000i16; 480 * 10])).await.unwrap();
+        ends.gemini_events_tx
+            .send(Event::OutputAudio(vec![8000i16; 480 * 10]))
+            .await
+            .unwrap();
         tokio::task::yield_now().await;
 
         // Advance three 20 ms ticks; expect three 160-byte frames carrying
@@ -465,7 +503,10 @@ mod tests {
             let frame = ends.phone_out_rx.recv().await.unwrap();
             assert_eq!(frame.len(), 160);
             let pcm = g711::decode(G711Kind::Ulaw, &frame);
-            assert!(pcm.iter().any(|&s| s.abs() > 1000), "expected paced audio, not silence");
+            assert!(
+                pcm.iter().any(|&s| s.abs() > 1000),
+                "expected paced audio, not silence"
+            );
         }
         drop(ends);
         let _ = h.await;
@@ -485,7 +526,10 @@ mod tests {
         let _ = ends.phone_out_rx.recv().await.unwrap();
 
         // Push a large burst (~400 ms) of loud audio.
-        ends.gemini_events_tx.send(Event::OutputAudio(vec![8000i16; 480 * 20])).await.unwrap();
+        ends.gemini_events_tx
+            .send(Event::OutputAudio(vec![8000i16; 480 * 20]))
+            .await
+            .unwrap();
         // The next regular tick is a full 20 ms away (Pending) -> `select!` can
         // only take the `gemini_events` branch, so this push is processed
         // deterministically before any tick fires.
@@ -497,13 +541,19 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_millis(20)).await;
         let frame = ends.phone_out_rx.recv().await.unwrap();
         let pcm = g711::decode(G711Kind::Ulaw, &frame);
-        assert!(pcm.iter().any(|&s| s.abs() > 1000), "expected audio to be playing before barge-in");
+        assert!(
+            pcm.iter().any(|&s| s.abs() > 1000),
+            "expected audio to be playing before barge-in"
+        );
 
         // Barge-in while ~18 more frames (360 ms) of loud audio remain buffered.
         // `interrupt_fade` ramps the buffered head down to silence over ~25 ms and
         // DROPS the ~17 remaining frames, so the phone hears a short fade then
         // clean silence — not the full 360 ms burst.
-        ends.gemini_events_tx.send(Event::Interrupted).await.unwrap();
+        ends.gemini_events_tx
+            .send(Event::Interrupted)
+            .await
+            .unwrap();
         tokio::task::yield_now().await;
 
         // Within a few frames the level must decay to silence (proving the bulk
@@ -525,8 +575,14 @@ mod tests {
                 loud_frames += 1;
             }
         }
-        assert!(reached_silence, "audio must fade to silence within a few frames of barge-in");
-        assert!(loud_frames <= 2, "barge-in must drop the buffered bulk (only a short fade remains), got {loud_frames} loud frames");
+        assert!(
+            reached_silence,
+            "audio must fade to silence within a few frames of barge-in"
+        );
+        assert!(
+            loud_frames <= 2,
+            "barge-in must drop the buffered bulk (only a short fade remains), got {loud_frames} loud frames"
+        );
 
         drop(ends);
         let _ = h.await;
@@ -536,7 +592,10 @@ mod tests {
     async fn non_audio_events_forwarded_to_engine() {
         let (ports, mut ends) = wire(G711Kind::Ulaw);
         let h = tokio::spawn(run(ports));
-        ends.gemini_events_tx.send(Event::TurnComplete).await.unwrap();
+        ends.gemini_events_tx
+            .send(Event::TurnComplete)
+            .await
+            .unwrap();
         let got = ends.events_out_rx.recv().await.unwrap();
         assert!(matches!(got, Event::TurnComplete));
         drop(ends);
@@ -552,14 +611,20 @@ mod tests {
         ports.quality = q.clone();
         let h = tokio::spawn(run(ports));
         // Model turn starts, one 20 ms chunk, then goes quiet mid-turn (no TurnComplete).
-        ends.gemini_events_tx.send(Event::OutputAudio(vec![8000i16; 480])).await.unwrap();
+        ends.gemini_events_tx
+            .send(Event::OutputAudio(vec![8000i16; 480]))
+            .await
+            .unwrap();
         tokio::task::yield_now().await;
         // Drain several ticks: after the one buffered frame, empty-while-expecting = underruns.
         for _ in 0..4 {
             tokio::time::advance(std::time::Duration::from_millis(20)).await;
             let _ = ends.phone_out_rx.recv().await;
         }
-        assert!(q.snapshot().underruns >= 1, "expected underruns recorded while expecting");
+        assert!(
+            q.snapshot().underruns >= 1,
+            "expected underruns recorded while expecting"
+        );
         drop(ends);
         let _ = h.await;
     }
@@ -575,7 +640,10 @@ mod tests {
         let h = tokio::spawn(run(ports));
 
         for _ in 0..5 {
-            ends.phone_in_tx.send(Bytes::from(vec![0xFFu8; 160])).await.unwrap();
+            ends.phone_in_tx
+                .send(Bytes::from(vec![0xFFu8; 160]))
+                .await
+                .unwrap();
         }
         // Close only the phone side; the uplink task drains the buffered
         // frames, finalizes both WAV writers, and ends -- which the bridge
@@ -589,8 +657,16 @@ mod tests {
         let sixteen = dir.join("c1-uplink-16k.wav");
         assert!(eight.exists(), "8k dump missing");
         assert!(sixteen.exists(), "16k dump missing");
-        assert!(!crate::audio_file::read_pcm16(&eight, 8000).unwrap().is_empty());
-        assert!(!crate::audio_file::read_pcm16(&sixteen, 16000).unwrap().is_empty());
+        assert!(
+            !crate::audio_file::read_pcm16(&eight, 8000)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !crate::audio_file::read_pcm16(&sixteen, 16000)
+                .unwrap()
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -606,7 +682,10 @@ mod tests {
 
         // Model audio (24k) -> the 24k dump; the 20ms pacer ticks -> the 8k dump.
         for _ in 0..3 {
-            ends.gemini_events_tx.send(Event::OutputAudio(vec![1000i16; 480 * 4])).await.unwrap();
+            ends.gemini_events_tx
+                .send(Event::OutputAudio(vec![1000i16; 480 * 4]))
+                .await
+                .unwrap();
         }
         tokio::time::sleep(std::time::Duration::from_millis(120)).await; // let several ticks fire
         // Close the gemini side; the bridge returns `GeminiClosed` and finalizes
@@ -619,7 +698,11 @@ mod tests {
         let k8 = dir.join("d1-downlink-8k.wav");
         assert!(k24.exists(), "24k downlink dump missing");
         assert!(k8.exists(), "8k downlink dump missing");
-        assert!(!crate::audio_file::read_pcm16(&k24, 24000).unwrap().is_empty());
+        assert!(
+            !crate::audio_file::read_pcm16(&k24, 24000)
+                .unwrap()
+                .is_empty()
+        );
         assert!(!crate::audio_file::read_pcm16(&k8, 8000).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

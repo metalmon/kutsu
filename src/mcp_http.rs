@@ -32,10 +32,24 @@ use crate::mcp::KutsuServer;
 pub fn render_prometheus(m: &MetricsSnapshot) -> String {
     let mut s = String::new();
     let g = |s: &mut String, name: &str, help: &str, kind: &str, v: String| {
-        s.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {v}\n"));
+        s.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {v}\n"
+        ));
     };
-    g(&mut s, "kutsu_calls_active", "Calls ringing or in progress.", "gauge", m.active.to_string());
-    g(&mut s, "kutsu_calls_queued", "Calls waiting for a channel.", "gauge", m.queued.to_string());
+    g(
+        &mut s,
+        "kutsu_calls_active",
+        "Calls ringing or in progress.",
+        "gauge",
+        m.active.to_string(),
+    );
+    g(
+        &mut s,
+        "kutsu_calls_queued",
+        "Calls waiting for a channel.",
+        "gauge",
+        m.queued.to_string(),
+    );
     g(
         &mut s,
         "kutsu_calls_placed_total",
@@ -50,12 +64,48 @@ pub fn render_prometheus(m: &MetricsSnapshot) -> String {
         "counter",
         m.completed_total.to_string(),
     );
-    g(&mut s, "kutsu_calls_failed_total", "Calls failed (technical failures only).", "counter", m.failed_total.to_string());
-    g(&mut s, "kutsu_calls_busy_total", "Calls that ended busy (486).", "counter", m.busy_total.to_string());
-    g(&mut s, "kutsu_calls_no_answer_total", "Calls with no answer (timeout/408/480).", "counter", m.no_answer_total.to_string());
-    g(&mut s, "kutsu_calls_rejected_total", "Calls rejected (603/403/6xx).", "counter", m.rejected_total.to_string());
-    g(&mut s, "kutsu_calls_not_found_total", "Calls to a number not found (404/484).", "counter", m.not_found_total.to_string());
-    g(&mut s, "kutsu_calls_unavailable_total", "Calls that hit a service-unavailable response (503/5xx).", "counter", m.unavailable_total.to_string());
+    g(
+        &mut s,
+        "kutsu_calls_failed_total",
+        "Calls failed (technical failures only).",
+        "counter",
+        m.failed_total.to_string(),
+    );
+    g(
+        &mut s,
+        "kutsu_calls_busy_total",
+        "Calls that ended busy (486).",
+        "counter",
+        m.busy_total.to_string(),
+    );
+    g(
+        &mut s,
+        "kutsu_calls_no_answer_total",
+        "Calls with no answer (timeout/408/480).",
+        "counter",
+        m.no_answer_total.to_string(),
+    );
+    g(
+        &mut s,
+        "kutsu_calls_rejected_total",
+        "Calls rejected (603/403/6xx).",
+        "counter",
+        m.rejected_total.to_string(),
+    );
+    g(
+        &mut s,
+        "kutsu_calls_not_found_total",
+        "Calls to a number not found (404/484).",
+        "counter",
+        m.not_found_total.to_string(),
+    );
+    g(
+        &mut s,
+        "kutsu_calls_unavailable_total",
+        "Calls that hit a service-unavailable response (503/5xx).",
+        "counter",
+        m.unavailable_total.to_string(),
+    );
     g(
         &mut s,
         "kutsu_calls_cancelled_total",
@@ -63,12 +113,48 @@ pub fn render_prometheus(m: &MetricsSnapshot) -> String {
         "counter",
         m.cancelled_total.to_string(),
     );
-    g(&mut s, "kutsu_channels_cap", "Max concurrent channels.", "gauge", m.channels_cap.to_string());
-    g(&mut s, "kutsu_audio_underruns_total", "Audio underruns since start.", "counter", m.underruns_total.to_string());
-    g(&mut s, "kutsu_audio_starved_ms_total", "Total milliseconds of audio starvation.", "counter", m.starved_ms_total.to_string());
-    g(&mut s, "kutsu_calls_quality_aborted_total", "Calls aborted due to quality issues.", "counter", m.quality_aborted_total.to_string());
-    g(&mut s, "kutsu_uplink_received_total", "Uplink RTP packets received since start.", "counter", m.uplink_received_total.to_string());
-    g(&mut s, "kutsu_uplink_lost_total", "Uplink RTP packets lost since start.", "counter", m.uplink_lost_total.to_string());
+    g(
+        &mut s,
+        "kutsu_channels_cap",
+        "Max concurrent channels.",
+        "gauge",
+        m.channels_cap.to_string(),
+    );
+    g(
+        &mut s,
+        "kutsu_audio_underruns_total",
+        "Audio underruns since start.",
+        "counter",
+        m.underruns_total.to_string(),
+    );
+    g(
+        &mut s,
+        "kutsu_audio_starved_ms_total",
+        "Total milliseconds of audio starvation.",
+        "counter",
+        m.starved_ms_total.to_string(),
+    );
+    g(
+        &mut s,
+        "kutsu_calls_quality_aborted_total",
+        "Calls aborted due to quality issues.",
+        "counter",
+        m.quality_aborted_total.to_string(),
+    );
+    g(
+        &mut s,
+        "kutsu_uplink_received_total",
+        "Uplink RTP packets received since start.",
+        "counter",
+        m.uplink_received_total.to_string(),
+    );
+    g(
+        &mut s,
+        "kutsu_uplink_lost_total",
+        "Uplink RTP packets lost since start.",
+        "counter",
+        m.uplink_lost_total.to_string(),
+    );
     s
 }
 
@@ -116,7 +202,9 @@ async fn bearer_guard(token: Arc<str>, req: Request, next: Next) -> Response {
 /// Unix (Windows has no SIGTERM; Ctrl-C is the portable baseline there).
 pub async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c().await.expect("failed to install Ctrl-C handler");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
     };
 
     #[cfg(unix)]
@@ -166,7 +254,11 @@ pub async fn graceful_teardown(engine: Arc<Engine>) {
 /// `Some`, `/mcp` requires a matching `Authorization: Bearer <token>`
 /// header; the ops endpoints are never gated. Runs until a shutdown signal
 /// arrives (see [`shutdown_signal`]).
-pub async fn serve(engine: Arc<Engine>, bind: &str, auth_token: Option<String>) -> anyhow::Result<()> {
+pub async fn serve(
+    engine: Arc<Engine>,
+    bind: &str,
+    auth_token: Option<String>,
+) -> anyhow::Result<()> {
     let mcp_engine = engine.clone();
     let svc = StreamableHttpService::new(
         move || Ok(KutsuServer::new(mcp_engine.clone())),
@@ -176,8 +268,9 @@ pub async fn serve(engine: Arc<Engine>, bind: &str, auth_token: Option<String>) 
     let mut mcp_router = Router::new().route_service("/mcp", svc);
     if let Some(token) = auth_token {
         let token: Arc<str> = Arc::from(token);
-        mcp_router = mcp_router
-            .layer(axum::middleware::from_fn(move |req, next| bearer_guard(token.clone(), req, next)));
+        mcp_router = mcp_router.layer(axum::middleware::from_fn(move |req, next| {
+            bearer_guard(token.clone(), req, next)
+        }));
     }
 
     let app = Router::new()
@@ -189,7 +282,9 @@ pub async fn serve(engine: Arc<Engine>, bind: &str, auth_token: Option<String>) 
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "kutsu MCP streamable-http listening");
-    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
 
@@ -201,7 +296,9 @@ mod tests {
     /// Build a valid engine for tests, bound to loopback so `SipTransport::new`
     /// binds offline (no real trunk) — mirrors `mcp::tests::test_engine`.
     async fn test_engine(cap: usize) -> Engine {
-        use crate::config::{Model, NetCheckConfig, ServerConfig, SipConfig, VadConfig, RESUME_CUE};
+        use crate::config::{
+            Model, NetCheckConfig, RESUME_CUE, ServerConfig, SipConfig, VadConfig,
+        };
         let server = ServerConfig {
             api_key: "k".into(),
             proxy: None,
@@ -213,7 +310,8 @@ mod tests {
             max_concurrent_channels: cap,
             greet_after_silence_ms: 4000,
             transcript_dir: None,
-            dump_uplink_dir: None, dump_downlink_dir: None,
+            dump_uplink_dir: None,
+            dump_downlink_dir: None,
             max_call_secs: 600,
             quality: crate::config::QualityConfig::default(),
             retry: crate::config::RetryConfig::default(),
@@ -309,14 +407,30 @@ mod tests {
     #[test]
     fn prometheus_has_quality_series() {
         let m = MetricsSnapshot {
-            active: 0, queued: 0, placed_total: 0, completed_total: 0, failed_total: 0,
-            cancelled_total: 0, channels_cap: 3,
-            underruns_total: 7, starved_ms_total: 140, quality_aborted_total: 2,
-            uplink_received_total: 0, uplink_lost_total: 0,
-            busy_total: 0, no_answer_total: 0, rejected_total: 0, not_found_total: 0, unavailable_total: 0,
+            active: 0,
+            queued: 0,
+            placed_total: 0,
+            completed_total: 0,
+            failed_total: 0,
+            cancelled_total: 0,
+            channels_cap: 3,
+            underruns_total: 7,
+            starved_ms_total: 140,
+            quality_aborted_total: 2,
+            uplink_received_total: 0,
+            uplink_lost_total: 0,
+            busy_total: 0,
+            no_answer_total: 0,
+            rejected_total: 0,
+            not_found_total: 0,
+            unavailable_total: 0,
         };
         let s = render_prometheus(&m);
-        for line in ["kutsu_audio_underruns_total 7", "kutsu_audio_starved_ms_total 140", "kutsu_calls_quality_aborted_total 2"] {
+        for line in [
+            "kutsu_audio_underruns_total 7",
+            "kutsu_audio_starved_ms_total 140",
+            "kutsu_calls_quality_aborted_total 2",
+        ] {
             assert!(s.contains(line), "missing: {line}");
         }
     }
@@ -324,14 +438,29 @@ mod tests {
     #[test]
     fn uplink_series_present() {
         let m = MetricsSnapshot {
-            active: 0, queued: 0, placed_total: 0, completed_total: 0, failed_total: 0,
-            cancelled_total: 0, channels_cap: 3,
-            underruns_total: 0, starved_ms_total: 0, quality_aborted_total: 0,
-            uplink_received_total: 900, uplink_lost_total: 12,
-            busy_total: 0, no_answer_total: 0, rejected_total: 0, not_found_total: 0, unavailable_total: 0,
+            active: 0,
+            queued: 0,
+            placed_total: 0,
+            completed_total: 0,
+            failed_total: 0,
+            cancelled_total: 0,
+            channels_cap: 3,
+            underruns_total: 0,
+            starved_ms_total: 0,
+            quality_aborted_total: 0,
+            uplink_received_total: 900,
+            uplink_lost_total: 12,
+            busy_total: 0,
+            no_answer_total: 0,
+            rejected_total: 0,
+            not_found_total: 0,
+            unavailable_total: 0,
         };
         let s = render_prometheus(&m);
-        for line in ["kutsu_uplink_received_total 900", "kutsu_uplink_lost_total 12"] {
+        for line in [
+            "kutsu_uplink_received_total 900",
+            "kutsu_uplink_lost_total 12",
+        ] {
             assert!(s.contains(line), "missing: {line}\n{s}");
         }
     }
@@ -339,11 +468,23 @@ mod tests {
     #[test]
     fn outcome_series_present() {
         let m = MetricsSnapshot {
-            active: 0, queued: 0, placed_total: 0, completed_total: 0, failed_total: 0,
-            cancelled_total: 0, channels_cap: 3,
-            underruns_total: 0, starved_ms_total: 0, quality_aborted_total: 0,
-            uplink_received_total: 0, uplink_lost_total: 0,
-            busy_total: 5, no_answer_total: 4, rejected_total: 3, not_found_total: 2, unavailable_total: 1,
+            active: 0,
+            queued: 0,
+            placed_total: 0,
+            completed_total: 0,
+            failed_total: 0,
+            cancelled_total: 0,
+            channels_cap: 3,
+            underruns_total: 0,
+            starved_ms_total: 0,
+            quality_aborted_total: 0,
+            uplink_received_total: 0,
+            uplink_lost_total: 0,
+            busy_total: 5,
+            no_answer_total: 4,
+            rejected_total: 3,
+            not_found_total: 2,
+            unavailable_total: 1,
         };
         let s = render_prometheus(&m);
         for line in [

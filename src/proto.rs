@@ -27,16 +27,18 @@ const CLOSING_INSTRUCTION: &str = "\n\n# Ending the call\n\
 /// convention; the Russian examples anchor the gendered forms that matter.
 fn gender_instruction(gender: Gender) -> &'static str {
     match gender {
-        Gender::Female =>
+        Gender::Female => {
             "\n\n# Your voice\nYou speak with a FEMALE voice. Always refer to \
              yourself using feminine grammatical forms — verbs, adjectives, \
              participles (in Russian: «я поняла», «была рада», «сама», «готова»). \
-             Never use masculine self-reference.",
-        Gender::Male =>
+             Never use masculine self-reference."
+        }
+        Gender::Male => {
             "\n\n# Your voice\nYou speak with a MALE voice. Always refer to \
              yourself using masculine grammatical forms — verbs, adjectives, \
              participles (in Russian: «я понял», «был рад», «сам», «готов»). \
-             Never use feminine self-reference.",
+             Never use feminine self-reference."
+        }
         Gender::Neutral => "",
     }
 }
@@ -85,13 +87,23 @@ mod tests {
 
     fn server() -> ServerConfig {
         ServerConfig {
-            api_key: "KEY".into(), proxy: None, model: Model::NativeAudio, voice: "Autonoe".into(),
+            api_key: "KEY".into(),
+            proxy: None,
+            model: Model::NativeAudio,
+            voice: "Autonoe".into(),
             voice_gender: Gender::Female,
-            language: "en-US".into(), net_check: NetCheckConfig::default(),
-            max_concurrent_channels: 3, greet_after_silence_ms: 4000,
-            transcript_dir: None, dump_uplink_dir: None, dump_downlink_dir: None, max_call_secs: 600,
-            quality: QualityConfig::default(), retry: RetryConfig::default(),
-            vad: VadConfig::default(), agc: crate::config::AgcConfig::default(),
+            language: "en-US".into(),
+            net_check: NetCheckConfig::default(),
+            max_concurrent_channels: 3,
+            greet_after_silence_ms: 4000,
+            transcript_dir: None,
+            dump_uplink_dir: None,
+            dump_downlink_dir: None,
+            max_call_secs: 600,
+            quality: QualityConfig::default(),
+            retry: RetryConfig::default(),
+            vad: VadConfig::default(),
+            agc: crate::config::AgcConfig::default(),
             resume_cue: RESUME_CUE.into(),
         }
     }
@@ -108,7 +120,10 @@ mod tests {
         let p = build_system_prompt(&scenario(), Gender::Female);
         assert!(p.starts_with("Be nice."));
         assert!(p.contains("end_call"), "closing must reference the tool");
-        assert!(p.contains("SAME turn"), "closing must couple the goodbye to the tool");
+        assert!(
+            p.contains("SAME turn"),
+            "closing must couple the goodbye to the tool"
+        );
         assert!(p.to_lowercase().contains("goodbye"));
     }
 
@@ -131,8 +146,14 @@ mod tests {
         // native-audio model — which ignores the structured languageCode — from
         // drifting. It must be present and carry the configured tag.
         let sys = assemble_system_instruction(&server(), &scenario());
-        assert!(sys.contains("# Language"), "system instruction must carry a language section");
-        assert!(sys.contains("en-US"), "language directive must pin server.language (en-US here)");
+        assert!(
+            sys.contains("# Language"),
+            "system instruction must carry a language section"
+        );
+        assert!(
+            sys.contains("en-US"),
+            "language directive must pin server.language (en-US here)"
+        );
         // The scenario + closing layer is still present ahead of it.
         assert!(sys.starts_with("Be nice."));
         assert!(sys.contains("end_call"));

@@ -33,7 +33,7 @@ pub fn outcome_from_status(code: u16) -> CallOutcome {
     match code {
         200..=299 => CallOutcome::Completed,
         404 | 484 => CallOutcome::NotFound,
-        486 | 600 => CallOutcome::Busy,      // 486 Busy Here, 600 Busy Everywhere
+        486 | 600 => CallOutcome::Busy, // 486 Busy Here, 600 Busy Everywhere
         408 | 480 => CallOutcome::NoAnswer,
         403 | 603 => CallOutcome::Rejected,
         500..=599 => CallOutcome::Unavailable,
@@ -69,7 +69,13 @@ mod tests {
     fn retryable_only_busy_and_no_answer() {
         assert!(CallOutcome::Busy.retryable());
         assert!(CallOutcome::NoAnswer.retryable());
-        for o in [CallOutcome::Completed, CallOutcome::Rejected, CallOutcome::NotFound, CallOutcome::Unavailable, CallOutcome::Failed] {
+        for o in [
+            CallOutcome::Completed,
+            CallOutcome::Rejected,
+            CallOutcome::NotFound,
+            CallOutcome::Unavailable,
+            CallOutcome::Failed,
+        ] {
             assert!(!o.retryable());
         }
     }

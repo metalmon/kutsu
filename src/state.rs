@@ -148,7 +148,10 @@ impl CallStore {
     /// Snapshot of active (Ringing|InProgress) and Queued counts.
     pub fn counts(&self) -> StateCounts {
         let g = self.inner.lock().unwrap();
-        let mut c = StateCounts { active: 0, queued: 0 };
+        let mut c = StateCounts {
+            active: 0,
+            queued: 0,
+        };
         for r in g.values() {
             match r.state {
                 CallState::Ringing | CallState::InProgress => c.active += 1,
@@ -187,8 +190,22 @@ mod tests {
     fn append_affect_records_emotion_in_order() {
         let store = CallStore::new();
         store.insert(rec("c1"));
-        store.append_affect("c1", AffectEntry { role: Role::User, label: "interest".into(), ts_ms: 7 });
-        store.append_affect("c1", AffectEntry { role: Role::Model, label: "calmness".into(), ts_ms: 9 });
+        store.append_affect(
+            "c1",
+            AffectEntry {
+                role: Role::User,
+                label: "interest".into(),
+                ts_ms: 7,
+            },
+        );
+        store.append_affect(
+            "c1",
+            AffectEntry {
+                role: Role::Model,
+                label: "calmness".into(),
+                ts_ms: 9,
+            },
+        );
         let r = store.get("c1").unwrap();
         assert_eq!(r.affect.len(), 2);
         assert_eq!(r.affect[0].label, "interest");
@@ -210,7 +227,14 @@ mod tests {
         let store = CallStore::new();
         store.insert(rec("c1"));
         store.set_state("c1", CallState::InProgress);
-        store.append_transcript("c1", TranscriptEntry { role: Role::Model, text: "hi".into(), ts_ms: 5 });
+        store.append_transcript(
+            "c1",
+            TranscriptEntry {
+                role: Role::Model,
+                text: "hi".into(),
+                ts_ms: 5,
+            },
+        );
         let got = store.get("c1").unwrap();
         assert_eq!(got.state, CallState::InProgress);
         assert_eq!(got.transcript.len(), 1);
@@ -221,7 +245,14 @@ mod tests {
     fn finalize_sets_terminal_fields() {
         let store = CallStore::new();
         store.insert(rec("c1"));
-        store.set_transcript("c1", vec![TranscriptEntry { role: Role::User, text: "bye".into(), ts_ms: 9 }]);
+        store.set_transcript(
+            "c1",
+            vec![TranscriptEntry {
+                role: Role::User,
+                text: "bye".into(),
+                ts_ms: 9,
+            }],
+        );
         store.finalize(
             "c1",
             CallState::Completed,
@@ -270,18 +301,32 @@ mod tests {
 
     #[test]
     fn queued_and_cancelled_serialize_snake_case() {
-        assert_eq!(serde_json::to_string(&CallState::Queued).unwrap(), "\"queued\"");
-        assert_eq!(serde_json::to_string(&CallState::Cancelled).unwrap(), "\"cancelled\"");
+        assert_eq!(
+            serde_json::to_string(&CallState::Queued).unwrap(),
+            "\"queued\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CallState::Cancelled).unwrap(),
+            "\"cancelled\""
+        );
     }
 
     #[test]
     fn set_quality_updates_record() {
         let store = CallStore::new();
         store.insert(rec("c1"));
-        store.set_quality("c1", CallQuality {
-            underruns: 3, starved_ms: 60, max_gap_ms: 220,
-            uplink_received: 500, uplink_lost: 7, uplink_reordered: 1, uplink_rms: 2048,
-        });
+        store.set_quality(
+            "c1",
+            CallQuality {
+                underruns: 3,
+                starved_ms: 60,
+                max_gap_ms: 220,
+                uplink_received: 500,
+                uplink_lost: 7,
+                uplink_reordered: 1,
+                uplink_rms: 2048,
+            },
+        );
         let got = store.get("c1").unwrap();
         assert_eq!(got.quality.underruns, 3);
         assert_eq!(got.quality.uplink_lost, 7);

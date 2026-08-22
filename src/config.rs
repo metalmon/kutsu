@@ -73,15 +73,11 @@ impl SipConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum Model {
+    #[default]
     HalfCascade,
     NativeAudio,
-}
-
-impl Default for Model {
-    fn default() -> Self {
-        Model::HalfCascade
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -109,7 +105,14 @@ pub struct NetCheckConfig {
 impl Default for NetCheckConfig {
     fn default() -> Self {
         // Thresholds tuned for realtime voice (see spec).
-        NetCheckConfig { enabled: true, samples: 10, max_rtt_ms: 300, max_jitter_ms: 50, max_loss_pct: 2.0, uplink_loss_abort_pct: 10.0 }
+        NetCheckConfig {
+            enabled: true,
+            samples: 10,
+            max_rtt_ms: 300,
+            max_jitter_ms: 50,
+            max_loss_pct: 2.0,
+            uplink_loss_abort_pct: 10.0,
+        }
     }
 }
 
@@ -197,7 +200,11 @@ impl Default for QualityConfig {
         // that a smaller buffer rendered as dropouts. The earlier 180/60 was
         // tuned against a zero-jitter LAN PBX; on a live Novofon→mobile call 800
         // dropped starvation from ~1460 ms to ~0 with no audible latency cost.
-        Self { prebuffer_ms: 800, resume_ms: 400, abort_underruns: 40 }
+        Self {
+            prebuffer_ms: 800,
+            resume_ms: 400,
+            abort_underruns: 40,
+        }
     }
 }
 
@@ -223,7 +230,12 @@ pub struct AgcConfig {
 
 impl Default for AgcConfig {
     fn default() -> Self {
-        Self { enabled: true, target_dbfs: -18.0, max_gain_db: 30.0, noise_floor_rms: 200.0 }
+        Self {
+            enabled: true,
+            target_dbfs: -18.0,
+            max_gain_db: 30.0,
+            noise_floor_rms: 200.0,
+        }
     }
 }
 
@@ -238,7 +250,10 @@ pub struct RetryConfig {
 
 impl Default for RetryConfig {
     fn default() -> Self {
-        Self { busy_max_attempts: 3, busy_retry_interval_ms: 300_000 }
+        Self {
+            busy_max_attempts: 3,
+            busy_retry_interval_ms: 300_000,
+        }
     }
 }
 
@@ -271,7 +286,14 @@ pub struct VadConfig {
     pub warmup_frames: u32,
 }
 impl Default for VadConfig {
-    fn default() -> Self { Self { min_rms: 200, ratio: 3.0, onset_frames: 3, warmup_frames: 10 } }
+    fn default() -> Self {
+        Self {
+            min_rms: 200,
+            ratio: 3.0,
+            onset_frames: 3,
+            warmup_frames: 10,
+        }
+    }
 }
 
 /// Default wait before the agent greets a silent callee (see
@@ -323,7 +345,10 @@ mod tests {
 
     #[test]
     fn model_serde_uses_kebab_case() {
-        assert_eq!(serde_json::to_string(&Model::NativeAudio).unwrap(), "\"native-audio\"");
+        assert_eq!(
+            serde_json::to_string(&Model::NativeAudio).unwrap(),
+            "\"native-audio\""
+        );
         let m: Model = serde_json::from_str("\"half-cascade\"").unwrap();
         assert!(matches!(m, Model::HalfCascade));
     }

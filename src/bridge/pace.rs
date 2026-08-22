@@ -184,7 +184,10 @@ mod tests {
                 signal_frames += 1;
             }
         }
-        assert!(signal_frames <= 2, "fade must drop the buffered bulk, got {signal_frames}");
+        assert!(
+            signal_frames <= 2,
+            "fade must drop the buffered bulk, got {signal_frames}"
+        );
     }
 
     #[test]
@@ -209,7 +212,10 @@ mod tests {
         let mut d = Downlink::new(0, 0);
         let f = d.next_frame();
         assert_eq!(f.len(), 160);
-        assert!(f.iter().all(|&s| s.abs() < 16), "empty buffer should be ~silence");
+        assert!(
+            f.iter().all(|&s| s.abs() < 16),
+            "empty buffer should be ~silence"
+        );
     }
 
     #[test]
@@ -219,7 +225,10 @@ mod tests {
         let f = d.next_frame();
         assert_eq!(f.len(), 160);
         // After warm-up the frame carries the signal, not silence.
-        assert!(f[80..].iter().any(|&s| s.abs() > 2000), "buffered audio not played");
+        assert!(
+            f[80..].iter().any(|&s| s.abs() > 2000),
+            "buffered audio not played"
+        );
     }
 
     #[test]
@@ -232,7 +241,10 @@ mod tests {
         // no ring-out tail from the audio that was playing before the barge-in.
         let _ = d.next_frame();
         let f = d.next_frame();
-        assert!(f.iter().all(|&s| s.abs() < 16), "second post-clear frame should be silence");
+        assert!(
+            f.iter().all(|&s| s.abs() < 16),
+            "second post-clear frame should be silence"
+        );
     }
 
     #[test]
@@ -256,11 +268,17 @@ mod tests {
         d.push(&[8000i16; 480 * 3]); // 60 ms < 140 ms target
         // Under target -> silence, and it's counted as starvation while expecting.
         let f = d.next_frame();
-        assert!(f.iter().all(|&s| s.abs() < 16), "should hold (silence) under prefill target");
+        assert!(
+            f.iter().all(|&s| s.abs() < 16),
+            "should hold (silence) under prefill target"
+        );
         // Top up past 140 ms and it starts playing.
         d.push(&[8000i16; 480 * 5]); // now 160 ms buffered
         let f = d.next_frame();
-        assert!(f[80..].iter().any(|&s| s.abs() > 2000), "should play once prefill met");
+        assert!(
+            f[80..].iter().any(|&s| s.abs() > 2000),
+            "should play once prefill met"
+        );
     }
 
     #[test]
@@ -291,6 +309,9 @@ mod tests {
         d.clear();
         d.push(&[8000i16; 480 * 3]); // 60 ms < 140 ms -> must re-prefill
         let f = d.next_frame();
-        assert!(f.iter().all(|&s| s.abs() < 16), "clear must re-arm the 140 ms prefill");
+        assert!(
+            f.iter().all(|&s| s.abs() < 16),
+            "clear must re-arm the 140 ms prefill"
+        );
     }
 }

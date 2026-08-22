@@ -5,23 +5,23 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use bytesstr::BytesStr;
+use ezk_rtc::OpenSslContext;
 use ezk_rtc::rtp_session::SendRtpPacket;
 use ezk_rtc::sdp::{Codec, Codecs, Direction, MediaType, SdpSession};
-use ezk_rtc::OpenSslContext;
 use ezk_sip_auth::{DigestAuthenticator, DigestCredentials, DigestUser};
 use ezk_sip_core::Endpoint;
+use ezk_sip_types::Method;
 use ezk_sip_types::header::typed::Contact;
 use ezk_sip_types::host::{Host, HostPort};
 use ezk_sip_types::uri::{NameAddr, SipUri};
-use ezk_sip_types::Method;
 use ezk_sip_ua::dialog::DialogLayer;
 use ezk_sip_ua::{CallEvent, MediaEvent, OutboundCall, RtcMediaBackend};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::SipConfig;
 use crate::sip::{
-    g711_kind_from_pt, plain_rtp_g711_config, CallOutcome, G711Kind, NegotiatedCodec, SipCall,
-    SipError, SipEvent, TermReason, UplinkQualityShared, UplinkStats,
+    CallOutcome, G711Kind, NegotiatedCodec, SipCall, SipError, SipEvent, TermReason,
+    UplinkQualityShared, UplinkStats, g711_kind_from_pt, plain_rtp_g711_config,
 };
 
 /// Build the shared endpoint with one UDP transport. `add_allow` is MANDATORY —
@@ -137,15 +137,14 @@ pub(crate) async fn run_call(
     let uri_host = uri_host_port(server, cfg.sip_domain.as_deref());
     let (id, contact, target) = make_uris(uri_host, cfg.from_user(), bound, &number);
 
-    let mut outbound = match OutboundCall::make(endpoint, make_auth(&cfg), id, contact, target, media)
-        .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            let _ = reply.send(Err(map_make_err(&e)));
-            return;
-        }
-    };
+    let mut outbound =
+        match OutboundCall::make(endpoint, make_auth(&cfg), id, contact, target, media).await {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = reply.send(Err(map_make_err(&e)));
+                return;
+            }
+        };
 
     // Dialog established -> hand the caller a live SipCall handle.
     let (ev_tx, ev_rx) = mpsc::channel::<SipEvent>(16);
@@ -153,7 +152,14 @@ pub(crate) async fn run_call(
     let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(64);
     let (hup_tx, mut hup_rx) = oneshot::channel::<()>();
     let uplink_quality = UplinkQualityShared::new();
-    let handle = SipCall::from_parts(call_id, ev_rx, in_rx, out_tx, hup_tx, uplink_quality.clone());
+    let handle = SipCall::from_parts(
+        call_id,
+        ev_rx,
+        in_rx,
+        out_tx,
+        hup_tx,
+        uplink_quality.clone(),
+    );
     if reply.send(Ok(handle)).is_err() {
         let _ = outbound.cancel().await;
         return;
@@ -271,7 +277,11 @@ pub(crate) async fn run_call(
                 None => Instant::now(),
             };
             media_time = Some(mt);
-            if sender.send(SendRtpPacket::new(mt, pt, payload)).await.is_err() {
+            if sender
+                .send(SendRtpPacket::new(mt, pt, payload))
+                .await
+                .is_err()
+            {
                 break;
             }
         }

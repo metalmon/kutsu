@@ -23,8 +23,12 @@ async fn engine_places_and_finalizes_a_call() {
     let (server, sip_cfg) = kutsu::main_support::configs_from_env().expect("configs from env");
     let scenario: ScenarioConfig = kutsu::main_support::default_scenario();
 
-    let engine = Engine::new(Arc::new(server), &sip_cfg).await.expect("engine up");
-    let id = engine.place_call(env_or("KUTSU_SIP_EXT", "600"), scenario).await;
+    let engine = Engine::new(Arc::new(server), &sip_cfg)
+        .await
+        .expect("engine up");
+    let id = engine
+        .place_call(env_or("KUTSU_SIP_EXT", "600"), scenario)
+        .await;
 
     // Poll until InProgress (proves answer + bridge wiring), then until terminal.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -37,7 +41,10 @@ async fn engine_places_and_finalizes_a_call() {
             if rec.state == CallState::InProgress {
                 saw_in_progress = true;
             }
-            if matches!(rec.state, CallState::Completed | CallState::Failed | CallState::HungUp) {
+            if matches!(
+                rec.state,
+                CallState::Completed | CallState::Failed | CallState::HungUp
+            ) {
                 break;
             }
         }
@@ -45,9 +52,19 @@ async fn engine_places_and_finalizes_a_call() {
     }
 
     let rec = engine.store().get(&id).expect("record exists");
-    eprintln!("[engine_call] final state={:?} transcript_len={}", rec.state, rec.transcript.len());
-    assert!(saw_in_progress, "call never reached InProgress — wiring/answer failed");
-    assert!(rec.ended_ms.is_some() || rec.state == CallState::InProgress, "call did not progress");
+    eprintln!(
+        "[engine_call] final state={:?} transcript_len={}",
+        rec.state,
+        rec.transcript.len()
+    );
+    assert!(
+        saw_in_progress,
+        "call never reached InProgress — wiring/answer failed"
+    );
+    assert!(
+        rec.ended_ms.is_some() || rec.state == CallState::InProgress,
+        "call did not progress"
+    );
 
     engine.shutdown().await;
 }

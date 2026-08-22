@@ -22,7 +22,12 @@ impl Agc {
     pub fn new(cfg: AgcConfig) -> Self {
         let target_rms = 32768.0 * 10f32.powf(cfg.target_dbfs / 20.0);
         let max_gain = 10f32.powf(cfg.max_gain_db / 20.0);
-        Self { cfg, target_rms, max_gain, gain: 1.0 }
+        Self {
+            cfg,
+            target_rms,
+            max_gain,
+            gain: 1.0,
+        }
     }
 
     /// Apply adaptive gain in place to one PCM16 frame.
@@ -97,7 +102,11 @@ mod tests {
         }
         let t = target_rms(&c);
         assert!(f.iter().all(|&s| s.abs() < 32767), "must not clip");
-        assert!((rms(&f) - t).abs() < t * 0.2, "expected ~{t}, got {}", rms(&f));
+        assert!(
+            (rms(&f) - t).abs() < t * 0.2,
+            "expected ~{t}, got {}",
+            rms(&f)
+        );
     }
 
     #[test]
@@ -110,18 +119,30 @@ mod tests {
 
     #[test]
     fn gain_respects_max_cap() {
-        let c = AgcConfig { max_gain_db: 6.0, ..AgcConfig::default() }; // ~2x cap
+        let c = AgcConfig {
+            max_gain_db: 6.0,
+            ..AgcConfig::default()
+        }; // ~2x cap
         let mut agc = Agc::new(c);
         let out = run(&mut agc, 500, 400); // desired ~8x, capped at 2x -> ~1000
         assert!(out <= 500.0 * 2.0 * 1.05, "gain must cap at ~2x, got {out}");
-        assert!(out > 500.0 * 1.5, "gain should apply up to the cap, got {out}");
+        assert!(
+            out > 500.0 * 1.5,
+            "gain should apply up to the cap, got {out}"
+        );
     }
 
     #[test]
     fn disabled_passes_through_unchanged() {
-        let c = AgcConfig { enabled: false, ..AgcConfig::default() };
+        let c = AgcConfig {
+            enabled: false,
+            ..AgcConfig::default()
+        };
         let mut agc = Agc::new(c);
         let out = run(&mut agc, 500, 50);
-        assert!((out - 500.0).abs() < 1.0, "disabled AGC must not alter the signal");
+        assert!(
+            (out - 500.0).abs() < 1.0,
+            "disabled AGC must not alter the signal"
+        );
     }
 }

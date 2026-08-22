@@ -24,6 +24,10 @@ pub trait QueueStore: Send {
     fn remove(&mut self, call_id: &str) -> Option<PendingEntry>;
     /// Count of pending entries.
     fn len(&self) -> usize;
+    /// Whether the queue holds no pending entries.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     /// 1-based position of `call_id` in dispatch order among pending entries.
     fn position(&self, call_id: &str) -> Option<usize>;
 }
@@ -36,12 +40,15 @@ pub struct MemQueue {
 }
 
 impl MemQueue {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl QueueStore for MemQueue {
     fn push(&mut self, entry: PendingEntry) {
-        self.entries.insert((entry.eligible_at_ms, entry.call_id.clone()), entry);
+        self.entries
+            .insert((entry.eligible_at_ms, entry.call_id.clone()), entry);
     }
     fn pop_eligible(&mut self, now_ms: u64) -> Option<PendingEntry> {
         // BTreeMap is ordered by (eligible_at_ms, call_id), so the first
@@ -59,12 +66,21 @@ impl QueueStore for MemQueue {
         self.entries.keys().next().map(|(t, _)| *t)
     }
     fn remove(&mut self, call_id: &str) -> Option<PendingEntry> {
-        let key = self.entries.iter().find(|(_, v)| v.call_id == call_id).map(|(k, _)| k.clone())?;
+        let key = self
+            .entries
+            .iter()
+            .find(|(_, v)| v.call_id == call_id)
+            .map(|(k, _)| k.clone())?;
         self.entries.remove(&key)
     }
-    fn len(&self) -> usize { self.entries.len() }
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
     fn position(&self, call_id: &str) -> Option<usize> {
-        self.entries.values().position(|v| v.call_id == call_id).map(|i| i + 1)
+        self.entries
+            .values()
+            .position(|v| v.call_id == call_id)
+            .map(|i| i + 1)
     }
 }
 
@@ -72,18 +88,27 @@ impl QueueStore for MemQueue {
 mod tests {
     use super::*;
     fn entry(id: &str, at: u64) -> PendingEntry {
-        PendingEntry { call_id: id.into(), number: "1".into(),
-            scenario: ScenarioConfig { system_prompt: String::new(), goal_schema: serde_json::json!({}), context: None },
-            eligible_at_ms: at, attempt: 1, retry_of: None }
+        PendingEntry {
+            call_id: id.into(),
+            number: "1".into(),
+            scenario: ScenarioConfig {
+                system_prompt: String::new(),
+                goal_schema: serde_json::json!({}),
+                context: None,
+            },
+            eligible_at_ms: at,
+            attempt: 1,
+            retry_of: None,
+        }
     }
     #[test]
     fn pops_earliest_eligible_only() {
         let mut q = MemQueue::new();
         q.push(entry("b", 200));
         q.push(entry("a", 100));
-        assert!(q.pop_eligible(50).is_none());          // nothing eligible yet
+        assert!(q.pop_eligible(50).is_none()); // nothing eligible yet
         assert_eq!(q.pop_eligible(150).unwrap().call_id, "a"); // only a is eligible
-        assert!(q.pop_eligible(150).is_none());          // b not yet
+        assert!(q.pop_eligible(150).is_none()); // b not yet
         assert_eq!(q.pop_eligible(250).unwrap().call_id, "b");
     }
     #[test]

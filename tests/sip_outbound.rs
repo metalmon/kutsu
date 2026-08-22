@@ -22,7 +22,10 @@ async fn outbound_echo_600_bidirectional_rtp() {
         password: env_or("KUTSU_SIP_PASS", "kutsupw"),
         from_user: None,
         local_ip: None,
+        local_port: None,
+        sip_domain: None,
         register: false,
+        register_expiry_secs: None,
         transport: Default::default(),
     };
     let transport = SipTransport::new(&cfg).await.expect("transport up");
@@ -33,11 +36,9 @@ async fn outbound_echo_600_bidirectional_rtp() {
 
     // Wait for answer, bounded so a dead stand fails fast instead of hanging.
     let codec = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        loop {
-            match call.events().recv().await.expect("event stream open") {
-                SipEvent::Answered { codec } => break codec,
-                SipEvent::Terminated(r) => panic!("terminated before answer: {r:?}"),
-            }
+        match call.events().recv().await.expect("event stream open") {
+            SipEvent::Answered { codec } => codec,
+            SipEvent::Terminated(r) => panic!("terminated before answer: {r:?}"),
         }
     })
     .await
@@ -70,7 +71,10 @@ async fn outbound_echo_600_bidirectional_rtp() {
     sender.abort();
 
     eprintln!("[sip_outbound] codec={:?} received={received}", codec.kind);
-    assert!(received > 0, "no echoed RTP frames — bidirectional media failed");
+    assert!(
+        received > 0,
+        "no echoed RTP frames — bidirectional media failed"
+    );
 
     call.hangup().await;
     transport.shutdown().await;
