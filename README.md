@@ -27,16 +27,46 @@
 
 ## Quickstart
 
-> Kutsu is an early scaffold — the commands below show the intended interface, not working software yet. See [Status](#status).
+Download the binary for your platform from the [Releases](../../releases) page
+(or [build from source](#building)). Then:
 
 ```bash
-cargo build --release
-./target/release/kutsu mcp --transport stdio
-# or over HTTP:
-./target/release/kutsu mcp --transport streamable-http --bind 127.0.0.1:8090
+kutsu init                 # write a documented kutsu.toml
 ```
 
+Edit the `[sip]` trunk in `kutsu.toml` — the login (`server`, `username`) lives
+in the file; only the password is a secret:
+
+```toml
+[sip]
+server = "sip.example.com:5060"
+username = "your-sip-login"
+register = true            # for login/password trunks
+```
+
+Then set the secrets in the environment (never in the file):
+
+```bash
+export GEMINI_API_KEY=...   # Gemini Live API key
+export KUTSU_SIP_PASS=...    # SIP password (login is in kutsu.toml)
+
+kutsu mcp                                                     # MCP server over stdio
+kutsu mcp --transport streamable-http --bind 127.0.0.1:8090  # or over HTTP
+```
+
+Place a one-off call from the CLI, or drive it from an agent over MCP:
+
+```bash
+kutsu call +15551234567 --scenario docs/examples/scenario.json
+```
+
+See [docs/getting-started.md](docs/getting-started.md) for a walkthrough,
+[docs/configuration.md](docs/configuration.md) for every setting, and
+[docs/mcp.md](docs/mcp.md) for the tool surface.
+
 ### Building
+
+Build from source only if you are not using a release binary.
 
 The SIP media stack pulls in native C code: `ezk-rtc` → `ezk-srtp` builds a bundled **libsrtp2** and needs OpenSSL's libcrypto for SRTP. That makes a few native toolchain dependencies mandatory on **every** platform, plus a choice of how OpenSSL is provided.
 
@@ -103,13 +133,13 @@ flowchart LR
 
 ## Call outcomes
 
-Every completed call must yield three artifacts, not just a transcript (planned — see [Status](#status)):
+A completed call yields structured outcomes, not just a transcript:
 
 | Artifact | What it is |
 |----------|------------|
-| **Transcript** | Timestamped `TranscriptEntry` list: both sides of the conversation plus tool calls the model made |
+| **Transcript** | Timestamped `TranscriptEntry` list: both sides of the conversation plus tool calls the model made. Persisted as `CallRecord` JSON when `transcript_dir` is set |
 | **Goal JSON** | A structured result (contact fields, appointment, disposition, scenario-specific flags) filled in during the call. `place_call` accepts a goal schema (JSON Schema); the model fills it and passes it as the arguments of a single `end_call` tool call at the end; kutsu records those arguments as the final goal JSON |
-| **Recording** | Audio of the full call (both legs), saved to disk and retrievable after hangup |
+| **Audio dumps** | Per-call WAV of each leg (uplink 8k/16k, downlink 8k/24k), written when `dump_uplink_dir` / `dump_downlink_dir` are set. Primarily for debugging/analysis |
 
 How the goal JSON gets filled: the scenario declares the goal schema; the model completes it over the course of the conversation; at the end, the model calls `end_call` with the filled schema as its arguments; kutsu records those arguments as the final goal JSON. The disposition (appointment, callback, refused, wrong contact, …) is a field inside the goal schema itself.
 
@@ -125,18 +155,26 @@ External tools are declared `NON_BLOCKING`, so the model keeps talking while the
 
 ## Status
 
-Early scaffold. Nothing works yet. Build phases:
+Working end to end: outbound calls over a real SIP trunk, bridged to Gemini
+Live, driven from the CLI or over MCP. The first live two-way call landed on a
+production Novofon trunk; active work is call-quality hardening (latency,
+dropouts, turn-taking).
 
-1. SIP spike (`ezk-sip-ua`/`ezk-rtc`) — outbound `INVITE`, raw RTP frames.
-2. `RealtimeProvider` trait + Gemini Live implementation (`BidiGenerateContent`, session resumption, tool bridging).
-3. Audio bridge (G.711 8kHz mu-law/PCM ↔ PCM16 16k/24k).
-4. Call engine + state (`CallRecord`/`TranscriptEntry`/`CallState`).
-5. MCP layer (`rmcp`): the five tools above.
-6. Call outcomes: goal JSON (schema in `place_call`, merged from model tool calls) + call recording to disk.
-7. In-call tool bridge: webhook out, async result callback in, `NON_BLOCKING` + `scheduling`, barge-in cancellation.
-8. Config, docs, tests.
+**Done:**
+
+1. SIP leg (`ezk-sip-ua`/`ezk-rtc`) — outbound `INVITE`, RTP media, REGISTER.
+2. `RealtimeProvider` (Gemini Live) — `BidiGenerateContent`, session resumption.
+3. Audio bridge — G.711 8kHz mu-law/PCM ↔ PCM16 16k/24k, both ways, realtime.
+4. Call engine + state (`CallRecord`/`TranscriptEntry`/`CallState`), retry, quality gates.
+5. MCP layer (`rmcp`): the four tools above (stdio + streamable-http, ops endpoints).
+6. Call outcomes: transcript + filled goal JSON; per-call audio dumps.
+7. Config file + env overlay, `kutsu init`, docs, tests.
+
+**Planned:**
+
+8. In-call tool bridge: webhook out, async result callback in, `NON_BLOCKING` + `scheduling`, barge-in cancellation.
 9. Second provider: OpenAI Realtime — validates the `RealtimeProvider` trait doesn't leak Gemini specifics.
-10. Inbound calls: `REGISTER` on the trunk, DID → scenario mapping, busy policy, webhook notification of incoming calls.
+10. Inbound calls: DID → scenario mapping, busy policy, webhook notification of incoming calls.
 
 ### Dev harness: kutsu live
 

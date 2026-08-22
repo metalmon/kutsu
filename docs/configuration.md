@@ -21,8 +21,9 @@ built-in default  <  kutsu.toml  <  KUTSU_* environment variable  <  CLI flag
   only the keys it names.
 - **`KUTSU_*` environment** — overrides any file/default value. Names are flat
   and unchanged from earlier releases (see the [reference table](#environment-variable-reference)).
-- **CLI flags** — a few `kutsu live` / `kutsu call` flags (e.g. `--model`,
-  `--voice`) override the resolved config for that one invocation.
+- **CLI flags** — a few `kutsu live` flags (e.g. `--model`, `--voice`,
+  `--greet-after-silence-ms`) override the resolved config for that one
+  invocation. See [cli.md](cli.md).
 
 Generate a documented starter file:
 

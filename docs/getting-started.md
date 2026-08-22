@@ -1,8 +1,14 @@
 # Getting started
 
-This guide takes you from a source checkout to a first call.
+This guide takes you from a fresh machine to a first call.
 
-## Build
+## Install
+
+Download the binary for your platform from the project's **Releases** page
+(linked from the [README](../README.md#quickstart)) and put it on your `PATH`.
+That is all most operators need — skip to [Configure](#configure).
+
+### Build from source (developers)
 
 ```bash
 cargo build --release
@@ -14,6 +20,9 @@ Some platforms need a vendored OpenSSL for the TLS/WebSocket path:
 ```bash
 cargo build --release --features vendor-openssl
 ```
+
+See the root [README](../README.md#building) for the full native-toolchain
+requirements (CMake, libclang, and — for the vendored build — Perl/NASM).
 
 ## Configure
 
