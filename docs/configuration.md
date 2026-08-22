@@ -196,6 +196,7 @@ All prompt text. Every key has an English-only default; see
 | `resume_cue` | `KUTSU_RESUME_CUE` |
 | `gender_female` / `gender_male` | — |
 | `language_template` | — |
+| `amd_instruction` | — |
 
 ### `[sip]`
 

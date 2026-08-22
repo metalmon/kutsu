@@ -253,9 +253,45 @@ impl ServerConfig {
             Gender::Neutral => "",
         });
         s.push_str(&p.closing);
+        s.push_str(&p.amd_instruction);
         s.push_str(&p.language_template.replace("{language}", &self.language));
         s
     }
+}
+
+/// Inject kutsu's standard `amd` field into a caller-supplied `goal_schema` so
+/// the model always reports what it reached via the single `end_call` tool. The
+/// caller's business fields are untouched; kutsu adds a top-level `amd` enum
+/// (and marks it required). A non-object schema is returned unchanged.
+pub fn augment_goal_schema(schema: &serde_json::Value) -> serde_json::Value {
+    let mut s = schema.clone();
+    let Some(obj) = s.as_object_mut() else {
+        return s;
+    };
+    let props = obj
+        .entry("properties")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(props) = props.as_object_mut() {
+        props.insert(
+            "amd".into(),
+            serde_json::json!({
+                "type": "string",
+                "enum": ["live", "voicemail", "announcement", "ivr", "hold"],
+                "description": "What the far end is: `live` for a real person you \
+                    conversed with; otherwise the non-live kind you detected."
+            }),
+        );
+    }
+    // Mark `amd` required so the model always reports it.
+    let req = obj
+        .entry("required")
+        .or_insert_with(|| serde_json::json!([]));
+    if let Some(arr) = req.as_array_mut()
+        && !arr.iter().any(|v| v == "amd")
+    {
+        arr.push(serde_json::json!("amd"));
+    }
+    s
 }
 
 /// Downlink playout pacing thresholds. Tunes the tradeoff between latency
@@ -451,6 +487,29 @@ pub const LANGUAGE_TEMPLATE: &str = "\n\n# Language\nSpeak ONLY in the language 
     language, but you MUST always answer in `{language}`, pronouncing it cleanly \
     and naturally like a native speaker, with no foreign accent.";
 
+/// Answering-machine / non-live detection, done inside the live session (no
+/// separate classifier). Two rules: recognize obviously non-live audio, and —
+/// for the hard case of background speech with no musical cue — use
+/// interactivity (a live person answers you; background audio does not). The
+/// model reports the outcome in the `amd` field of `end_call` (injected by
+/// [`augment_goal_schema`]). English by repo convention.
+pub const AMD_INSTRUCTION: &str = "\n\n# Detecting a non-live answer\n\
+    You may reach something other than a live person ready to talk. Watch for:\n\
+    - a voicemail / answering-machine greeting (set amd=voicemail),\n\
+    - a carrier/operator recording such as \"the subscriber is unavailable or \
+    switched off\" (set amd=announcement),\n\
+    - an automated menu asking you to press or say options (set amd=ivr),\n\
+    - hold music, ads, or voices/chatter in the background that are not \
+    addressing you (set amd=hold).\n\
+    Decisive test when audio alone is ambiguous (e.g. background speech with no \
+    music): a LIVE person responds to you - they answer your greeting and your \
+    questions and take turns. If, after you greet and ask a short question, the \
+    other side does not engage with you (keeps talking without responding, talks \
+    over you, or ignores your question), treat it as NOT live. As soon as you are \
+    confident it is not a live person, do NOT continue the conversation: call \
+    `end_call` immediately with the matching `amd` value. When you did have a \
+    real back-and-forth with a person, set amd=live.";
+
 /// All prompt text used to assemble a call's system instruction and the runtime
 /// cues. Deployment-stable defaults live here (English-only); operators override
 /// any field in `[server.prompts]` or via the matching `KUTSU_*` env var. The
@@ -475,6 +534,8 @@ pub struct PromptsConfig {
     pub gender_male: String,
     /// Language directive template; `{language}` is substituted at assembly.
     pub language_template: String,
+    /// Non-live detection rule (voicemail/announcement/ivr/hold + interactivity).
+    pub amd_instruction: String,
 }
 
 impl Default for PromptsConfig {
@@ -488,6 +549,7 @@ impl Default for PromptsConfig {
             gender_female: GENDER_FEMALE.into(),
             gender_male: GENDER_MALE.into(),
             language_template: LANGUAGE_TEMPLATE.into(),
+            amd_instruction: AMD_INSTRUCTION.into(),
         }
     }
 }
@@ -703,12 +765,56 @@ mod tests {
             &p.gender_female,
             &p.gender_male,
             &p.language_template,
+            &p.amd_instruction,
         ] {
             assert!(
                 s.is_ascii(),
                 "prompt default must be ASCII/English-only: {s:?}"
             );
         }
+    }
+
+    #[test]
+    fn augment_goal_schema_injects_amd_and_keeps_caller_fields() {
+        let caller = serde_json::json!({
+            "type": "object",
+            "properties": { "disposition": { "type": "string" } },
+            "required": ["disposition"]
+        });
+        let aug = augment_goal_schema(&caller);
+        // caller field preserved
+        assert_eq!(aug["properties"]["disposition"]["type"], "string");
+        // amd injected + required
+        assert_eq!(aug["properties"]["amd"]["type"], "string");
+        let req: Vec<&str> = aug["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(req.contains(&"disposition"));
+        assert!(req.contains(&"amd"));
+        assert!(
+            aug["properties"]["amd"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "hold")
+        );
+    }
+
+    #[test]
+    fn augment_goal_schema_leaves_non_object_unchanged() {
+        let s = serde_json::json!("not an object");
+        assert_eq!(augment_goal_schema(&s), s);
+    }
+
+    #[test]
+    fn assemble_includes_amd_instruction() {
+        let cfg = ServerConfig::default();
+        let sys = cfg.assemble_system_instruction(&scenario(serde_json::json!({"type": "object"})));
+        assert!(sys.contains("amd=voicemail"), "AMD rule must be present");
+        assert!(sys.contains("amd=hold"));
     }
 
     #[test]

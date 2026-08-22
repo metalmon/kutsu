@@ -143,6 +143,11 @@ pub(crate) fn map_model(m: crate::config::Model) -> GeminiModel {
 fn client_config(server: &ServerConfig, scenario: &ScenarioConfig) -> ClientConfig {
     let model = map_model(server.model);
     let native = model.is_native();
+    // Inject kutsu's `amd` field so `end_call` always reports what was reached.
+    // Both the prompt (the schema is echoed into it) and the tool params must see
+    // the augmented schema, so assemble from a scenario carrying it.
+    let mut scenario = scenario.clone();
+    scenario.goal_schema = crate::config::augment_goal_schema(&scenario.goal_schema);
     let setup = SetupConfig {
         model,
         voice: server.voice.clone(),
@@ -151,7 +156,7 @@ fn client_config(server: &ServerConfig, scenario: &ScenarioConfig) -> ClientConf
         } else {
             Some(server.language.clone())
         },
-        system_instruction: server.assemble_system_instruction(scenario),
+        system_instruction: server.assemble_system_instruction(&scenario),
         temperature: 0.8,
         goal_schema: scenario.goal_schema.clone(),
         resume_handle: None,

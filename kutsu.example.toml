@@ -127,6 +127,12 @@ noise_floor_rms = 200.0 # below this a frame is silence/noise; gain is held
 # Language directive template; {language} is replaced with `language` above.
 # language_template = "\n\n# Language\nSpeak ONLY in the language with BCP-47 code `{language}` ..."
 
+# Non-live-answer detection (voicemail / carrier announcement / IVR / hold),
+# done in the live session: the model reports the outcome in end_call's `amd`
+# field (kutsu injects that field into the goal schema automatically) and hangs
+# up early on a non-live answer.
+# amd_instruction = "\n\n# Detecting a non-live answer\nYou may reach something other than a live person ..."
+
 # ----------------------------------------------------------------------------
 # [sip] - outbound SIP trunk. Edit for your trunk; password is env-only.
 # ----------------------------------------------------------------------------
