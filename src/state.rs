@@ -22,6 +22,82 @@ pub enum CallState {
     Cancelled,
 }
 
+/// ~15 s: an answered call that the remote drops this fast with no transcript is
+/// a carrier announcement ("subscriber unavailable"), not a real conversation.
+pub const FAST_DISCONNECT_MAX_MS: u64 = 15_000;
+
+/// The authoritative terminal result: what the call actually was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Disposition {
+    Completed,
+    Voicemail,
+    Announcement,
+    Ivr,
+    Hold,
+    Busy,
+    NoAnswer,
+    Rejected,
+    NotFound,
+    Unavailable,
+    Failed,
+    Cancelled,
+}
+
+/// Shape of a terminated call, fed to [`resolve_disposition`].
+#[derive(Clone, Copy, Debug)]
+pub struct CallShape {
+    pub answered: bool,
+    pub duration_ms: u64,
+    pub transcript_len: usize,
+    pub ended_by: crate::gemini_live::EndedBy,
+}
+
+/// Resolve the single authoritative disposition. Precedence: cancelled, then the
+/// SIP dial outcome when the call was never answered, then the model's `amd`
+/// verdict when answered, then call-shape inference.
+pub fn resolve_disposition(
+    cancelled: bool,
+    amd: Option<&str>,
+    sip: Option<crate::sip::CallOutcome>,
+    shape: CallShape,
+) -> Disposition {
+    use crate::sip::CallOutcome;
+    if cancelled {
+        return Disposition::Cancelled;
+    }
+    if !shape.answered {
+        return match sip {
+            Some(CallOutcome::Busy) => Disposition::Busy,
+            Some(CallOutcome::NoAnswer) => Disposition::NoAnswer,
+            Some(CallOutcome::Rejected) => Disposition::Rejected,
+            Some(CallOutcome::NotFound) => Disposition::NotFound,
+            Some(CallOutcome::Unavailable) => Disposition::Unavailable,
+            _ => Disposition::Failed,
+        };
+    }
+    match amd {
+        Some("voicemail") => Disposition::Voicemail,
+        Some("announcement") => Disposition::Announcement,
+        Some("ivr") => Disposition::Ivr,
+        Some("hold") => Disposition::Hold,
+        Some("live") => Disposition::Completed,
+        _ => {
+            let fast_disconnect =
+                matches!(shape.ended_by, crate::gemini_live::EndedBy::RemoteClose)
+                    && shape.duration_ms < FAST_DISCONNECT_MAX_MS
+                    && shape.transcript_len == 0;
+            if fast_disconnect {
+                Disposition::Announcement
+            } else if shape.transcript_len > 0 {
+                Disposition::Completed
+            } else {
+                Disposition::Failed
+            }
+        }
+    }
+}
+
 /// Audio quality metrics for a call.
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct CallQuality {
@@ -339,5 +415,99 @@ mod tests {
         assert_eq!(got.quality.underruns, 3);
         assert_eq!(got.quality.uplink_lost, 7);
         assert_eq!(got.quality.uplink_received, 500);
+    }
+}
+
+#[cfg(test)]
+mod disposition_tests {
+    use super::*;
+    use crate::gemini_live::EndedBy;
+    use crate::sip::CallOutcome;
+
+    fn shape(answered: bool, dur: u64, tlen: usize, ended: EndedBy) -> CallShape {
+        CallShape {
+            answered,
+            duration_ms: dur,
+            transcript_len: tlen,
+            ended_by: ended,
+        }
+    }
+
+    #[test]
+    fn cancelled_wins() {
+        let d = resolve_disposition(true, None, None, shape(false, 0, 0, EndedBy::Error));
+        assert_eq!(d, Disposition::Cancelled);
+    }
+
+    #[test]
+    fn unanswered_maps_sip_outcome() {
+        let d = resolve_disposition(
+            false,
+            None,
+            Some(CallOutcome::NoAnswer),
+            shape(false, 0, 0, EndedBy::Error),
+        );
+        assert_eq!(d, Disposition::NoAnswer);
+        let d = resolve_disposition(
+            false,
+            None,
+            Some(CallOutcome::Busy),
+            shape(false, 0, 0, EndedBy::Error),
+        );
+        assert_eq!(d, Disposition::Busy);
+    }
+
+    #[test]
+    fn amd_wins_when_answered() {
+        let s = shape(true, 8000, 5, EndedBy::ModelEndCall);
+        assert_eq!(
+            resolve_disposition(false, Some("voicemail"), None, s),
+            Disposition::Voicemail
+        );
+        assert_eq!(
+            resolve_disposition(false, Some("announcement"), None, s),
+            Disposition::Announcement
+        );
+        assert_eq!(
+            resolve_disposition(false, Some("hold"), None, s),
+            Disposition::Hold
+        );
+        assert_eq!(
+            resolve_disposition(false, Some("ivr"), None, s),
+            Disposition::Ivr
+        );
+        assert_eq!(
+            resolve_disposition(false, Some("live"), None, s),
+            Disposition::Completed
+        );
+    }
+
+    #[test]
+    fn fast_disconnect_no_amd_is_announcement() {
+        // answered, remote hung up, short, empty transcript.
+        let s = shape(true, 4000, 0, EndedBy::RemoteClose);
+        assert_eq!(
+            resolve_disposition(false, None, None, s),
+            Disposition::Announcement
+        );
+    }
+
+    #[test]
+    fn real_conversation_without_amd_is_completed() {
+        let s = shape(true, 40000, 6, EndedBy::RemoteClose);
+        assert_eq!(
+            resolve_disposition(false, None, None, s),
+            Disposition::Completed
+        );
+    }
+
+    #[test]
+    fn answered_but_empty_and_not_short_is_failed() {
+        // answered, no amd, no transcript, but long (media negotiated then silence)
+        let s = shape(true, 40000, 0, EndedBy::Error);
+        assert_eq!(
+            resolve_disposition(false, None, None, s),
+            Disposition::Failed
+        );
     }
 }
