@@ -674,6 +674,7 @@ async fn run_call(
     let (gemini_handle, gemini_in, gemini_events) = session.split();
     let (events_out_tx, mut events_out_rx) = mpsc::channel::<Event>(256);
     let quality = bridge::QualityShared::new();
+    let (bridge_cancel_tx, bridge_cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let ports = BridgePorts {
         codec: codec.kind,
         phone_in: audio_in,
@@ -688,8 +689,30 @@ async fn run_call(
         uplink_dump: server.dump_uplink_dir.clone(),
         downlink_dump: server.dump_downlink_dir.clone(),
         agc_cfg: server.agc,
+        cancel: bridge_cancel_rx,
     };
-    let mut bridge_task = tokio::spawn(bridge::run(ports));
+    // Run the bridge (downlink pacer + uplink) on a dedicated OS thread with its
+    // own current-thread runtime, promoted to real-time priority — so the 20 ms
+    // downlink pacing is not delayed by shared-runtime contention. The engine
+    // stops it via `bridge_cancel_tx` (not task abort) and reads the outcome from
+    // `bridge_done_rx`.
+    let (bridge_done_tx, mut bridge_done_rx) =
+        tokio::sync::oneshot::channel::<crate::bridge::BridgeEnd>();
+    let bridge_thread = std::thread::Builder::new()
+        .name("kutsu-bridge".into())
+        .spawn(move || {
+            let _rt_priority = crate::realtime::promote_current_thread(
+                "kutsu-bridge",
+                crate::realtime::rt_enabled(std::env::var("KUTSU_RT_PRIORITY").ok()),
+            );
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build bridge runtime");
+            let end = rt.block_on(bridge::run(ports));
+            let _ = bridge_done_tx.send(end);
+        })
+        .expect("spawn bridge thread");
 
     // 7. Orchestration loop.
     let mut goal = None;
@@ -728,10 +751,14 @@ async fn run_call(
                 Some(SipEvent::Terminated(_)) | None => break CallState::HungUp,
                 Some(_) => {}
             },
-            r = &mut bridge_task => break match r {
+            r = &mut bridge_done_rx => break match r {
                 Ok(crate::bridge::BridgeEnd::PhoneClosed) => CallState::HungUp,
                 Ok(crate::bridge::BridgeEnd::GeminiClosed) => CallState::Failed,
-                Err(_) => CallState::Failed, // bridge task panicked
+                // Engine-initiated cancel is sent only during teardown (after the
+                // loop), so this arm normally sees Phone/GeminiClosed; treat a
+                // stray Cancelled as a hang-up.
+                Ok(crate::bridge::BridgeEnd::Cancelled) => CallState::HungUp,
+                Err(_) => CallState::Failed, // bridge thread died before sending
             },
             _ = &mut deadline => break CallState::Completed,
             _ = &mut cancel_rx => break CallState::Cancelled,
@@ -757,7 +784,7 @@ async fn run_call(
     // 8. Teardown (BYE both sides, stop the bridge, get the authoritative outcome).
     // On a model-initiated end (goodbye + `end_call`, so `goal` is set), let the
     // downlink pacer play the buffered goodbye out to the phone before we hang
-    // up — otherwise BYE + `bridge_task.abort()` truncate the model's last words.
+    // up — otherwise BYE + stopping the bridge truncate the model's last words.
     // The bridge keeps pacing while we wait. Bounded so a buffer that never
     // drains can't hang teardown; every other exit path tears down immediately.
     if goal.is_some() {
@@ -771,7 +798,11 @@ async fn run_call(
     }
     let _ = sip_hangup.send(());
     gemini_handle.hangup().await;
-    bridge_task.abort();
+    // Stop the bridge (dedicated thread) and join it — replaces task abort.
+    // Gemini hangup above usually ends the bridge on its own (GeminiClosed);
+    // the cancel covers the paths where it is still running.
+    let _ = bridge_cancel_tx.send(());
+    let _ = tokio::task::spawn_blocking(move || bridge_thread.join()).await;
     let outcome = gemini_handle.join().await;
 
     // 9. Finalize. Reconcile the loop's end_state with the authoritative outcome

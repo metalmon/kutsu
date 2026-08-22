@@ -22,20 +22,24 @@ pub fn rt_enabled(var: Option<String>) -> bool {
 /// reverts). `enabled == false`, or any OS failure, yields `None` without
 /// failing the caller.
 #[must_use]
-pub fn promote_current_thread(enabled: bool) -> Option<audio_thread_priority::RtPriorityHandle> {
+pub fn promote_current_thread(
+    label: &str,
+    enabled: bool,
+) -> Option<audio_thread_priority::RtPriorityHandle> {
     if !enabled {
         return None;
     }
     // 20 ms G.711 frames @ 8 kHz = 160 frames per RTP packet.
     match audio_thread_priority::promote_current_thread_to_real_time(160, 8000) {
         Ok(handle) => {
-            tracing::info!("SIP thread promoted to real-time priority");
+            tracing::info!(thread = label, "thread promoted to real-time priority");
             Some(handle)
         }
         Err(e) => {
             tracing::warn!(
+                thread = label,
                 error = ?e,
-                "could not raise SIP thread to real-time priority; continuing at normal priority"
+                "could not raise thread to real-time priority; continuing at normal priority"
             );
             None
         }

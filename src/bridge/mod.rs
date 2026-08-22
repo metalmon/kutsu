@@ -116,15 +116,20 @@ pub struct BridgePorts {
     pub downlink_dump: Option<std::path::PathBuf>,
     /// Adaptive gain applied to the uplink before it reaches Gemini.
     pub agc_cfg: crate::config::AgcConfig,
+    /// Teardown signal from the engine: when it fires, the bridge stops and
+    /// returns [`BridgeEnd::Cancelled`] (replaces aborting the task).
+    pub cancel: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// Why the bridge stopped.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum BridgeEnd {
     /// The phone side ended (RTP receiver closed, or send to phone failed).
     PhoneClosed,
     /// The Gemini side ended (event stream closed).
     GeminiClosed,
+    /// The engine asked the bridge to stop (call teardown).
+    Cancelled,
 }
 
 /// Bridge one call until a side ends. Does not hang up or join either side —
@@ -144,6 +149,7 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
         uplink_dump,
         downlink_dump,
         agc_cfg,
+        mut cancel,
     } = ports;
 
     // Uplink: transparent, continuous, never-manipulated forward (spec §2).
@@ -249,6 +255,10 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
     // cancelling it, so we must abort explicitly rather than just `return`.
     let end = loop {
         tokio::select! {
+            _ = &mut cancel => {
+                // Engine teardown: stop bridging (fires on send() or sender drop).
+                break BridgeEnd::Cancelled;
+            }
             _ = &mut uplink => {
                 // Uplink task ended: the phone stopped feeding us (hang-up).
                 break BridgeEnd::PhoneClosed;
@@ -366,6 +376,15 @@ mod tests {
         assert_eq!(q.snapshot().uplink_rms, 1000);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn cancel_signal_ends_the_bridge_as_cancelled() {
+        let (ports, ends) = wire(G711Kind::Ulaw);
+        let h = tokio::spawn(run(ports));
+        // No side closes; only the engine's teardown signal fires.
+        ends.cancel_tx.send(()).unwrap();
+        assert_eq!(h.await.unwrap(), BridgeEnd::Cancelled);
+    }
+
     // Build ports + keep the far ends for the test to drive.
     struct Ends {
         phone_in_tx: mpsc::Sender<Bytes>,
@@ -373,6 +392,7 @@ mod tests {
         gemini_in_rx: mpsc::Receiver<Vec<i16>>,
         gemini_events_tx: mpsc::Sender<Event>,
         events_out_rx: mpsc::Receiver<Event>,
+        cancel_tx: tokio::sync::oneshot::Sender<()>,
     }
 
     fn wire(codec: G711Kind) -> (BridgePorts, Ends) {
@@ -381,6 +401,7 @@ mod tests {
         let (gemini_in, gemini_in_rx) = mpsc::channel(64);
         let (gemini_events_tx, gemini_events) = mpsc::channel(64);
         let (events_out, events_out_rx) = mpsc::channel(64);
+        let (cancel_tx, cancel) = tokio::sync::oneshot::channel();
         (
             BridgePorts {
                 codec,
@@ -395,8 +416,9 @@ mod tests {
                 call_id: "c1".to_string(),
                 uplink_dump: None, downlink_dump: None,
                 agc_cfg: crate::config::AgcConfig { enabled: false, ..Default::default() },
+                cancel,
             },
-            Ends { phone_in_tx, phone_out_rx, gemini_in_rx, gemini_events_tx, events_out_rx },
+            Ends { phone_in_tx, phone_out_rx, gemini_in_rx, gemini_events_tx, events_out_rx, cancel_tx },
         )
     }
 
