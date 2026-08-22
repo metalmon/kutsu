@@ -157,7 +157,7 @@ External tools are declared `NON_BLOCKING`, so the model keeps talking while the
 
 Working end to end: outbound calls over a real SIP trunk, bridged to Gemini
 Live, driven from the CLI or over MCP. The first live two-way call landed on a
-production Novofon trunk; active work is call-quality hardening (latency,
+production SIP trunk; active work is call-quality hardening (latency,
 dropouts, turn-taking).
 
 **Done:**

@@ -54,7 +54,7 @@ pub(crate) async fn build_endpoint(
 /// Build the SIP-URI host:port for request/To/From URIs and the registrar.
 /// With a configured `domain` (a DNS name the stack resolves), the URIs carry
 /// that domain (required by trunks that route/authorize by SIP domain, e.g.
-/// Novofon `sip.novofon.ru`); otherwise they fall back to the numeric `server`
+/// `sip.example.com`); otherwise they fall back to the numeric `server`
 /// host (backwards-compatible IP behaviour). The port always comes from `server`.
 pub(crate) fn uri_host_port(server: SocketAddr, domain: Option<&str>) -> HostPort {
     match domain {

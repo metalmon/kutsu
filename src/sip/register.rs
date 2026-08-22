@@ -1,8 +1,8 @@
 //! REGISTER support: bind the account to the trunk (digest auth) and keep the
 //! binding refreshed for the process lifetime.
 //!
-//! Required by registration-based trunks (login/password), e.g. Novofon's
-//! standard SIP account. Pure IP-authorized trunks leave `register` off and
+//! Required by registration-based trunks (login/password), e.g. a standard
+//! login/password SIP account. Pure IP-authorized trunks leave `register` off and
 //! never touch this path.
 
 use std::net::SocketAddr;

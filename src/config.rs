@@ -46,13 +46,13 @@ pub struct SipConfig {
     pub local_ip: Option<IpAddr>,
     /// Local UDP port to bind the SIP transport to. `None` (or `0`) lets the OS
     /// pick an ephemeral port. Set a fixed port for trunks that authorize by a
-    /// static source `IP:port` (e.g. Novofon's IP-authorized SIP trunk): the
+    /// static source `IP:port` (e.g. an IP-authorized SIP trunk): the
     /// outbound source port must then match the configured origination address.
     #[serde(default)]
     pub local_port: Option<u16>,
 
     /// SIP domain (host part) for the request/To/From URIs and the REGISTER
-    /// registrar, e.g. `sip.novofon.ru`. When set, outbound URIs carry this
+    /// registrar, e.g. `sip.example.com`. When set, outbound URIs carry this
     /// domain (resolved via DNS by the stack) instead of the numeric `server`
     /// address — required by trunks that route/authorize by SIP domain. When
     /// absent, the URIs use `server`'s host (backwards-compatible IP behaviour).
@@ -60,11 +60,11 @@ pub struct SipConfig {
     pub sip_domain: Option<String>,
     /// Register a binding with the trunk before placing calls (REGISTER +
     /// digest, refreshed until shutdown). Required by registration-based trunks
-    /// (login/password), e.g. Novofon's standard SIP account.
+    /// (login/password), e.g. a standard login-password SIP account.
     #[serde(default)]
     pub register: bool,
     /// Requested REGISTER binding expiry, seconds. `None` uses the stack
-    /// default. Trunks often prefer a short value (Novofon ~120).
+    /// default. Trunks often prefer a short value (often ~120).
     #[serde(default)]
     pub register_expiry_secs: Option<u64>,
 
@@ -274,7 +274,7 @@ impl Default for QualityConfig {
         // latency — measured onset stays ~0), and that cushion rides out the
         // multi-hundred-ms mid-turn gaps in Gemini's delivery over the network
         // that a smaller buffer rendered as dropouts. The earlier 180/60 was
-        // tuned against a zero-jitter LAN PBX; on a live Novofon→mobile call 800
+        // tuned against a zero-jitter LAN PBX; on a live carrier→mobile call 800
         // dropped starvation from ~1460 ms to ~0 with no audible latency cost.
         Self {
             prebuffer_ms: 800,
@@ -592,9 +592,9 @@ mod tests {
         assert!(c.register_expiry_secs.is_none());
 
         let json = r#"{"server":"37.139.38.224:5060","username":"06733","password":"p",
-            "sip_domain":"sip.novofon.ru","register":true,"register_expiry_secs":120}"#;
+            "sip_domain":"sip.example.com","register":true,"register_expiry_secs":120}"#;
         let c: SipConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(c.sip_domain.as_deref(), Some("sip.novofon.ru"));
+        assert_eq!(c.sip_domain.as_deref(), Some("sip.example.com"));
         assert!(c.register);
         assert_eq!(c.register_expiry_secs, Some(120));
     }

@@ -77,8 +77,8 @@ live-tests = []
 [patch.crates-io]
 # Local fork of ezk-sip-core 0.9.1: `create_via` now emits a bare `rport` param
 # so SIP responses route back through NAT to the actual source IP:port (RFC 3581)
-# instead of the private Via sent-by. Required by Novofon (honors Via/rport, does
-# not blindly latch). See vendor/ezk-sip-core and memory novofon-nat-rport.
+# instead of the private Via sent-by. Required by carriers that honor Via/rport
+# rather than blindly latching. See vendor/ezk-sip-core.
 ezk-sip-core = { path = "vendor/ezk-sip-core" }
 
 [dev-dependencies]

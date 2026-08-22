@@ -117,8 +117,8 @@ impl Endpoint {
         // sent-by carries the transport's bound address, which behind NAT is a
         // private IP the server cannot reach; a bare `rport` tells the server to
         // send the response to the actual source IP:port instead of sent-by.
-        // (kutsu local patch — required by Novofon, which honors Via/rport
-        // rather than blindly latching. See memory novofon-nat-rport.)
+        // (kutsu local patch — required by carriers that honor Via/rport
+        // rather than blindly latching.)
         via.params.push(sip_types::uri::params::Param::name("rport"));
         via
     }
