@@ -9,15 +9,14 @@ Done: `net_check::preflight` is now enforced in `engine::run_call` (real
 `kutsu call` + MCP paths), fail-closed, gated by `net_check.enabled`; plus a
 mid-call abort on sustained uplink RTP loss (>10% cumulative after ~5 s).
 
-Remaining refinements:
-- **Rolling-window RTP loss**, not cumulative — a bad burst late in a long call
-  won't push the cumulative average over threshold.
-- **Tunable RTP-loss threshold** (currently a hardcoded 10% in engine.rs); add a
-  config knob if needed.
-- **Pre-answer callee/RTP leg probe** — preflight only covers the Gemini leg; the
-  cellular leg can't be probed before answer, only watched mid-call.
-- **Jitter metric** is mean-abs-deviation on Gemini ping RTT (rough); consider a
-  percentile / RFC3550-style measure.
+Done (2026-08-22): rolling-window uplink-loss gate (`window_loss_pct` over an
+~8 s deque), tunable threshold (`NetCheckConfig.uplink_loss_abort_pct` /
+`KUTSU_UPLINK_LOSS_ABORT_PCT`), and percentile jitter (p95−p50) in preflight.
+
+Remaining (inherent, low priority):
+- **Pre-answer callee/RTP leg probe** — preflight can only cover the Gemini leg;
+  the callee's cellular leg cannot be probed before answer, only watched mid-call
+  (which the rolling-window gate now does).
 
 ## Real-time scheduling — v2 (downlink pacer thread)
 
