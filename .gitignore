@@ -11,3 +11,13 @@ downlink-dump/
 # Per-call runtime output (audio dumps + transcripts)
 /dumps/
 /transcripts/
+
+# Local AI/agent tooling — not part of the project
+/.claude/
+/.superpowers/
+/docs/superpowers/
+CLAUDE.md
+.mcp.json
+
+# Internal working notes (kept locally, not part of the OSS docs)
+/docs/backlog.md
