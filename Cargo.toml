@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "Outbound SIP calling MCP server, bridging real phone calls to Gemini Live"
 license = "MIT"
+repository = "https://github.com/metalmon/kutsu"
+readme = "README.md"
+keywords = ["sip", "mcp", "voice", "telephony", "gemini"]
+categories = ["command-line-utilities", "multimedia"]
 
 [workspace]
 members = ["crates/gemini-live"]
@@ -91,3 +95,31 @@ tokio = { version = "1", features = ["test-util"] }
 # (edition 2024 / resolver v3) means this does not leak into `cargo build`'s
 # feature set for the `kutsu` binary, only into test targets.
 rmcp = { version = "3.1", features = ["client"] }
+
+# --- Linux packaging (cargo-deb / cargo-generate-rpm) ---
+# Both package the already-built `target/release/kutsu` (the release workflow
+# builds it once with `--features vendor-openssl`, then runs the packagers with
+# --no-build). Version/license/summary are taken from [package] above.
+
+[package.metadata.deb]
+maintainer = "metalmon <alex.metalmon@gmail.com>"
+copyright = "2026, metalmon"
+section = "net"
+priority = "optional"
+extended-description = """
+kutsu places outbound SIP calls and bridges them to a realtime voice model
+(Gemini Live), exposed as an MCP server. One static binary; the model owns
+turn-taking, barge-in, and tool calls for the duration of the call."""
+assets = [
+    ["target/release/kutsu", "usr/bin/", "755"],
+    ["kutsu.example.toml", "usr/share/doc/kutsu/kutsu.example.toml", "644"],
+    ["README.md", "usr/share/doc/kutsu/README.md", "644"],
+    ["docs/configuration.md", "usr/share/doc/kutsu/configuration.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/kutsu", dest = "/usr/bin/kutsu", mode = "755" },
+    { source = "kutsu.example.toml", dest = "/usr/share/doc/kutsu/kutsu.example.toml", mode = "644", doc = true },
+    { source = "README.md", dest = "/usr/share/doc/kutsu/README.md", mode = "644", doc = true },
+]

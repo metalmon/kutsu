@@ -1,0 +1,134 @@
+name: release
+
+# Build release artifacts on a version tag (v*) and attach them to a GitHub
+# Release. Can also be run manually (workflow_dispatch) to smoke-test the build
+# matrix without publishing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ---- Linux x86_64: static binary + .deb + .rpm + tarball --------------------
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install native build deps
+        run: |
+          sudo apt-get update
+          # cmake -> bundled libsrtp2; clang/libclang -> bindgen; perl+make (present)
+          # drive the vendored OpenSSL source build.
+          sudo apt-get install -y cmake clang llvm libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+
+      - name: Build (vendored OpenSSL, self-contained)
+        run: cargo build --release --features vendor-openssl
+
+      - name: Package .deb / .rpm (reuse the built binary)
+        run: |
+          cargo deb --no-build
+          cargo generate-rpm
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          cp target/debian/*.deb dist/
+          cp target/generate-rpm/*.rpm dist/
+          tar czf "dist/kutsu-${GITHUB_REF_NAME}-x86_64-linux.tar.gz" -C target/release kutsu
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  # ---- Windows x86_64: zip ----------------------------------------------------
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install NASM + LLVM (vendored OpenSSL asm + bindgen)
+        run: choco install -y nasm llvm
+
+      - name: Expose NASM/LLVM to the build
+        shell: pwsh
+        run: |
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (vendored OpenSSL, self-contained)
+        run: cargo build --release --features vendor-openssl
+
+      - name: Package .zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path target\release\kutsu.exe `
+            -DestinationPath "dist\kutsu-$env:GITHUB_REF_NAME-x86_64-windows.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  # ---- macOS arm64: tarball ("the rest") -------------------------------------
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install native build deps
+        run: brew install cmake llvm
+
+      - name: Expose libclang to bindgen
+        run: echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (vendored OpenSSL, self-contained)
+        run: cargo build --release --features vendor-openssl
+
+      - name: Package tarball
+        run: |
+          mkdir -p dist
+          tar czf "dist/kutsu-${GITHUB_REF_NAME}-aarch64-macos.tar.gz" -C target/release kutsu
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  # ---- Publish the GitHub Release (tags only) --------------------------------
+  release:
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
