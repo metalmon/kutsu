@@ -1027,7 +1027,7 @@ fn write_owner_only(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Model, NetCheckConfig, RESUME_CUE, VadConfig};
+    use crate::config::{Model, NetCheckConfig, VadConfig};
 
     #[test]
     fn window_loss_pct_needs_enough_samples_then_reports_windowed_loss() {
@@ -1064,7 +1064,7 @@ mod tests {
             retry: crate::config::RetryConfig::default(),
             vad: VadConfig::default(),
             agc: crate::config::AgcConfig::default(),
-            resume_cue: RESUME_CUE.into(),
+            prompts: crate::config::PromptsConfig::default(),
         };
         let sip_cfg = SipConfig {
             server: "127.0.0.1:5060".into(),
@@ -1083,9 +1083,9 @@ mod tests {
 
     fn test_scenario() -> ScenarioConfig {
         ScenarioConfig {
-            system_prompt: "You are a test assistant.".into(),
             goal_schema: serde_json::json!({"type": "object", "required": ["disposition"]}),
             context: None,
+            prompt_override: None,
         }
     }
 

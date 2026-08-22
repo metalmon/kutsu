@@ -1,0 +1,143 @@
+# kutsu configuration.
+#
+# Copy to `kutsu.toml` (or run `kutsu init`) and edit. Every field is optional:
+# omit a key to keep its built-in default. Precedence, low to high:
+#
+#     built-in default  <  this file  <  KUTSU_* environment variable  <  CLI flag
+#
+# The file is discovered at $KUTSU_CONFIG, else `kutsu.toml` in the working
+# directory. SECRETS ARE NEVER READ FROM THIS FILE - set them in the
+# environment instead:
+#
+#     GEMINI_API_KEY   Gemini Live API key            (required)
+#     KUTSU_SIP_PASS   SIP digest password            (required for real calls)
+#     PROXY_URL / PROXY_USER / PROXY_PASSWORD          (optional egress proxy)
+
+# ----------------------------------------------------------------------------
+# [server] - Gemini Live + call-engine defaults (stable per deployment).
+# ----------------------------------------------------------------------------
+[server]
+# Gemini model. "half-cascade" (default) is the most reliable for telephone
+# ASR; "native-audio" is lower-latency but ignores the structured language code.
+model = "half-cascade"
+
+# Gemini voice name and the grammatical gender the agent refers to itself in
+# (male | female | neutral) - matched to the voice you pick.
+voice = "Autonoe"
+voice_gender = "female"
+
+# Spoken language as a BCP-47 tag. Also pinned into the system prompt (see
+# [server.prompts].language_template). Override with KUTSU_LANGUAGE.
+language = "en-US"
+
+# Max simultaneous calls; further calls queue. 0 means every call queues
+# forever (never dials) - raise it to enable calls.
+max_concurrent_channels = 3
+
+# If the callee is silent this many ms after answer, the agent greets first.
+# 0 disables the proactive greeting (purely reactive).
+greet_after_silence_ms = 1000
+
+# Safety cap on a single call's duration, seconds.
+max_call_secs = 600
+
+# Optional output directories (omit to disable). Per-call transcript JSON and
+# raw audio dumps, useful for debugging / offline analysis.
+# transcript_dir = "./transcripts"
+# dump_uplink_dir = "./uplink-dump"
+# dump_downlink_dir = "./downlink-dump"
+
+# ----------------------------------------------------------------------------
+# [server.net_check] - pre-dial network preflight + mid-call RTP-loss gate.
+# ----------------------------------------------------------------------------
+[server.net_check]
+enabled = true
+samples = 10          # ping samples for the pre-dial Gemini-leg probe
+max_rtt_ms = 300      # fail preflight above this median RTT
+max_jitter_ms = 50    # fail preflight above this p95-p50 jitter
+max_loss_pct = 2.0    # fail preflight above this ping-loss %
+uplink_loss_abort_pct = 10.0  # abort a live call above this rolling uplink loss %
+
+# ----------------------------------------------------------------------------
+# [server.quality] - downlink playout pacing (latency vs glitch tradeoff).
+# ----------------------------------------------------------------------------
+[server.quality]
+prebuffer_ms = 800    # buffer target before (re)starting playout
+resume_ms = 400       # faster re-arm target after a mid-turn underrun
+abort_underruns = 40  # cumulative underruns that abort a call as unusable (0 = never)
+
+# ----------------------------------------------------------------------------
+# [server.retry] - retry policy for transient dial outcomes.
+# ----------------------------------------------------------------------------
+[server.retry]
+busy_max_attempts = 3           # dial attempts for a busy number (incl. the first)
+busy_retry_interval_ms = 300000 # delay before a busy retry (5 min)
+
+# ----------------------------------------------------------------------------
+# [server.vad] - energy VAD tuning for detecting callee speech onset.
+# ----------------------------------------------------------------------------
+[server.vad]
+min_rms = 200         # absolute RMS floor below which a frame is never speech
+ratio = 3.0           # speech = RMS >= max(min_rms, noise_floor * ratio)
+onset_frames = 3      # consecutive speech frames required to confirm onset
+warmup_frames = 10    # startup window (~200 ms at 20 ms/frame) for early onset
+
+# ----------------------------------------------------------------------------
+# [server.agc] - adaptive uplink gain (lifts quiet real-trunk speech).
+# ----------------------------------------------------------------------------
+[server.agc]
+enabled = true
+target_dbfs = -18.0     # target output level; sustained speech is driven toward this
+max_gain_db = 30.0      # ceiling on applied gain
+noise_floor_rms = 200.0 # below this a frame is silence/noise; gain is held
+
+# ----------------------------------------------------------------------------
+# [server.prompts] - all prompt text (deployment-stable). Every key below has a
+# sensible English default; uncomment to override. The PER-CALL layer (the
+# call's objective and lead data) is NOT here - it is the `goal_schema` +
+# `context` passed to `place_call`, plus an optional per-call `prompt_override`.
+#
+# Language-specific wording (e.g. gendered verb endings for a non-English
+# target language) belongs here in your local kutsu.toml, keeping the shipped
+# defaults English-only.
+# ----------------------------------------------------------------------------
+[server.prompts]
+# Base persona/behaviour, used when a call carries no prompt_override.
+# Also settable via KUTSU_SYSTEM_PROMPT.
+# base_system_prompt = "You are a helpful voice agent making a phone call. Speak naturally and conversationally, keep your replies short, and stay on task."
+
+# Preamble printed before the per-call goal_schema JSON inside the prompt, so
+# the model knows what to gather (not only how to shape the end_call payload).
+# goal_preamble = "\n\n# Your objective\nDuring this call, pursue and gather ..."
+
+# Directive that makes the model close deterministically via the end_call tool.
+# closing = "\n\n# Ending the call\nWhen the conversation is finished ..."
+
+# Cue handed to the model to greet a silent callee (KUTSU_GREET_CUE).
+# greet_cue = "The call has connected and the other party has not spoken yet. Greet them now and begin the conversation as instructed."
+
+# Instruction sent when a session reconnects with lost context (KUTSU_RESUME_CUE).
+# resume_cue = "The connection dropped briefly ..."
+
+# Voice-gender directives. Add language-specific examples here if needed.
+# gender_female = "\n\n# Your voice\nYou speak with a FEMALE voice. ..."
+# gender_male = "\n\n# Your voice\nYou speak with a MALE voice. ..."
+
+# Language directive template; {language} is replaced with `language` above.
+# language_template = "\n\n# Language\nSpeak ONLY in the language with BCP-47 code `{language}` ..."
+
+# ----------------------------------------------------------------------------
+# [sip] - outbound SIP trunk. Edit for your trunk; password is env-only.
+# ----------------------------------------------------------------------------
+[sip]
+server = "sip.example.com:5060"  # trunk as host:port
+username = "your-sip-login"      # digest username (also default caller identity)
+# password comes from KUTSU_SIP_PASS (never store it here)
+
+register = false                 # REGISTER before calling (needed by login/password trunks)
+
+# from_user = "caller-id"        # From-header user-part (defaults to username)
+# local_ip = "203.0.113.10"      # bind + advertise in SDP (auto-detected if absent)
+# local_port = 5060              # fixed source port for IP:port-authorized trunks
+# sip_domain = "sip.example.com" # SIP domain for URIs/REGISTER (for domain-routed trunks)
+# register_expiry_secs = 120     # requested REGISTER binding expiry

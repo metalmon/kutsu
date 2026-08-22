@@ -81,10 +81,6 @@ async fn place_call_via_mcp_completes() {
             "to_number",
             serde_json::Value::String(env_or("KUTSU_SIP_EXT", "600")),
         ),
-        (
-            "system_prompt",
-            serde_json::Value::String(scenario.system_prompt.clone()),
-        ),
         ("goal_schema", scenario.goal_schema.clone()),
     ]);
     let place_result = client

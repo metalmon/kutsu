@@ -125,11 +125,6 @@ pub struct CallOutcome {
     pub transcript: Vec<TranscriptEntry>,
 }
 
-/// Kickoff cue sent as a user turn when the callee stays silent. It only hands
-/// the turn to the model — the greeting wording comes from the system prompt.
-const GREET_CUE: &str = "The call has connected and the other party has not spoken yet. \
-     Greet them now and begin the conversation as instructed.";
-
 /// Map kutsu's config-level model onto the crate's model enum. `pub(crate)` so
 /// the network preflight (`net_check`) builds the same endpoint URL the session
 /// uses via the crate's `endpoint_url`.
@@ -156,7 +151,7 @@ fn client_config(server: &ServerConfig, scenario: &ScenarioConfig) -> ClientConf
         } else {
             Some(server.language.clone())
         },
-        system_instruction: crate::proto::assemble_system_instruction(server, scenario),
+        system_instruction: server.assemble_system_instruction(scenario),
         temperature: 0.8,
         goal_schema: scenario.goal_schema.clone(),
         resume_handle: None,
@@ -276,7 +271,11 @@ async fn run_driver(
                 if greet_armed && !greeted && !had_activity && !callee_active && !is_reconnect_session => {
                 greeted = true;
                 tracing::info!("gemini: callee silent — sending greeting kickoff");
-                if session.send_client_text(GREET_CUE).await.is_err() {
+                if session
+                    .send_client_text(&server.prompts.greet_cue)
+                    .await
+                    .is_err()
+                {
                     break (EndedBy::RemoteClose, None);
                 }
             }
@@ -371,7 +370,11 @@ async fn run_driver(
                                     resume_needed = true,
                                     "gemini reconnect: context lost mid-exchange — sending RESUME_CUE"
                                 );
-                                if session.send_client_text(&server.resume_cue).await.is_err() {
+                                if session
+                                    .send_client_text(&server.prompts.resume_cue)
+                                    .await
+                                    .is_err()
+                                {
                                     break (EndedBy::RemoteClose, None);
                                 }
                             }
@@ -585,23 +588,8 @@ mod tests {
     fn server() -> ServerConfig {
         ServerConfig {
             api_key: "K".into(),
-            proxy: None,
-            model: Model::HalfCascade,
-            voice: "Autonoe".into(),
-            voice_gender: crate::config::Gender::Female,
-            language: "en-US".into(),
-            net_check: NetCheckConfig::default(),
-            max_concurrent_channels: 3,
             greet_after_silence_ms: 0,
-            transcript_dir: None,
-            dump_uplink_dir: None,
-            dump_downlink_dir: None,
-            max_call_secs: 600,
-            quality: crate::config::QualityConfig::default(),
-            retry: crate::config::RetryConfig::default(),
-            vad: VadConfig::default(),
-            agc: crate::config::AgcConfig::default(),
-            resume_cue: RESUME_CUE.into(),
+            ..Default::default()
         }
     }
 
@@ -992,7 +980,7 @@ mod tests {
             }
         }
         assert_eq!(interrupted, 1, "exactly one Interrupted flush on reconnect");
-        let expected = client_content(&server().resume_cue);
+        let expected = client_content(&server().prompts.resume_cue);
         assert!(
             second_sent.lock().unwrap().contains(&expected),
             "RESUME_CUE must be sent on lost context"
@@ -1046,7 +1034,7 @@ mod tests {
             }
         }
         assert_eq!(interrupted, 1, "the reconnect still flushes the pacer once");
-        let cue = client_content(&server().resume_cue);
+        let cue = client_content(&server().prompts.resume_cue);
         // The reopened setup carries the handle, but no client-content cue is sent.
         assert!(
             !second_sent.lock().unwrap().contains(&cue),
@@ -1097,7 +1085,7 @@ mod tests {
             }
         }
         assert_eq!(interrupted, 1, "the reconnect still flushes the pacer once");
-        let cue = client_content(&server().resume_cue);
+        let cue = client_content(&server().prompts.resume_cue);
         assert!(
             !second_sent.lock().unwrap().contains(&cue),
             "no RESUME_CUE without a pending turn"

@@ -92,9 +92,9 @@ mod tests {
             call_id: id.into(),
             number: "1".into(),
             scenario: ScenarioConfig {
-                system_prompt: String::new(),
                 goal_schema: serde_json::json!({}),
                 context: None,
+                prompt_override: None,
             },
             eligible_at_ms: at,
             attempt: 1,

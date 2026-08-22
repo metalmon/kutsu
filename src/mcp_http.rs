@@ -296,9 +296,7 @@ mod tests {
     /// Build a valid engine for tests, bound to loopback so `SipTransport::new`
     /// binds offline (no real trunk) — mirrors `mcp::tests::test_engine`.
     async fn test_engine(cap: usize) -> Engine {
-        use crate::config::{
-            Model, NetCheckConfig, RESUME_CUE, ServerConfig, SipConfig, VadConfig,
-        };
+        use crate::config::{Model, NetCheckConfig, ServerConfig, SipConfig, VadConfig};
         let server = ServerConfig {
             api_key: "k".into(),
             proxy: None,
@@ -317,7 +315,7 @@ mod tests {
             retry: crate::config::RetryConfig::default(),
             vad: VadConfig::default(),
             agc: crate::config::AgcConfig::default(),
-            resume_cue: RESUME_CUE.into(),
+            prompts: crate::config::PromptsConfig::default(),
         };
         let sip = SipConfig {
             server: "127.0.0.1:5060".into(),
@@ -350,9 +348,9 @@ mod tests {
             .place_call(
                 "600".into(),
                 ScenarioConfig {
-                    system_prompt: "hi".into(),
                     goal_schema: serde_json::json!({ "type": "object" }),
                     context: None,
+                    prompt_override: None,
                 },
             )
             .await;

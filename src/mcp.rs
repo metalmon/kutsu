@@ -2,7 +2,7 @@
 //!
 //! Four tools, each a thin wrapper over [`crate::engine::Engine`] /
 //! [`crate::state`]:
-//! - `place_call(to_number, system_prompt, goal_schema, context)` — spawns
+//! - `place_call(to_number, goal_schema, context?, prompt_override?)` — spawns
 //!   the call in the background and returns a `call_id` immediately (async
 //!   execution model, chosen to avoid MCP client tool-call timeouts on calls
 //!   that run minutes).
@@ -49,13 +49,17 @@ pub struct KutsuServer {
 struct PlaceCallArgs {
     /// Callee number in E.164, e.g. "+79991234567".
     to_number: String,
-    /// System prompt / persona that drives the agent for this call.
-    system_prompt: String,
-    /// JSON Schema the agent fills and submits via end_call (the call goal).
+    /// JSON Schema the agent fills and submits via end_call. Carries the call's
+    /// objective (via its field descriptions) as well as the output shape; it is
+    /// also injected into the prompt so the model knows what to gather.
     goal_schema: serde_json::Value,
     /// Optional lead/context object merged into the prompt.
     #[serde(default)]
     context: Option<serde_json::Value>,
+    /// Optional per-call persona override. When absent, the deployment's base
+    /// system prompt (`[server.prompts]` / `KUTSU_SYSTEM_PROMPT`) is used.
+    #[serde(default)]
+    prompt_override: Option<String>,
     /// Optional UTC epoch ms to place the call at. Past/absent = immediate.
     #[serde(default)]
     schedule_at: Option<u64>,
@@ -159,9 +163,9 @@ impl KutsuServer {
         client_supports_tasks: bool,
     ) -> Result<CallToolResponse, ErrorData> {
         let scenario = ScenarioConfig {
-            system_prompt: a.system_prompt,
             goal_schema: a.goal_schema,
             context: a.context,
+            prompt_override: a.prompt_override,
         };
         // A `schedule_at` in the past (or absent) means "now" — never an
         // error, just immediate eligibility.
@@ -381,7 +385,7 @@ impl ServerHandler for KutsuServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Model, NetCheckConfig, RESUME_CUE, ServerConfig, SipConfig, VadConfig};
+    use crate::config::{Model, NetCheckConfig, ServerConfig, SipConfig, VadConfig};
 
     /// Build a valid engine for tests, bound to loopback so `SipTransport::new`
     /// binds offline (no real trunk) — mirrors `engine::tests::test_configs`.
@@ -404,7 +408,7 @@ mod tests {
             retry: crate::config::RetryConfig::default(),
             vad: VadConfig::default(),
             agc: crate::config::AgcConfig::default(),
-            resume_cue: RESUME_CUE.into(),
+            prompts: crate::config::PromptsConfig::default(),
         };
         let sip = SipConfig {
             server: "127.0.0.1:5060".into(),
@@ -441,9 +445,9 @@ mod tests {
     fn args(to: &str) -> PlaceCallArgs {
         PlaceCallArgs {
             to_number: to.into(),
-            system_prompt: "hi".into(),
             goal_schema: serde_json::json!({ "type": "object" }),
             context: None,
+            prompt_override: None,
             schedule_at: None,
             retry_of: None,
         }
@@ -572,9 +576,9 @@ mod tests {
             .place_call(
                 "600".into(),
                 ScenarioConfig {
-                    system_prompt: "hi".into(),
                     goal_schema: serde_json::json!({ "type": "object" }),
                     context: None,
+                    prompt_override: None,
                 },
             )
             .await;

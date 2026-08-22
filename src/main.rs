@@ -41,7 +41,7 @@ enum Command {
     },
     /// Run one conversation against Gemini Live from a scenario + audio file (dev harness).
     Live {
-        /// Scenario JSON: { system_prompt, goal_schema, context? }.
+        /// Scenario JSON: { goal_schema, context?, prompt_override? }.
         #[arg(long)]
         scenario: std::path::PathBuf,
         /// Input audio: mono PCM16 WAV or raw .pcm at 16 kHz.
@@ -77,11 +77,24 @@ enum Command {
     Call {
         /// Number/extension to dial.
         number: String,
-        /// Optional scenario JSON file (system prompt, goal schema). Uses a default if absent.
+        /// Optional scenario JSON file (goal_schema, context?, prompt_override?). Uses a default if absent.
         #[arg(long)]
         scenario: Option<std::path::PathBuf>,
     },
+    /// Write a documented default config to `kutsu.toml` (does not overwrite unless --force).
+    Init {
+        /// Path to write. Defaults to `kutsu.toml` in the current directory.
+        #[arg(long, default_value = "kutsu.toml")]
+        path: std::path::PathBuf,
+        /// Overwrite an existing file.
+        #[arg(long)]
+        force: bool,
+    },
 }
+
+/// The documented default `kutsu.toml`, embedded so `kutsu init` and the
+/// in-repo example never drift.
+const EXAMPLE_TOML: &str = include_str!("../kutsu.example.toml");
 
 /// On Windows the default multimedia timer resolution is ~15.6 ms, which
 /// quantises the bridge's 20 ms media pacer into uneven ticks → jittery RTP
@@ -160,16 +173,31 @@ fn main() -> anyhow::Result<()> {
             let code = rt.block_on(run_call_cli(number, scenario));
             std::process::exit(code);
         }
+        Some(Command::Init { path, force }) => run_init(&path, force),
         None => {
             println!(
                 "kutsu {} — outbound SIP calling MCP server. Subcommands: `mcp` (run the MCP server), \
-                 `call` (place one call from the CLI), `live` (dev harness against a scenario + audio file). \
-                 Run with --help for details.",
+                 `call` (place one call from the CLI), `live` (dev harness against a scenario + audio file), \
+                 `init` (write a default kutsu.toml). Run with --help for details.",
                 kutsu::version()
             );
             Ok(())
         }
     }
+}
+
+/// Write the documented default config to `path`. Refuses to clobber an
+/// existing file unless `force`, so a populated `kutsu.toml` is never lost.
+fn run_init(path: &std::path::Path, force: bool) -> anyhow::Result<()> {
+    if path.exists() && !force {
+        anyhow::bail!(
+            "{} already exists; pass --force to overwrite",
+            path.display()
+        );
+    }
+    std::fs::write(path, EXAMPLE_TOML)?;
+    println!("wrote {}", path.display());
+    Ok(())
 }
 
 /// Run the MCP server: build the engine from env config, serve the chosen

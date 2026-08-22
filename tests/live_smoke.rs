@@ -43,13 +43,15 @@ async fn short_live_session_returns_audio_and_ends() {
         retry: kutsu::config::RetryConfig::default(),
         vad: kutsu::config::VadConfig::default(),
         agc: kutsu::config::AgcConfig::default(),
-        resume_cue: kutsu::config::RESUME_CUE.into(),
+        prompts: kutsu::config::PromptsConfig::default(),
     };
     let scenario = kutsu::config::ScenarioConfig {
-        system_prompt: "You are a friendly assistant. Greet briefly, then call end_call.".into(),
         goal_schema: serde_json::json!({"type":"object","required":["disposition"],
             "properties":{"disposition":{"type":"string"}}}),
         context: None,
+        prompt_override: Some(
+            "You are a friendly assistant. Greet briefly, then call end_call.".into(),
+        ),
     };
 
     let health = kutsu::net_check::preflight(&server)

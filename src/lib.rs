@@ -20,7 +20,6 @@ pub mod main_support;
 pub mod mcp;
 pub mod mcp_http;
 pub mod net_check;
-pub mod proto;
 pub mod queue;
 pub mod realtime;
 pub mod sip;
