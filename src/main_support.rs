@@ -150,6 +150,10 @@ fn apply_env_overlay(server: &mut ServerConfig, sip: &mut SipConfig) -> anyhow::
         "KUTSU_UPLINK_LOSS_ABORT_PCT",
         &mut server.net_check.uplink_loss_abort_pct,
     );
+    over_f32(
+        "KUTSU_DOWNLINK_LOSS_ABORT_PCT",
+        &mut server.net_check.downlink_loss_abort_pct,
+    );
 
     // quality.
     over_u32(

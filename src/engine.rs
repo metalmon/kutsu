@@ -43,11 +43,34 @@ fn window_loss_pct(oldest: (u64, u64), current: (u64, u64)) -> Option<f32> {
 /// Merge a downlink `CallQuality` snapshot with the uplink (phone→bridge)
 /// snapshot, so both directions are reported through the one `CallQuality`
 /// record. Kept in one place, used by both the `qtick` arm and finalize.
-fn merge_quality(mut q: CallQuality, u: crate::sip::UplinkQuality) -> CallQuality {
+fn merge_quality(
+    mut q: CallQuality,
+    u: crate::sip::UplinkQuality,
+    d: crate::sip::DownlinkQuality,
+) -> CallQuality {
     q.uplink_received = u.received;
     q.uplink_lost = u.lost;
     q.uplink_reordered = u.reordered;
+    // Downlink is RR-derived and best-effort: only record it when a report is
+    // actually present, so a missing RR reads as 0 (no data), not "0% loss".
+    if d.present {
+        q.downlink_loss_pct = d.loss_pct;
+        q.downlink_jitter_ms = d.jitter_ms;
+        q.downlink_rtt_ms = d.rtt_ms;
+    }
     q
+}
+
+/// Number of consecutive ~1 s quality ticks with a downlink RR loss breach that
+/// aborts a call. RR is smoothed and ~1/s, so require a short sustained streak
+/// rather than reacting to a single noisy report.
+const DOWNLINK_BREACH_TICKS: u32 = 5;
+
+/// Does this downlink snapshot breach the abort threshold? Only a present
+/// RR-derived sample can breach — a missing report is never a breach (the
+/// downlink gate is best-effort and fails open when the carrier sends no RR).
+fn downlink_breach(d: crate::sip::DownlinkQuality, abort_pct: f32) -> bool {
+    d.present && d.loss_pct > abort_pct
 }
 
 /// Should a busy dial attempt be retried? `attempt` is the 1-based attempt
@@ -684,6 +707,7 @@ async fn run_call(
         audio_out,
         hangup: sip_hangup,
         uplink_quality,
+        downlink_quality,
         ..
     } = call.split();
 
@@ -842,6 +866,9 @@ async fn run_call(
     // Rolling window of cumulative (uplink_received, uplink_lost) snapshots, one
     // per quality tick, for the mid-call uplink-RTP-loss gate.
     let mut uplink_hist: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
+    // Consecutive downlink RR-loss breaches (see `downlink_breach`), reset by any
+    // clean/absent sample; abort once it reaches `DOWNLINK_BREACH_TICKS`.
+    let mut downlink_over_streak: u32 = 0;
     let end_state = loop {
         tokio::select! {
             ev = events_out_rx.recv(), if events_open => match ev {
@@ -883,7 +910,8 @@ async fn run_call(
             _ = &mut deadline => break CallState::Completed,
             _ = &mut cancel_rx => break CallState::Cancelled,
             _ = qtick.tick() => {
-                let q = merge_quality(quality.snapshot(), uplink_quality.snapshot());
+                let downlink = downlink_quality.snapshot();
+                let q = merge_quality(quality.snapshot(), uplink_quality.snapshot(), downlink);
                 store.set_quality(&call_id, q);
                 if should_abort(&server.quality, q.underruns) {
                     // NOTE: don't bump `quality_aborted` here — the abort is not
@@ -914,6 +942,22 @@ async fn run_call(
                                 ));
                                 break CallState::Failed;
                             }
+                // Mid-call downlink gate: abort when the callee's RTCP RR reports
+                // sustained loss of OUR audio reaching them. Best-effort — an
+                // absent RR never breaches (see `downlink_breach`) and resets the
+                // streak, so a carrier that sends no RR simply never triggers it.
+                if downlink_breach(downlink, server.net_check.downlink_loss_abort_pct) {
+                    downlink_over_streak += 1;
+                    if downlink_over_streak >= DOWNLINK_BREACH_TICKS {
+                        abort_reason = Some(format!(
+                            "aborted: downlink RTP loss {:.1}% reported by callee over ~{DOWNLINK_BREACH_TICKS}s",
+                            downlink.loss_pct
+                        ));
+                        break CallState::Failed;
+                    }
+                } else {
+                    downlink_over_streak = 0;
+                }
             }
         }
     };
@@ -948,7 +992,11 @@ async fn run_call(
     // Final quality snapshot + cumulative totals, added exactly once here
     // (not per tick, which only updates the live record + checks the abort
     // threshold).
-    let q = merge_quality(quality.snapshot(), uplink_quality.snapshot());
+    let q = merge_quality(
+        quality.snapshot(),
+        uplink_quality.snapshot(),
+        downlink_quality.snapshot(),
+    );
     store.set_quality(&call_id, q);
     counters.underruns.fetch_add(q.underruns, Ordering::Relaxed);
     counters
@@ -1282,6 +1330,39 @@ mod tests {
         assert!(!should_abort(&cfg, 39));
         assert!(should_abort(&cfg, 40));
         assert!(should_abort(&cfg, 41));
+    }
+
+    #[test]
+    fn downlink_breach_requires_present_report_over_threshold() {
+        use crate::sip::DownlinkQuality;
+        let over = DownlinkQuality {
+            present: true,
+            loss_pct: 15.0,
+            ..Default::default()
+        };
+        let under = DownlinkQuality {
+            present: true,
+            loss_pct: 5.0,
+            ..Default::default()
+        };
+        // An absent report is never a breach, even with a high loss value.
+        let absent = DownlinkQuality {
+            present: false,
+            loss_pct: 99.0,
+            ..Default::default()
+        };
+        assert!(downlink_breach(over, 10.0));
+        assert!(!downlink_breach(under, 10.0));
+        assert!(!downlink_breach(absent, 10.0));
+        // Exactly at the threshold does not breach (strictly greater).
+        assert!(!downlink_breach(
+            DownlinkQuality {
+                present: true,
+                loss_pct: 10.0,
+                ..Default::default()
+            },
+            10.0
+        ));
     }
 
     #[test]

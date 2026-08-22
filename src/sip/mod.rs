@@ -10,10 +10,12 @@
 //! before building anything on top of this.
 
 mod call;
+mod downlink;
 mod outcome;
 mod register;
 mod uplink;
 
+pub use downlink::{DownlinkQuality, DownlinkQualityShared};
 pub use outcome::{CallOutcome, outcome_from_status};
 pub use uplink::{UplinkQuality, UplinkQualityShared, UplinkStats};
 
@@ -133,6 +135,7 @@ pub struct SipCall {
     rtp_out: mpsc::Sender<Bytes>,
     hangup: Option<oneshot::Sender<()>>,
     uplink_quality: std::sync::Arc<UplinkQualityShared>,
+    downlink_quality: std::sync::Arc<DownlinkQualityShared>,
 }
 
 impl SipCall {
@@ -176,6 +179,7 @@ impl SipCall {
             audio_out: self.rtp_out,
             hangup,
             uplink_quality: self.uplink_quality,
+            downlink_quality: self.downlink_quality,
         }
     }
 
@@ -187,6 +191,7 @@ impl SipCall {
         rtp_out: mpsc::Sender<Bytes>,
         hangup: oneshot::Sender<()>,
         uplink_quality: std::sync::Arc<UplinkQualityShared>,
+        downlink_quality: std::sync::Arc<DownlinkQualityShared>,
     ) -> Self {
         Self {
             call_id,
@@ -195,6 +200,7 @@ impl SipCall {
             rtp_out,
             hangup: Some(hangup),
             uplink_quality,
+            downlink_quality,
         }
     }
 }
@@ -207,6 +213,7 @@ pub struct SipCallParts {
     pub audio_out: mpsc::Sender<Bytes>,
     pub hangup: oneshot::Sender<()>,
     pub uplink_quality: std::sync::Arc<UplinkQualityShared>,
+    pub downlink_quality: std::sync::Arc<DownlinkQualityShared>,
 }
 
 /// Command sent from `SipTransport` to the SIP runtime thread.
@@ -427,6 +434,7 @@ mod tests {
             out_tx,
             hup_tx,
             UplinkQualityShared::new(),
+            DownlinkQualityShared::new(),
         );
 
         let mut parts = call.split();

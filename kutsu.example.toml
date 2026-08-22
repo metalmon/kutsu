@@ -56,7 +56,8 @@ samples = 10          # ping samples for the pre-dial Gemini-leg probe
 max_rtt_ms = 300      # fail preflight above this median RTT
 max_jitter_ms = 50    # fail preflight above this p95-p50 jitter
 max_loss_pct = 2.0    # fail preflight above this ping-loss %
-uplink_loss_abort_pct = 10.0  # abort a live call above this rolling uplink loss %
+uplink_loss_abort_pct = 10.0    # abort a live call above this rolling uplink loss %
+downlink_loss_abort_pct = 10.0  # abort above this loss % the callee reports via RTCP (best-effort)
 
 # ----------------------------------------------------------------------------
 # [server.quality] - downlink playout pacing (latency vs glitch tradeoff).

@@ -41,6 +41,13 @@ pub struct CallQuality {
     /// aborted at teardown, so the last few teardown-window frames may be
     /// excluded (negligible against a whole-call average).
     pub uplink_rms: u64,
+    /// Downlink (us -> phone) loss %, as the callee reports via RTCP receiver
+    /// reports. `0` when the carrier never sent an RR (no signal, not "perfect").
+    pub downlink_loss_pct: f32,
+    /// Downlink interarrival jitter (ms) from the callee's RTCP RR.
+    pub downlink_jitter_ms: u32,
+    /// Estimated round-trip time (ms) from the callee's RTCP RR; `0` if unknown.
+    pub downlink_rtt_ms: u32,
 }
 
 /// One call's record.
@@ -325,6 +332,7 @@ mod tests {
                 uplink_lost: 7,
                 uplink_reordered: 1,
                 uplink_rms: 2048,
+                ..Default::default()
             },
         );
         let got = store.get("c1").unwrap();

@@ -111,6 +111,10 @@ pub struct NetCheckConfig {
     /// ~8 s that marks the callee/cellular leg as unusable. Distinct from
     /// `max_loss_pct` (which gates the pre-dial Gemini-leg ping loss).
     pub uplink_loss_abort_pct: f32,
+    /// Mid-call abort threshold: downlink RTP loss (%) the callee reports back via
+    /// RTCP receiver reports (our audio -> callee). Best-effort: only active when
+    /// the carrier actually sends RR; otherwise no downlink signal and no abort.
+    pub downlink_loss_abort_pct: f32,
 }
 
 impl Default for NetCheckConfig {
@@ -123,6 +127,7 @@ impl Default for NetCheckConfig {
             max_jitter_ms: 50,
             max_loss_pct: 2.0,
             uplink_loss_abort_pct: 10.0,
+            downlink_loss_abort_pct: 10.0,
         }
     }
 }
@@ -552,6 +557,17 @@ mod tests {
         assert_eq!(nc.max_rtt_ms, 300);
         assert_eq!(nc.samples, 10);
         assert!(nc.enabled);
+        assert_eq!(nc.uplink_loss_abort_pct, 10.0);
+        assert_eq!(nc.downlink_loss_abort_pct, 10.0);
+    }
+
+    #[test]
+    fn net_check_downlink_threshold_parses_from_toml() {
+        let cfg =
+            Config::from_toml_str("[server.net_check]\ndownlink_loss_abort_pct = 25.0\n").unwrap();
+        assert_eq!(cfg.server.net_check.downlink_loss_abort_pct, 25.0);
+        // other net_check fields keep their defaults
+        assert_eq!(cfg.server.net_check.uplink_loss_abort_pct, 10.0);
     }
 
     #[test]

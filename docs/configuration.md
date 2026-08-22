@@ -141,6 +141,7 @@ RTP-loss abort (callee leg).
 | `max_jitter_ms` | `50` | Fail preflight above this p95−p50 jitter. |
 | `max_loss_pct` | `2.0` | Fail preflight above this ping-loss %. |
 | `uplink_loss_abort_pct` | `10.0` | Abort a live call above this rolling (~8 s window) uplink RTP loss %. |
+| `downlink_loss_abort_pct` | `10.0` | Abort above this loss % the callee reports via RTCP receiver reports (our audio → callee). Best-effort: only active when the carrier sends RR. |
 
 ### `[server.quality]`
 
@@ -233,6 +234,7 @@ variables that are set take effect, so the file/default shows through otherwise.
 | `KUTSU_NETCHECK_MAX_JITTER_MS` | `server.net_check.max_jitter_ms` |
 | `KUTSU_NETCHECK_MAX_LOSS_PCT` | `server.net_check.max_loss_pct` |
 | `KUTSU_UPLINK_LOSS_ABORT_PCT` | `server.net_check.uplink_loss_abort_pct` |
+| `KUTSU_DOWNLINK_LOSS_ABORT_PCT` | `server.net_check.downlink_loss_abort_pct` |
 | `KUTSU_QUALITY_PREBUFFER_MS` | `server.quality.prebuffer_ms` |
 | `KUTSU_QUALITY_RESUME_MS` | `server.quality.resume_ms` |
 | `KUTSU_QUALITY_ABORT_UNDERRUNS` | `server.quality.abort_underruns` |

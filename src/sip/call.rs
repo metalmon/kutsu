@@ -20,8 +20,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::SipConfig;
 use crate::sip::{
-    CallOutcome, G711Kind, NegotiatedCodec, SipCall, SipError, SipEvent, TermReason,
-    UplinkQualityShared, UplinkStats, g711_kind_from_pt, plain_rtp_g711_config,
+    CallOutcome, DownlinkQuality, DownlinkQualityShared, G711Kind, NegotiatedCodec, SipCall,
+    SipError, SipEvent, TermReason, UplinkQualityShared, UplinkStats, g711_kind_from_pt,
+    plain_rtp_g711_config,
 };
 
 /// Build the shared endpoint with one UDP transport. `add_allow` is MANDATORY —
@@ -152,6 +153,7 @@ pub(crate) async fn run_call(
     let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(64);
     let (hup_tx, mut hup_rx) = oneshot::channel::<()>();
     let uplink_quality = UplinkQualityShared::new();
+    let downlink_quality = DownlinkQualityShared::new();
     let handle = SipCall::from_parts(
         call_id,
         ev_rx,
@@ -159,6 +161,7 @@ pub(crate) async fn run_call(
         out_tx,
         hup_tx,
         uplink_quality.clone(),
+        downlink_quality.clone(),
     );
     if reply.send(Ok(handle)).is_err() {
         let _ = outbound.cancel().await;
@@ -304,10 +307,34 @@ pub(crate) async fn run_call(
         }
     });
 
+    // Sample the callee's RTCP receiver reports ~1/s and publish downlink
+    // quality (our audio -> callee). Best-effort: `remote` is None until the
+    // carrier sends an RR, and stays None if it never does. The tick body runs
+    // only when `call.run()`'s future has been dropped by the select, so the
+    // `&mut call` borrow here does not conflict.
+    let mut rr_interval = tokio::time::interval(Duration::from_secs(1));
+
     // Main loop: pump SIP/media and honour hangup. Inbound RTP is drained by
     // `in_task` above; outbound by `out_task`.
     let reason = loop {
         tokio::select! {
+            _ = rr_interval.tick() => {
+                let mut dq = DownlinkQuality::default();
+                'rr: for (_id, sess) in call.media().sdp_session().rtp_sessions() {
+                    for stream in sess.tx_streams() {
+                        if let Some(r) = stream.stats().remote {
+                            dq = DownlinkQuality {
+                                present: true,
+                                loss_pct: r.loss * 100.0,
+                                jitter_ms: r.jitter.as_millis() as u32,
+                                rtt_ms: r.rtt.map(|d| d.as_millis() as u32).unwrap_or(0),
+                            };
+                            break 'rr;
+                        }
+                    }
+                }
+                downlink_quality.publish(&dq);
+            }
             r = call.run() => match r {
                 Ok(CallEvent::Internal(e)) => {
                     if call.handle_internal_event(e).await.is_err() {
