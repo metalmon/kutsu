@@ -2,6 +2,7 @@
 name = "kutsu"
 version = "0.1.0"
 edition = "2024"
+default-run = "kutsu"
 description = "Outbound SIP calling MCP server, bridging real phone calls to Gemini Live"
 license = "MIT"
 repository = "https://github.com/metalmon/kutsu"

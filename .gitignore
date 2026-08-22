@@ -21,3 +21,6 @@ CLAUDE.md
 
 # Internal working notes (kept locally, not part of the OSS docs)
 /docs/backlog.md
+
+# AMD corpus — private call recordings (voices, real numbers); never commit
+/amd-corpus/
