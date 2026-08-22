@@ -7,7 +7,7 @@
 //! contrast to be judged against, so it unconditionally seeds `noise_floor`.
 //! For the rest of the `warmup_frames` window, a frame that jumps above the
 //! floor already established by that seed is treated as speech immediately —
-//! so a "Алло" arriving right after pickup isn't silently averaged into the
+//! so a "Allo" arriving right after pickup isn't silently averaged into the
 //! background — while frames that stay near the seed keep training it.
 //!
 //! Residual ambiguity (not fixable, documented deliberately): speech that is
@@ -54,7 +54,7 @@ impl Vad {
     /// Whether the most recently observed frame is above the speech threshold
     /// (same rule as [`Vad::classify`], but a stateless read of the last frame).
     /// Used to profile utterance duration for answering-machine detection — a
-    /// short first utterance ("алло") vs a long continuous greeting (voicemail).
+    /// short first utterance ("allo") vs a long continuous greeting (voicemail).
     pub fn is_speech_frame(&self) -> bool {
         let threshold = (self.cfg.min_rms as f32).max(self.noise_floor * self.cfg.ratio);
         self.last_rms >= threshold
@@ -182,7 +182,7 @@ mod tests {
         for _ in 0..4 {
             assert!(!v.observe(&frame(80, 320)));
         }
-        // The callee's "Алло" is a clear jump above that established floor —
+        // The callee's "Allo" is a clear jump above that established floor —
         // still inside the warmup window (frames_seen well under
         // warmup_frames=10), but the jump-bail catches it immediately
         // instead of averaging it into the background.
@@ -199,7 +199,7 @@ mod tests {
         for _ in 0..10 {
             assert!(!v.observe(&frame(80, 320)));
         }
-        // Quiet "Алло"-level speech (well below the old ratio*min_rms=600
+        // Quiet "Allo"-level speech (well below the old ratio*min_rms=600
         // trap, but real speech): must still be detected.
         let mut fired = false;
         for _ in 0..5 {

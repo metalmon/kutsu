@@ -342,7 +342,7 @@ pub struct VadConfig {
     /// Absolute RMS floor: a frame below this is never speech, regardless of
     /// how low the adaptive noise floor has decayed. Telephone-calibrated
     /// against measured uplink levels (line background roughly 50-500 RMS,
-    /// voiced "Алло" roughly 200-500 RMS), so genuine quiet callee speech
+    /// voiced "Allo" roughly 200-500 RMS), so genuine quiet callee speech
     /// still clears it once the floor has been calibrated (see
     /// `warmup_frames`).
     pub min_rms: u32,
@@ -378,7 +378,7 @@ impl Default for VadConfig {
 /// Default wait before the agent greets a silent callee (see
 /// [`ServerConfig::greet_after_silence_ms`]). With warm-start the Gemini
 /// session is already connected at answer, so this is a natural conversational
-/// beat, not dead air: ~1 s lets the callee get their "Алло?" in first (and,
+/// beat, not dead air: ~1 s lets the callee get their "Allo?" in first (and,
 /// if Gemini transcribes it in time, the agent responds reactively); if the
 /// callee stays silent, the agent greets. Override per deployment with
 /// `KUTSU_GREET_AFTER_SILENCE_MS` (0 disables the proactive greeting entirely).

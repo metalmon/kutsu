@@ -228,7 +228,7 @@ async fn run_driver(
 
     // AMD (answering-machine detection) signal gathering — logged once per call.
     // Profiles the callee's FIRST utterance after answer: its onset (ms after
-    // answer) and its duration. A human says a short "алло" (~0.3-0.8 s) then
+    // answer) and its duration. A human says a short "allo" (~0.3-0.8 s) then
     // waits; a voicemail/auto-answer plays a long continuous greeting (2-5 s+).
     // See docs/backlog.md (AMD). `answered_at` anchors onset timing.
     let mut answered_at: Option<tokio::time::Instant> = if greet_armed {
