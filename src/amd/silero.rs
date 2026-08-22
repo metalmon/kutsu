@@ -8,34 +8,39 @@ use ort::value::Tensor;
 /// Embedded Silero VAD v5 model (see assets/silero_vad.onnx).
 const MODEL: &[u8] = include_bytes!("../../assets/silero_vad.onnx");
 
-/// Silero v5 requires a fixed 512-sample window at 16 kHz.
-pub const WINDOW: usize = 512;
-/// Sample rate the model is driven at.
-const SR: i64 = 16_000;
 /// Recurrent state shape is `[2, 1, 128]` = 256 floats.
 const STATE_LEN: usize = 2 * 128;
+
+/// Silero v5's required window size for a sample rate: 256 samples at 8 kHz,
+/// 512 at 16 kHz. Telephony is natively 8 kHz — use the 8 kHz path for it, not
+/// 8 kHz audio upsampled to 16 kHz (which Silero scores poorly).
+pub const fn window_for(sample_rate: u32) -> usize {
+    if sample_rate <= 8_000 { 256 } else { 512 }
+}
 
 pub struct SileroModel {
     session: Session,
     state: Vec<f32>,
+    sr: i64,
 }
 
 impl SileroModel {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(sample_rate: u32) -> anyhow::Result<Self> {
         let session = Session::builder()?.commit_from_memory(MODEL)?;
         Ok(Self {
             session,
             state: vec![0.0f32; STATE_LEN],
+            sr: sample_rate as i64,
         })
     }
 
-    /// Run one `WINDOW`-sample window (i16 @ 16 kHz) and return the speech
+    /// Run one window (i16 at the configured sample rate) and return the speech
     /// probability in `0..=1`. Threads the recurrent state across calls.
     pub fn infer(&mut self, window: &[i16]) -> anyhow::Result<f32> {
         let audio: Vec<f32> = window.iter().map(|&s| s as f32 / 32768.0).collect();
         let audio_t = Tensor::from_array((vec![1_i64, audio.len() as i64], audio))?;
         let state_t = Tensor::from_array((vec![2_i64, 1, 128], self.state.clone()))?;
-        let sr_t = Tensor::from_array((Vec::<i64>::new(), vec![SR]))?;
+        let sr_t = Tensor::from_array((Vec::<i64>::new(), vec![self.sr]))?;
 
         let outputs = self.session.run(ort::inputs![
             "input" => audio_t,
@@ -57,11 +62,12 @@ mod tests {
 
     #[test]
     fn silero_loads_and_scores_in_range() {
-        let mut s = SileroModel::new().expect("load model");
-        let silence = vec![0i16; WINDOW];
+        let win = window_for(16_000);
+        let mut s = SileroModel::new(16_000).expect("load model");
+        let silence = vec![0i16; win];
         // A tone stands in for energy; Silero may or may not call it speech, but
         // the score must be a valid probability and not below the silence score.
-        let tone: Vec<i16> = (0..WINDOW)
+        let tone: Vec<i16> = (0..win)
             .map(|i| ((i as f32 * 0.3).sin() * 8000.0) as i16)
             .collect();
         let p_sil = s.infer(&silence).expect("infer silence");

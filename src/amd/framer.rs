@@ -40,6 +40,7 @@ impl SpeechFramer for EnergyFramer {
 #[cfg(feature = "amd-silero")]
 pub struct SileroFramer {
     model: crate::amd::silero::SileroModel,
+    window: usize,
     buf: Vec<i16>,
     last_prob: f32,
     threshold: f32,
@@ -47,10 +48,14 @@ pub struct SileroFramer {
 
 #[cfg(feature = "amd-silero")]
 impl SileroFramer {
-    pub fn new() -> anyhow::Result<Self> {
+    /// `sample_rate` must match the audio fed in (telephony is 8 kHz — use the
+    /// native 8 kHz dump, not one upsampled to 16 kHz).
+    pub fn new(sample_rate: u32) -> anyhow::Result<Self> {
+        let window = crate::amd::silero::window_for(sample_rate);
         Ok(Self {
-            model: crate::amd::silero::SileroModel::new()?,
-            buf: Vec::with_capacity(crate::amd::silero::WINDOW),
+            model: crate::amd::silero::SileroModel::new(sample_rate)?,
+            window,
+            buf: Vec::with_capacity(window),
             last_prob: 0.0,
             threshold: 0.5,
         })
@@ -61,8 +66,8 @@ impl SileroFramer {
 impl SpeechFramer for SileroFramer {
     fn classify(&mut self, frame: &[i16]) -> FrameClass {
         self.buf.extend_from_slice(frame);
-        while self.buf.len() >= crate::amd::silero::WINDOW {
-            let window: Vec<i16> = self.buf.drain(..crate::amd::silero::WINDOW).collect();
+        while self.buf.len() >= self.window {
+            let window: Vec<i16> = self.buf.drain(..self.window).collect();
             // Fail open: a model error holds the previous probability rather than
             // aborting the analysis of a whole recording/call.
             if let Ok(p) = self.model.infer(&window) {
