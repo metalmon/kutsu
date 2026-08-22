@@ -77,6 +77,12 @@ audio_thread_priority = "0.37.0"
 # recipe yields a self-contained binary needing no OpenSSL on the deploy host.
 vendor-openssl = ["ezk-rtc/vendor-openssl"]
 live-tests = []
+# Offline AMD evaluation harness (dev only; the `amd-eval` binary). Never
+# enabled for the release build.
+amd-eval = []
+# Silero neural VAD backend (ONNX via `ort`). Off by default; the `ort` dep is
+# wired in Task 7. Enabled in a prod build only if it wins the harness.
+amd-silero = []
 
 [patch.crates-io]
 # Local fork of ezk-sip-core 0.9.1: `create_via` now emits a bare `rport` param
