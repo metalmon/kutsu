@@ -12,7 +12,7 @@ use crate::config::{QualityConfig, ScenarioConfig, ServerConfig, SipConfig};
 use crate::gemini_live::{self, EndedBy, Event, TranscriptEntry};
 use crate::queue::{MemQueue, PendingEntry, QueueStore};
 use crate::sip::{CallOutcome, SipCallParts, SipEvent, SipTransport};
-use crate::state::{CallQuality, CallRecord, CallState, CallStore};
+use crate::state::{CallQuality, CallRecord, CallShape, CallState, CallStore, Disposition};
 
 /// Quality-abort gate: should a call in progress be aborted for degraded
 /// audio? `abort_underruns == 0` disables the gate (never abort). Pure
@@ -81,42 +81,6 @@ fn should_retry_busy(attempt: u32, cfg: &crate::config::RetryConfig) -> bool {
     attempt < cfg.busy_max_attempts
 }
 
-/// Reconcile the select loop's `end_state` with the authoritative outcome
-/// from the Gemini session: a model-initiated end is a success even if its
-/// `EndCall` event lost the select race against e.g. `GeminiClosed` (which
-/// would otherwise read `Failed`).
-fn reconcile_final_state(end_state: CallState, ended_by: EndedBy) -> CallState {
-    match ended_by {
-        EndedBy::ModelEndCall => CallState::Completed,
-        _ => end_state,
-    }
-}
-
-/// Only attach the abort error if the reconciled outcome is still `Failed` —
-/// a late `ModelEndCall` can override `end_state` to `Completed` even after
-/// the quality-abort arm fired; don't leave a stale error on a completed call.
-fn finalize_error(final_state: CallState, abort_reason: Option<String>) -> Option<String> {
-    if final_state == CallState::Failed {
-        abort_reason
-    } else {
-        None
-    }
-}
-
-/// Map the reconciled `final_state` of an in-call terminal finalize to a
-/// `CallOutcome`. `HungUp` is a successful connection (the caller or model
-/// ended a connected call) — same success bucket as `Completed` per
-/// `bump_counter`. `Cancelled` never got a dial outcome (call was cancelled
-/// before/without a SIP result reaching this point in-call), so `None`.
-fn finalize_outcome(final_state: CallState) -> Option<CallOutcome> {
-    match final_state {
-        CallState::Completed | CallState::HungUp => Some(CallOutcome::Completed),
-        CallState::Failed => Some(CallOutcome::Failed),
-        CallState::Cancelled => None,
-        CallState::Queued | CallState::Ringing | CallState::InProgress => None,
-    }
-}
-
 /// Errors from placing a call.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -142,13 +106,19 @@ struct Counters {
     failed: AtomicU64,
     cancelled: AtomicU64,
     /// Per-outcome cumulative totals for the dial-failure outcomes.
-    /// `bump_counter_outcome` maps `CallOutcome::Completed`/`Failed` onto
+    /// `bump_disposition` maps `Disposition::Completed`/`Failed` onto
     /// `completed`/`failed` above and the rest onto these.
     busy: AtomicU64,
     no_answer: AtomicU64,
     rejected: AtomicU64,
     not_found: AtomicU64,
     unavailable: AtomicU64,
+    /// Per-disposition cumulative totals for the answered-but-not-completed
+    /// AMD/shape verdicts (`bump_disposition`).
+    voicemail: AtomicU64,
+    announcement: AtomicU64,
+    ivr: AtomicU64,
+    hold: AtomicU64,
     /// Cumulative audio-quality totals, added once per call at finalize (not
     /// per tick) so a call's underruns/starved-ms are counted exactly once.
     underruns: AtomicU64,
@@ -181,6 +151,10 @@ pub struct MetricsSnapshot {
     pub rejected_total: u64,
     pub not_found_total: u64,
     pub unavailable_total: u64,
+    pub voicemail_total: u64,
+    pub announcement_total: u64,
+    pub ivr_total: u64,
+    pub hold_total: u64,
 }
 
 /// Everything needed to enqueue a new call (`place_call_at`'s body), bundled
@@ -224,6 +198,7 @@ impl Enqueuer {
             ended_ms: None,
             quality: CallQuality::default(),
             outcome: None,
+            disposition: None,
             attempt,
             retry_of: retry_of.clone(),
         });
@@ -333,6 +308,10 @@ impl Engine {
             rejected_total: self.counters.rejected.load(Ordering::Relaxed),
             not_found_total: self.counters.not_found.load(Ordering::Relaxed),
             unavailable_total: self.counters.unavailable.load(Ordering::Relaxed),
+            voicemail_total: self.counters.voicemail.load(Ordering::Relaxed),
+            announcement_total: self.counters.announcement.load(Ordering::Relaxed),
+            ivr_total: self.counters.ivr.load(Ordering::Relaxed),
+            hold_total: self.counters.hold.load(Ordering::Relaxed),
         }
     }
 
@@ -345,7 +324,8 @@ impl Engine {
 
     /// Place an outbound call now: enqueues it as `Queued` (attempt 1, no
     /// `retry_of`) and wakes the dispatcher. Always succeeds; SIP/other
-    /// failures surface later via `CallState::Failed`.
+    /// failures surface later as `CallState::Ended` with a `Disposition`
+    /// reflecting the failure (e.g. `Failed`, `Busy`, `NoAnswer`).
     pub async fn place_call(&self, number: String, scenario: ScenarioConfig) -> String {
         self.place_call_at(number, scenario, now_ms(), 1, None)
             .await
@@ -391,9 +371,23 @@ impl Engine {
         let mut q = self.queue.lock().unwrap();
         if q.remove(call_id).is_some() {
             drop(q);
-            self.store
-                .finalize(call_id, CallState::Cancelled, None, None, None, now_ms());
-            bump_counter(&self.counters, CallState::Cancelled);
+            finalize_call(
+                &self.store,
+                &self.counters,
+                call_id,
+                true,
+                None,
+                None,
+                CallShape {
+                    answered: false,
+                    duration_ms: 0,
+                    transcript_len: 0,
+                    ended_by: EndedBy::CallerHangup,
+                },
+                None,
+                None,
+                now_ms(),
+            );
             return true;
         }
         let tx = self.cancels.lock().unwrap().remove(call_id);
@@ -540,36 +534,64 @@ impl Drop for RunningGuard {
     }
 }
 
-/// Bump the cumulative counter matching a terminal `CallState`. `Ringing`,
-/// `InProgress`, and `Queued` never reach `finalize` and are unreachable here.
-fn bump_counter(counters: &Counters, state: CallState) {
-    match state {
-        CallState::Completed | CallState::HungUp => {
-            counters.completed.fetch_add(1, Ordering::Relaxed);
-        }
-        CallState::Failed => {
-            counters.failed.fetch_add(1, Ordering::Relaxed);
-        }
-        CallState::Cancelled => {
-            counters.cancelled.fetch_add(1, Ordering::Relaxed);
-        }
-        CallState::Queued | CallState::Ringing | CallState::InProgress => {}
+/// Bump the cumulative counter matching a resolved `Disposition`. The single
+/// per-call counter increment point — every finalize site goes through
+/// `finalize_call`, which calls this exactly once.
+fn bump_disposition(c: &Counters, d: Disposition) {
+    use Disposition::*;
+    use std::sync::atomic::Ordering::Relaxed;
+    match d {
+        Completed => &c.completed,
+        Voicemail => &c.voicemail,
+        Announcement => &c.announcement,
+        Ivr => &c.ivr,
+        Hold => &c.hold,
+        Busy => &c.busy,
+        NoAnswer => &c.no_answer,
+        Rejected => &c.rejected,
+        NotFound => &c.not_found,
+        Unavailable => &c.unavailable,
+        Failed => &c.failed,
+        Cancelled => &c.cancelled,
     }
+    .fetch_add(1, Relaxed);
 }
 
-/// Bump the cumulative counter matching a `CallOutcome`, for finalize sites
-/// that carry one (i.e. everywhere `bump_counter` would otherwise be told
-/// `CallState::Failed`, which loses the dial-outcome detail).
-fn bump_counter_outcome(counters: &Counters, outcome: CallOutcome) {
-    match outcome {
-        CallOutcome::Completed => counters.completed.fetch_add(1, Ordering::Relaxed),
-        CallOutcome::Busy => counters.busy.fetch_add(1, Ordering::Relaxed),
-        CallOutcome::NoAnswer => counters.no_answer.fetch_add(1, Ordering::Relaxed),
-        CallOutcome::Rejected => counters.rejected.fetch_add(1, Ordering::Relaxed),
-        CallOutcome::NotFound => counters.not_found.fetch_add(1, Ordering::Relaxed),
-        CallOutcome::Unavailable => counters.unavailable.fetch_add(1, Ordering::Relaxed),
-        CallOutcome::Failed => counters.failed.fetch_add(1, Ordering::Relaxed),
-    };
+/// Centralized terminal-finalize: resolves the authoritative [`Disposition`]
+/// (via [`crate::state::resolve_disposition`]), records it on the call's
+/// [`CallStore`] record, and bumps the matching cumulative counter — the one
+/// path every `run_call`/`end_call` finalize site goes through, so a call is
+/// never finalized without also being counted (and vice versa).
+#[allow(clippy::too_many_arguments)]
+fn finalize_call(
+    store: &CallStore,
+    counters: &Counters,
+    call_id: &str,
+    cancelled: bool,
+    amd: Option<&str>,
+    sip: Option<CallOutcome>,
+    shape: CallShape,
+    goal: Option<serde_json::Value>,
+    error: Option<String>,
+    ended_ms: u64,
+) -> Disposition {
+    let d = crate::state::resolve_disposition(cancelled, amd, sip, shape);
+    store.finalize(call_id, d, goal, error, ended_ms);
+    bump_disposition(counters, d);
+    d
+}
+
+/// The `CallShape` for every pre-answer finalize site (network preflight,
+/// INVITE, ring-wait termination/close): the call never answered, so
+/// duration/transcript are meaningless zeros and `ended_by` is irrelevant to
+/// `resolve_disposition`'s unanswered branch.
+fn unanswered_shape() -> CallShape {
+    CallShape {
+        answered: false,
+        duration_ms: 0,
+        transcript_len: 0,
+        ended_by: EndedBy::Error,
+    }
 }
 
 /// Outcome of the ring-wait: what the SIP side did while we waited (feeding a
@@ -583,6 +605,19 @@ enum RingOutcome {
     Terminated(crate::sip::TermReason),
     /// SIP event channel closed before any answer.
     Closed,
+}
+
+/// What the main orchestration `select!` loop in `run_call` broke on. Purely
+/// internal bookkeeping — distinct from [`crate::state::Disposition`], which
+/// is resolved once at teardown from this plus the AMD verdict / call shape /
+/// gemini `EndedBy`. Only `Cancelled` feeds into that resolution directly
+/// (as the `cancelled` flag); the other three collapse into `ended_by`+shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopEnd {
+    Completed,
+    HungUp,
+    Failed,
+    Cancelled,
 }
 
 /// Ring-wait loop: await the SIP answer while pushing 20 ms of 16 kHz silence
@@ -657,28 +692,34 @@ async fn run_call(
                 let v = crate::net_check::verdict(&health, &server.net_check);
                 tracing::info!(%call_id, health = %health.summary(), verdict = ?v, "network preflight");
                 if v == crate::net_check::Verdict::Unusable {
-                    store.finalize(
+                    finalize_call(
+                        &store,
+                        &counters,
                         &call_id,
-                        CallState::Failed,
+                        false,
+                        None,
+                        None,
+                        unanswered_shape(),
                         None,
                         Some(format!("network preflight unusable: {}", health.summary())),
-                        Some(CallOutcome::Failed),
                         now_ms(),
                     );
-                    bump_counter_outcome(&counters, CallOutcome::Failed);
                     return;
                 }
             }
             Err(e) => {
-                store.finalize(
+                finalize_call(
+                    &store,
+                    &counters,
                     &call_id,
-                    CallState::Failed,
+                    false,
+                    None,
+                    None,
+                    unanswered_shape(),
                     None,
                     Some(format!("network preflight failed: {e}")),
-                    Some(CallOutcome::Failed),
                     now_ms(),
                 );
-                bump_counter_outcome(&counters, CallOutcome::Failed);
                 return;
             }
         }
@@ -688,15 +729,18 @@ async fn run_call(
     let call = match sip.place_call(&number).await {
         Ok(c) => c,
         Err(e) => {
-            store.finalize(
+            finalize_call(
+                &store,
+                &counters,
                 &call_id,
-                CallState::Failed,
+                false,
+                None,
+                None,
+                unanswered_shape(),
                 None,
                 Some(e.to_string()),
-                Some(CallOutcome::Failed),
                 now_ms(),
             );
-            bump_counter_outcome(&counters, CallOutcome::Failed);
             return;
         }
     };
@@ -735,15 +779,18 @@ async fn run_call(
                 // Remote/local hangup before answer is effectively no-answer.
                 _ => (CallOutcome::NoAnswer, format!("{reason:?}")),
             };
-            store.finalize(
+            finalize_call(
+                &store,
+                &counters,
                 &call_id,
-                CallState::Failed,
+                false,
+                None,
+                Some(outcome),
+                unanswered_shape(),
                 None,
                 Some(detail),
-                Some(outcome),
                 now_ms(),
             );
-            bump_counter_outcome(&counters, outcome);
             // Busy is the only auto-retried outcome (NoAnswer and all others
             // finalize terminally here). The finalized record above is linked
             // forward by the follow-up's `retry_of`; the follow-up gets a fresh
@@ -767,15 +814,18 @@ async fn run_call(
                 s.hangup().await;
             }
             drop(warm);
-            store.finalize(
+            finalize_call(
+                &store,
+                &counters,
                 &call_id,
-                CallState::Failed,
+                false,
+                None,
+                None,
+                unanswered_shape(),
                 None,
                 Some("sip closed before answer".into()),
-                Some(CallOutcome::Failed),
                 now_ms(),
             );
-            bump_counter_outcome(&counters, CallOutcome::Failed);
             return;
         }
     };
@@ -794,15 +844,27 @@ async fn run_call(
         Ok(s) => s,
         Err(e) => {
             let _ = sip_hangup.send(());
-            store.finalize(
+            // The SIP leg WAS answered (200 OK, `answered_tx` already fired
+            // above) — only the Gemini leg failed to come up. No transcript,
+            // no AMD/SIP verdict available: `resolve_disposition` falls
+            // through its answered-with-nothing-to-go-on arm to `Failed`.
+            finalize_call(
+                &store,
+                &counters,
                 &call_id,
-                CallState::Failed,
+                false,
+                None,
+                None,
+                CallShape {
+                    answered: true,
+                    duration_ms: now_ms().saturating_sub(answered_at),
+                    transcript_len: 0,
+                    ended_by: EndedBy::Error,
+                },
                 None,
                 Some(format!("gemini connect: {e}")),
-                Some(CallOutcome::Failed),
                 now_ms(),
             );
-            bump_counter_outcome(&counters, CallOutcome::Failed);
             return;
         }
     };
@@ -886,7 +948,7 @@ async fn run_call(
                         store.append_transcript(&call_id, TranscriptEntry { role, text, ts_ms: now_ms() });
                     }
                 }
-                Some(Event::EndCall { goal: g }) => { goal = Some(g); break CallState::Completed; }
+                Some(Event::EndCall { goal: g }) => { goal = Some(g); break LoopEnd::Completed; }
                 Some(Event::TurnComplete) => {}
                 Some(Event::Affect { role, label }) => {
                     store.append_affect(&call_id, crate::gemini_live::AffectEntry { role, label, ts_ms: now_ms() });
@@ -895,20 +957,20 @@ async fn run_call(
                 None => events_open = false, // bridge closed events_out; stop polling (the bridge_task arm ends the call)
             },
             r = sip_events.recv() => match r {
-                Some(SipEvent::Terminated(_)) | None => break CallState::HungUp,
+                Some(SipEvent::Terminated(_)) | None => break LoopEnd::HungUp,
                 Some(_) => {}
             },
             r = &mut bridge_done_rx => break match r {
-                Ok(crate::bridge::BridgeEnd::PhoneClosed) => CallState::HungUp,
-                Ok(crate::bridge::BridgeEnd::GeminiClosed) => CallState::Failed,
+                Ok(crate::bridge::BridgeEnd::PhoneClosed) => LoopEnd::HungUp,
+                Ok(crate::bridge::BridgeEnd::GeminiClosed) => LoopEnd::Failed,
                 // Engine-initiated cancel is sent only during teardown (after the
                 // loop), so this arm normally sees Phone/GeminiClosed; treat a
                 // stray Cancelled as a hang-up.
-                Ok(crate::bridge::BridgeEnd::Cancelled) => CallState::HungUp,
-                Err(_) => CallState::Failed, // bridge thread died before sending
+                Ok(crate::bridge::BridgeEnd::Cancelled) => LoopEnd::HungUp,
+                Err(_) => LoopEnd::Failed, // bridge thread died before sending
             },
-            _ = &mut deadline => break CallState::Completed,
-            _ = &mut cancel_rx => break CallState::Cancelled,
+            _ = &mut deadline => break LoopEnd::Completed,
+            _ = &mut cancel_rx => break LoopEnd::Cancelled,
             _ = qtick.tick() => {
                 let downlink = downlink_quality.snapshot();
                 let q = merge_quality(quality.snapshot(), uplink_quality.snapshot(), downlink);
@@ -916,14 +978,16 @@ async fn run_call(
                 if should_abort(&server.quality, q.underruns) {
                     // NOTE: don't bump `quality_aborted` here — the abort is not
                     // authoritative yet. A model `EndCall` racing this tick can
-                    // reconcile `final_state` back to Completed (see finalize),
-                    // in which case this was not a quality abort. Count it at
-                    // finalize, gated on the surviving abort error.
+                    // still resolve to `Disposition::Completed` at finalize (the
+                    // gemini outcome / transcript are read after teardown), in
+                    // which case this was not a quality abort. Count it at
+                    // finalize, gated on the surviving abort error and the
+                    // resolved disposition.
                     abort_reason = Some(format!(
                         "aborted: audio quality degraded ({} underruns, {} ms silence)",
                         q.underruns, q.starved_ms
                     ));
-                    break CallState::Failed;
+                    break LoopEnd::Failed;
                 }
                 // Mid-call RTP gate: abort on sustained uplink packet loss over a
                 // rolling ~8 s window (a failing callee/cellular leg — the
@@ -940,7 +1004,7 @@ async fn run_call(
                                 abort_reason = Some(format!(
                                     "aborted: uplink RTP loss {loss_pct:.1}% over ~{UPLINK_WINDOW_TICKS}s window"
                                 ));
-                                break CallState::Failed;
+                                break LoopEnd::Failed;
                             }
                 // Mid-call downlink gate: abort when the callee's RTCP RR reports
                 // sustained loss of OUR audio reaching them. Best-effort — an
@@ -953,7 +1017,7 @@ async fn run_call(
                             "aborted: downlink RTP loss {:.1}% reported by callee over ~{DOWNLINK_BREACH_TICKS}s",
                             downlink.loss_pct
                         ));
-                        break CallState::Failed;
+                        break LoopEnd::Failed;
                     }
                 } else {
                     downlink_over_streak = 0;
@@ -984,11 +1048,15 @@ async fn run_call(
     // the cancel covers the paths where it is still running.
     let _ = bridge_cancel_tx.send(());
     let _ = tokio::task::spawn_blocking(move || bridge_thread.join()).await;
-    let outcome = gemini_handle.join().await;
+    let session_outcome = gemini_handle.join().await;
 
-    // 9. Finalize. Reconcile the loop's end_state with the authoritative outcome
-    // (see `reconcile_final_state`).
-    let final_state = reconcile_final_state(end_state, outcome.ended_by);
+    // 9. Finalize. `end_state` (this loop's own break reason) only feeds the
+    // `cancelled` flag into `resolve_disposition` — everything else (amd,
+    // shape, ended_by) comes from the authoritative session outcome read just
+    // above, so a model `EndCall` that lost the select race still resolves
+    // correctly (e.g. to `Completed`) via the shape/ended_by/amd path, not by
+    // overriding `end_state`.
+    let cancelled = matches!(end_state, LoopEnd::Cancelled);
     // Final quality snapshot + cumulative totals, added exactly once here
     // (not per tick, which only updates the live record + checks the abort
     // threshold).
@@ -1023,20 +1091,39 @@ async fn run_call(
         "call audio quality"
     );
 
-    store.set_transcript(&call_id, outcome.transcript);
-    let final_goal = goal.or(outcome.goal);
-    let error = finalize_error(final_state, abort_reason);
-    // Count the quality abort exactly once here, only if it survived reconcile
-    // (a racing model EndCall can flip Failed -> Completed and clear the error).
-    // `error` is Some iff this was an abort that stuck as Failed.
-    if error.is_some() {
+    store.set_transcript(&call_id, session_outcome.transcript);
+    let final_goal = goal.or(session_outcome.goal);
+    let transcript_len = store.get(&call_id).map(|r| r.transcript.len()).unwrap_or(0);
+    let amd = final_goal
+        .as_ref()
+        .and_then(|g| g.get("amd"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let shape = CallShape {
+        answered: true, // this path is always post-answer (see step 5 above)
+        duration_ms: now_ms().saturating_sub(answered_at),
+        transcript_len,
+        ended_by: session_outcome.ended_by,
+    };
+    let had_abort = abort_reason.is_some();
+    let d = finalize_call(
+        &store,
+        &counters,
+        &call_id,
+        cancelled,
+        amd.as_deref(),
+        None,
+        shape,
+        final_goal,
+        abort_reason,
+        now_ms(),
+    );
+    // Count the quality abort exactly once here, only if the abort survived
+    // resolution as a genuine failure (a racing model EndCall can still
+    // resolve to Completed via the transcript/amd path even after an abort
+    // tick fired).
+    if had_abort && d == Disposition::Failed {
         counters.quality_aborted.fetch_add(1, Ordering::Relaxed);
-    }
-    let outcome = finalize_outcome(final_state);
-    store.finalize(&call_id, final_state, final_goal, error, outcome, now_ms());
-    match outcome {
-        Some(o) => bump_counter_outcome(&counters, o),
-        None => bump_counter(&counters, CallState::Cancelled),
     }
 
     // 10. Persist. Owner-only permissions: the transcript may contain PII.
@@ -1252,7 +1339,9 @@ mod tests {
         assert_eq!(engine.store().get(&id).unwrap().state, CallState::Queued);
         assert!(engine.end_call(&id));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(engine.store().get(&id).unwrap().state, CallState::Cancelled);
+        let rec = engine.store().get(&id).unwrap();
+        assert_eq!(rec.state, CallState::Ended);
+        assert_eq!(rec.disposition, Some(crate::state::Disposition::Cancelled));
         // Cancel map entry cleaned up: a second end_call finds nothing live.
         assert!(!engine.end_call(&id));
         engine.shutdown().await;
@@ -1366,50 +1455,66 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_final_state_table() {
-        // A model-initiated end always wins as Completed, regardless of what
-        // the select loop landed on (it may have raced GeminiClosed -> Failed).
-        for end_state in [
-            CallState::Failed,
-            CallState::HungUp,
-            CallState::Completed,
-            CallState::Cancelled,
-        ] {
-            assert_eq!(
-                reconcile_final_state(end_state, EndedBy::ModelEndCall),
-                CallState::Completed
-            );
-        }
-        // Any other ended_by leaves end_state untouched.
-        for ended_by in [EndedBy::CallerHangup, EndedBy::RemoteClose, EndedBy::Error] {
-            for end_state in [
-                CallState::Failed,
-                CallState::HungUp,
-                CallState::Completed,
-                CallState::Cancelled,
-            ] {
-                assert_eq!(reconcile_final_state(end_state, ended_by), end_state);
-            }
-        }
+    fn bump_disposition_counts_per_kind() {
+        let c = Counters::default();
+        bump_disposition(&c, crate::state::Disposition::Voicemail);
+        bump_disposition(&c, crate::state::Disposition::Announcement);
+        bump_disposition(&c, crate::state::Disposition::Completed);
+        assert_eq!(c.voicemail.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(c.announcement.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(c.completed.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]
-    fn finalize_error_only_attached_when_failed() {
-        assert_eq!(
-            finalize_error(CallState::Failed, Some("boom".into())),
-            Some("boom".into())
+    fn finalize_call_resolves_records_and_bumps() {
+        // finalize_call must resolve the disposition via resolve_disposition,
+        // persist it on the store record (state -> Ended), and bump the
+        // matching cumulative counter — in one call, at every call site.
+        let store = CallStore::new();
+        store.insert(CallRecord {
+            call_id: "c1".into(),
+            number: "600".into(),
+            state: CallState::Ringing,
+            transcript: vec![],
+            affect: vec![],
+            goal: None,
+            error: None,
+            started_ms: 0,
+            ended_ms: None,
+            quality: Default::default(),
+            outcome: None,
+            disposition: None,
+            attempt: 1,
+            retry_of: None,
+        });
+        let counters = Counters::default();
+        let d = finalize_call(
+            &store,
+            &counters,
+            "c1",
+            false,
+            Some("voicemail"),
+            None,
+            crate::state::CallShape {
+                answered: true,
+                duration_ms: 9000,
+                transcript_len: 3,
+                ended_by: EndedBy::RemoteClose,
+            },
+            None,
+            None,
+            1234,
         );
-        assert_eq!(finalize_error(CallState::Failed, None), None);
-        // A reconciled Completed (e.g. late ModelEndCall overriding an aborted
-        // end_state) must not carry a stale abort error.
+        assert_eq!(d, Disposition::Voicemail);
+        let rec = store.get("c1").unwrap();
+        assert_eq!(rec.state, CallState::Ended);
+        assert_eq!(rec.disposition, Some(Disposition::Voicemail));
+        assert_eq!(rec.ended_ms, Some(1234));
         assert_eq!(
-            finalize_error(CallState::Completed, Some("boom".into())),
-            None
-        );
-        assert_eq!(finalize_error(CallState::HungUp, Some("boom".into())), None);
-        assert_eq!(
-            finalize_error(CallState::Cancelled, Some("boom".into())),
-            None
+            counters
+                .voicemail
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
         );
     }
 
@@ -1496,25 +1601,5 @@ mod tests {
             ring_wait(&mut ev_rx, None).await,
             RingOutcome::Closed
         ));
-    }
-
-    #[test]
-    fn finalize_outcome_maps_hungup_to_completed() {
-        // HungUp is a successful connection (caller/model ended a connected
-        // call) — same success bucket as Completed per `bump_counter`, not a
-        // technical failure.
-        assert_eq!(
-            finalize_outcome(CallState::Completed),
-            Some(CallOutcome::Completed)
-        );
-        assert_eq!(
-            finalize_outcome(CallState::HungUp),
-            Some(CallOutcome::Completed)
-        );
-        assert_eq!(
-            finalize_outcome(CallState::Failed),
-            Some(CallOutcome::Failed)
-        );
-        assert_eq!(finalize_outcome(CallState::Cancelled), None);
     }
 }

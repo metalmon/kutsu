@@ -16,10 +16,7 @@ pub enum CallState {
     Queued,
     Ringing,
     InProgress,
-    Completed,
-    Failed,
-    HungUp,
-    Cancelled,
+    Ended,
 }
 
 /// ~15 s: an answered call that the remote drops this fast with no transcript is
@@ -142,6 +139,8 @@ pub struct CallRecord {
     pub quality: CallQuality,
     /// Structured dial result; None while in-flight.
     pub outcome: Option<crate::sip::CallOutcome>,
+    /// The authoritative terminal result; None while in-flight.
+    pub disposition: Option<Disposition>,
     /// 1 for the first dial; incremented per internal busy-retry.
     pub attempt: u32,
     /// The prior call_id this attempt continues (busy-retry or external retry_of).
@@ -199,17 +198,16 @@ impl CallStore {
     pub fn finalize(
         &self,
         call_id: &str,
-        state: CallState,
+        disposition: Disposition,
         goal: Option<Value>,
         error: Option<String>,
-        outcome: Option<crate::sip::CallOutcome>,
         ended_ms: u64,
     ) {
         if let Some(r) = self.inner.lock().unwrap().get_mut(call_id) {
-            r.state = state;
+            r.state = CallState::Ended;
+            r.disposition = Some(disposition);
             r.goal = goal;
             r.error = error;
-            r.outcome = outcome;
             r.ended_ms = Some(ended_ms);
         }
     }
@@ -264,6 +262,7 @@ mod tests {
             ended_ms: None,
             quality: CallQuality::default(),
             outcome: None,
+            disposition: None,
             attempt: 1,
             retry_of: None,
         }
@@ -338,38 +337,32 @@ mod tests {
         );
         store.finalize(
             "c1",
-            CallState::Completed,
+            Disposition::Completed,
             Some(serde_json::json!({"ok": true})),
             None,
-            Some(crate::sip::CallOutcome::Completed),
             2000,
         );
         let got = store.get("c1").unwrap();
-        assert_eq!(got.state, CallState::Completed);
+        assert_eq!(got.state, CallState::Ended);
         assert_eq!(got.ended_ms, Some(2000));
         assert!(got.goal.is_some());
         assert_eq!(got.transcript.len(), 1);
-        assert_eq!(got.outcome, Some(crate::sip::CallOutcome::Completed));
+        assert_eq!(got.disposition, Some(Disposition::Completed));
     }
 
     #[test]
-    fn finalize_sets_outcome_and_record_defaults_attempt_and_retry_of() {
+    fn finalize_sets_disposition_and_record_defaults_attempt_and_retry_of() {
         let store = CallStore::new();
         let r = rec("c1");
         assert_eq!(r.attempt, 1);
         assert_eq!(r.retry_of, None);
-        assert_eq!(r.outcome, None);
+        assert_eq!(r.disposition, None);
         store.insert(r);
-        store.finalize(
-            "c1",
-            CallState::Failed,
-            None,
-            Some("busy".into()),
-            Some(crate::sip::CallOutcome::Busy),
-            3000,
-        );
+        store.finalize("c1", Disposition::Busy, None, Some("busy".into()), 3000);
         let got = store.get("c1").unwrap();
-        assert_eq!(got.outcome, Some(crate::sip::CallOutcome::Busy));
+        assert_eq!(got.disposition, Some(Disposition::Busy));
+        // finalize no longer sets the (deprecated) outcome field.
+        assert_eq!(got.outcome, None);
     }
 
     #[test]
@@ -383,14 +376,14 @@ mod tests {
     }
 
     #[test]
-    fn queued_and_cancelled_serialize_snake_case() {
+    fn queued_and_ended_serialize_snake_case() {
         assert_eq!(
             serde_json::to_string(&CallState::Queued).unwrap(),
             "\"queued\""
         );
         assert_eq!(
-            serde_json::to_string(&CallState::Cancelled).unwrap(),
-            "\"cancelled\""
+            serde_json::to_string(&CallState::Ended).unwrap(),
+            "\"ended\""
         );
     }
 

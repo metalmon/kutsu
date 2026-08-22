@@ -78,19 +78,22 @@ fn unknown_call(id: &str) -> ErrorData {
     ErrorData::invalid_params(format!("unknown call_id: {id}"), None)
 }
 
-/// Human-readable label for a [`CallState`], used in a task's progress
+/// Human-readable label for a call record, used in a task's progress
 /// message. (The task's actual MCP `TaskStatus` is derived by the framework
-/// from the task future's terminal `Ok`/`Err`, not from this label.)
-fn call_status_label(state: crate::state::CallState) -> &'static str {
+/// from the task future's terminal `Ok`/`Err`, not from this label.) While
+/// live this is the lifecycle state; once `Ended` it's the resolved
+/// disposition (e.g. "voicemail", "busy"), which is far more informative
+/// than a bare "ended".
+fn call_status_label(rec: &crate::state::CallRecord) -> String {
     use crate::state::CallState;
-    match state {
-        CallState::Queued => "queued",
-        CallState::Ringing => "ringing",
-        CallState::InProgress => "in progress",
-        CallState::Completed => "completed",
-        CallState::HungUp => "hung up",
-        CallState::Failed => "failed",
-        CallState::Cancelled => "cancelled",
+    match rec.state {
+        CallState::Queued => "queued".into(),
+        CallState::Ringing => "ringing".into(),
+        CallState::InProgress => "in progress".into(),
+        CallState::Ended => rec
+            .disposition
+            .map(|d| format!("{d:?}").to_lowercase())
+            .unwrap_or_else(|| "ended".into()),
     }
 }
 
@@ -98,11 +101,7 @@ fn call_status_label(state: crate::state::CallState) -> &'static str {
 ///
 /// Used by the `place_call` task branch.
 fn is_terminal_state(state: crate::state::CallState) -> bool {
-    use crate::state::CallState;
-    !matches!(
-        state,
-        CallState::Queued | CallState::Ringing | CallState::InProgress
-    )
+    matches!(state, crate::state::CallState::Ended)
 }
 
 /// Poll the call store until `call_id` reaches a terminal [`CallState`],
@@ -206,10 +205,10 @@ impl KutsuServer {
         // reaches a terminal state, which is guaranteed within `max_call_secs`.
         let task = self.tasks.spawn(options, move |ctx| {
             Box::pin(async move {
-                let terminal = loop {
+                loop {
                     // Publish the current human-readable status before waiting.
                     if let Some(rec) = engine.store().get(&cid) {
-                        let label = call_status_label(rec.state);
+                        let label = call_status_label(&rec);
                         let msg = match engine.queued_position(&cid) {
                             Some(pos) => format!("call {cid}: {label} (queue position {pos})"),
                             None => format!("call {cid}: {label}"),
@@ -217,8 +216,11 @@ impl KutsuServer {
                         ctx.set_status_message(msg);
                     }
                     tokio::select! {
-                        // Reuse the pure watcher for terminal detection.
-                        state = watch_call_to_terminal(&engine, &cid) => break state,
+                        // Reuse the pure watcher for terminal detection. The
+                        // only terminal CallState is Ended, so its resolved
+                        // Disposition (not the lifecycle state) drives the
+                        // task's Ok/Err outcome below.
+                        _ = watch_call_to_terminal(&engine, &cid) => break,
                         // Cooperative cancellation: hang up, settle as cancelled.
                         _ = ctx.cancelled() => {
                             engine.end_call(&cid);
@@ -227,15 +229,14 @@ impl KutsuServer {
                         // Otherwise wake periodically to refresh the status.
                         _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
                     }
-                };
+                }
 
-                use crate::state::CallState;
-                match terminal {
-                    CallState::Completed | CallState::HungUp => {
+                use crate::state::Disposition;
+                let rec = engine.store().get(&cid);
+                match rec.as_ref().and_then(|r| r.disposition) {
+                    Some(Disposition::Completed) => {
                         let server_time_unix = crate::engine::now_ms();
-                        let body = engine
-                            .store()
-                            .get(&cid)
+                        let body = rec
                             .map(|r| {
                                 serde_json::json!({
                                     "transcript": r.transcript, "goal": r.goal,
@@ -249,18 +250,21 @@ impl KutsuServer {
                             body.to_string(),
                         )]))
                     }
-                    CallState::Failed => {
-                        let msg = engine
-                            .store()
-                            .get(&cid)
+                    Some(Disposition::Cancelled) => Err(TaskExit::Cancelled),
+                    // Every other disposition (technical failure, or an
+                    // answered-but-not-completed AMD/shape verdict such as
+                    // Voicemail/Busy/NoAnswer) surfaces as a task error, same
+                    // as the old blanket CallState::Failed branch.
+                    Some(_) => {
+                        let msg = rec
                             .and_then(|r| r.error)
                             .unwrap_or_else(|| "call failed".to_string());
                         Err(TaskExit::Error(ErrorData::internal_error(msg, None)))
                     }
-                    CallState::Cancelled => Err(TaskExit::Cancelled),
-                    // watch_call_to_terminal only returns terminal states.
-                    other => Err(TaskExit::Error(ErrorData::internal_error(
-                        format!("unexpected non-terminal state: {other:?}"),
+                    // watch_call_to_terminal only returns once Ended, which
+                    // always carries a disposition.
+                    None => Err(TaskExit::Error(ErrorData::internal_error(
+                        "call ended with no disposition".to_string(),
                         None,
                     ))),
                 }
@@ -548,29 +552,56 @@ mod tests {
 
     #[test]
     fn call_status_label_and_terminal() {
-        use crate::state::CallState as S;
-        assert_eq!(call_status_label(S::Queued), "queued");
-        assert_eq!(call_status_label(S::Ringing), "ringing");
-        assert_eq!(call_status_label(S::InProgress), "in progress");
-        assert_eq!(call_status_label(S::Completed), "completed");
-        assert_eq!(call_status_label(S::HungUp), "hung up");
-        assert_eq!(call_status_label(S::Failed), "failed");
-        assert_eq!(call_status_label(S::Cancelled), "cancelled");
+        use crate::state::{CallState as S, Disposition};
+
+        fn rec(state: S, disposition: Option<Disposition>) -> crate::state::CallRecord {
+            crate::state::CallRecord {
+                call_id: "c1".into(),
+                number: "600".into(),
+                state,
+                transcript: vec![],
+                affect: vec![],
+                goal: None,
+                error: None,
+                started_ms: 0,
+                ended_ms: None,
+                quality: Default::default(),
+                outcome: None,
+                disposition,
+                attempt: 1,
+                retry_of: None,
+            }
+        }
+
+        assert_eq!(call_status_label(&rec(S::Queued, None)), "queued");
+        assert_eq!(call_status_label(&rec(S::Ringing, None)), "ringing");
+        assert_eq!(call_status_label(&rec(S::InProgress, None)), "in progress");
+        assert_eq!(
+            call_status_label(&rec(S::Ended, Some(Disposition::Completed))),
+            "completed"
+        );
+        assert_eq!(
+            call_status_label(&rec(S::Ended, Some(Disposition::Cancelled))),
+            "cancelled"
+        );
+        // Ended with no disposition (shouldn't happen via finalize, but the
+        // label must degrade gracefully rather than panic).
+        assert_eq!(call_status_label(&rec(S::Ended, None)), "ended");
+
         assert!(!is_terminal_state(S::Queued));
         assert!(!is_terminal_state(S::Ringing));
         assert!(!is_terminal_state(S::InProgress));
-        assert!(is_terminal_state(S::Completed));
-        assert!(is_terminal_state(S::HungUp));
-        assert!(is_terminal_state(S::Failed));
-        assert!(is_terminal_state(S::Cancelled));
+        assert!(is_terminal_state(S::Ended));
     }
 
-    /// The pure watcher must return the terminal state a call settles into.
-    /// cap-0 parks the call in `Queued`; a delayed `end_call` flips it to
-    /// `Cancelled`, and the watcher must resolve with `Cancelled`.
+    /// The pure watcher must return the terminal state a call settles into
+    /// (always `Ended`, the only terminal `CallState`); the resolved
+    /// `Disposition` on the record is what actually distinguishes cancelled
+    /// from completed/failed. cap-0 parks the call in `Queued`; a delayed
+    /// `end_call` flips it to `Ended` with `Disposition::Cancelled`.
     #[tokio::test]
     async fn watch_call_to_terminal_returns_cancelled() {
-        use crate::state::CallState;
+        use crate::state::{CallState, Disposition};
         let engine = Arc::new(test_engine(0).await);
         let call_id = engine
             .place_call(
@@ -596,7 +627,11 @@ mod tests {
         });
 
         let terminal = watch_call_to_terminal(&engine, &call_id).await;
-        assert!(matches!(terminal, CallState::Cancelled), "got {terminal:?}");
+        assert_eq!(terminal, CallState::Ended);
+        assert_eq!(
+            engine.store().get(&call_id).unwrap().disposition,
+            Some(Disposition::Cancelled)
+        );
     }
 
     /// A task-capable branch returns a `CallToolResponse::Task` handle rather

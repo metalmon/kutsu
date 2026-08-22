@@ -361,9 +361,11 @@ mod tests {
         // Consumes the only Arc<Engine> -> try_unwrap succeeds -> shutdown runs.
         graceful_teardown(engine).await;
 
-        // end_call fired for the queued call -> it finalizes Cancelled;
-        // teardown returned without panic/hang.
-        assert_eq!(store.get(&id).unwrap().state, CallState::Cancelled);
+        // end_call fired for the queued call -> it finalizes Ended with a
+        // Cancelled disposition; teardown returned without panic/hang.
+        let rec = store.get(&id).unwrap();
+        assert_eq!(rec.state, CallState::Ended);
+        assert_eq!(rec.disposition, Some(crate::state::Disposition::Cancelled));
     }
 
     #[test]
@@ -386,6 +388,10 @@ mod tests {
             rejected_total: 0,
             not_found_total: 0,
             unavailable_total: 0,
+            voicemail_total: 0,
+            announcement_total: 0,
+            ivr_total: 0,
+            hold_total: 0,
         };
         let s = render_prometheus(&m);
         for line in [
@@ -422,6 +428,10 @@ mod tests {
             rejected_total: 0,
             not_found_total: 0,
             unavailable_total: 0,
+            voicemail_total: 0,
+            announcement_total: 0,
+            ivr_total: 0,
+            hold_total: 0,
         };
         let s = render_prometheus(&m);
         for line in [
@@ -453,6 +463,10 @@ mod tests {
             rejected_total: 0,
             not_found_total: 0,
             unavailable_total: 0,
+            voicemail_total: 0,
+            announcement_total: 0,
+            ivr_total: 0,
+            hold_total: 0,
         };
         let s = render_prometheus(&m);
         for line in [
@@ -483,6 +497,10 @@ mod tests {
             rejected_total: 3,
             not_found_total: 2,
             unavailable_total: 1,
+            voicemail_total: 0,
+            announcement_total: 0,
+            ivr_total: 0,
+            hold_total: 0,
         };
         let s = render_prometheus(&m);
         for line in [

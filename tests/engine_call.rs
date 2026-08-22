@@ -41,10 +41,7 @@ async fn engine_places_and_finalizes_a_call() {
             if rec.state == CallState::InProgress {
                 saw_in_progress = true;
             }
-            if matches!(
-                rec.state,
-                CallState::Completed | CallState::Failed | CallState::HungUp
-            ) {
+            if matches!(rec.state, CallState::Ended) {
                 break;
             }
         }
