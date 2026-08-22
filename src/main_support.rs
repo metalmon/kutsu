@@ -52,7 +52,7 @@ pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
     let server = ServerConfig {
         api_key,
         proxy,
-        model: match env_or("KUTSU_MODEL", "native-audio").trim().to_ascii_lowercase().as_str() {
+        model: match env_or("KUTSU_MODEL", "half-cascade").trim().to_ascii_lowercase().as_str() {
             "half-cascade" | "half" | "halfcascade" | "cascade" => Model::HalfCascade,
             _ => Model::NativeAudio,
         },
