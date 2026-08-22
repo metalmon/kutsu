@@ -1,13 +1,23 @@
 {
-  "system_prompt": "You are an assistant calling to confirm an appointment. Be brief and polite.",
   "goal_schema": {
     "type": "object",
     "properties": {
-      "confirmed": { "type": "boolean" },
-      "callback_at": { "type": "string" },
-      "disposition": { "type": "string" }
+      "confirmed": {
+        "type": "boolean",
+        "description": "Did the person confirm the appointment?"
+      },
+      "callback_at": {
+        "type": "string",
+        "description": "If they asked to be called back, the time in their words."
+      },
+      "disposition": {
+        "type": "string",
+        "enum": ["confirmed", "declined", "callback", "no_answer"],
+        "description": "Overall call outcome."
+      }
     },
     "required": ["disposition"]
   },
-  "context": { "name": "Ivan", "city": "Kazan" }
+  "context": { "name": "Ivan", "city": "Kazan", "appointment": "2026-09-01 14:00" },
+  "prompt_override": null
 }

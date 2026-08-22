@@ -156,19 +156,21 @@ GEMINI_API_KEY=your-api-key cargo run --features vendor-openssl -- live \
 **Key flags:**
 - `--model half|native` — override the default (half-cascade).
 - `--tail SECONDS` — how long to keep the session open after the input ends (default 8).
-- `--greet-after-silence-ms MS` — wait this long for the callee before the agent greets first; `0` disables the proactive greeting (default 4000).
+- `--greet-after-silence-ms MS` — wait this long for the callee before the agent greets first; `0` disables the proactive greeting (default 1000).
 - `--no-net-check` — skip the fail-closed network preflight (offline/high-latency debugging).
 
-**Scenario file format** (`docs/examples/scenario.json`):
+**Scenario file format** (`docs/examples/scenario.json`) — the per-call layer
+only; the agent persona comes from config (`[server.prompts]`), see
+[docs/prompts.md](docs/prompts.md):
 ```json
 {
-  "system_prompt": "Your system message to the model",
   "goal_schema": {
     "type": "object",
-    "properties": { "field": { "type": "string" } },
+    "properties": { "field": { "type": "string", "description": "what to collect" } },
     "required": ["field"]
   },
-  "context": { "optional": "data", "passed": "to the model" }
+  "context": { "optional": "data", "passed": "to the model" },
+  "prompt_override": null
 }
 ```
 
@@ -190,6 +192,16 @@ GEMINI_API_KEY=your-api-key cargo run --features vendor-openssl -- live \
 - **Provider-agnostic voice model**: all realtime speech-to-speech APIs (Gemini Live, OpenAI Realtime, Amazon Nova Sonic) share the same shape — bidirectional session, PCM16 audio, tool calls with ids, barge-in events — so they sit behind one trait. kutsu owns the telephony; the brain is swappable. Gemini Live ships first (cheapest, proven flow); OpenAI Realtime second.
 - **Outbound first, inbound is a declared goal**: the expensive parts — audio bridge, `RealtimeProvider`, call engine, outcomes — are direction-agnostic. Inbound adds `REGISTER` on the trunk, DID → scenario routing, and a busy policy; kutsu answers autonomously with the pre-configured scenario and notifies the orchestrator over webhook (the same mechanism as the tool bridge), no polling required.
 - **Proven conversation flow**: the conversation logic (scenario tools, goal merging, dispositions, turn-taking against Gemini Live) was validated in an earlier Python prototype; kutsu ports that flow to Rust and puts a real SIP leg and MCP interface around it.
+
+## Documentation
+
+Full docs in [`docs/`](docs/README.md):
+
+- [Getting started](docs/getting-started.md) — build, `kutsu init`, first call
+- [Configuration](docs/configuration.md) — config file, env overlay, secrets, every knob
+- [Prompts & scenarios](docs/prompts.md) — persona (config) vs. per-call objective
+- [MCP server](docs/mcp.md) — tools, call lifecycle, transports, ops endpoints
+- [CLI reference](docs/cli.md) — `init`, `mcp`, `call`, `live`
 
 ## License
 
