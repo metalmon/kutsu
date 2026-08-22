@@ -65,6 +65,7 @@ pub fn configs_from_env() -> anyhow::Result<(ServerConfig, SipConfig)> {
             max_rtt_ms: env_u32("KUTSU_NETCHECK_MAX_RTT_MS", 300),
             max_jitter_ms: env_u32("KUTSU_NETCHECK_MAX_JITTER_MS", 50),
             max_loss_pct: env_f32("KUTSU_NETCHECK_MAX_LOSS_PCT", 2.0),
+            uplink_loss_abort_pct: env_f32("KUTSU_UPLINK_LOSS_ABORT_PCT", 10.0),
         },
         max_concurrent_channels: env_u32("KUTSU_MAX_CONCURRENT_CHANNELS", 3) as usize,
         greet_after_silence_ms: env_u64("KUTSU_GREET_AFTER_SILENCE_MS", DEFAULT_GREET_AFTER_SILENCE_MS),

@@ -22,6 +22,24 @@ fn should_abort(cfg: &QualityConfig, underruns: u64) -> bool {
     cfg.abort_underruns > 0 && underruns >= cfg.abort_underruns as u64
 }
 
+/// Number of 1 s quality ticks in the rolling uplink-loss window (~8 s).
+const UPLINK_WINDOW_TICKS: usize = 8;
+
+/// Rolling-window uplink RTP loss %, from the cumulative `(received, lost)` at
+/// the window start vs now. `None` until the window holds enough packets to
+/// judge (so a tiny early sample can't trigger an abort). Rolling (not
+/// cumulative) so a late burst on a long call isn't diluted away.
+fn window_loss_pct(oldest: (u64, u64), current: (u64, u64)) -> Option<f32> {
+    let recv = current.0.saturating_sub(oldest.0);
+    let lost = current.1.saturating_sub(oldest.1);
+    let total = recv + lost;
+    if total < 200 {
+        None
+    } else {
+        Some(lost as f32 / total as f32 * 100.0)
+    }
+}
+
 /// Merge a downlink `CallQuality` snapshot with the uplink (phone→bridge)
 /// snapshot, so both directions are reported through the one `CallQuality`
 /// record. Kept in one place, used by both the `qtick` arm and finalize.
@@ -751,6 +769,9 @@ async fn run_call(
     let deadline = tokio::time::sleep(Duration::from_secs(server.max_call_secs));
     tokio::pin!(deadline);
     let mut qtick = tokio::time::interval(Duration::from_secs(1));
+    // Rolling window of cumulative (uplink_received, uplink_lost) snapshots, one
+    // per quality tick, for the mid-call uplink-RTP-loss gate.
+    let mut uplink_hist: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
     let end_state = loop {
         tokio::select! {
             ev = events_out_rx.recv(), if events_open => match ev {
@@ -806,18 +827,24 @@ async fn run_call(
                     ));
                     break CallState::Failed;
                 }
-                // Mid-call RTP gate: abort on sustained high uplink packet loss
-                // (a failing callee/cellular leg — the preflight covered only the
-                // Gemini leg). Cumulative; needs >~5 s of RTP before it judges.
-                let up_total = q.uplink_received + q.uplink_lost;
-                if up_total > 250 {
-                    let loss_pct = q.uplink_lost as f32 / up_total as f32 * 100.0;
-                    if loss_pct > 10.0 {
-                        abort_reason = Some(format!(
-                            "aborted: uplink RTP loss {loss_pct:.1}% ({} lost / {up_total})",
-                            q.uplink_lost
-                        ));
-                        break CallState::Failed;
+                // Mid-call RTP gate: abort on sustained uplink packet loss over a
+                // rolling ~8 s window (a failing callee/cellular leg — the
+                // preflight covered only the Gemini leg). Rolling, not cumulative,
+                // so a late burst isn't diluted away by a long clean call.
+                uplink_hist.push_back((q.uplink_received, q.uplink_lost));
+                while uplink_hist.len() > UPLINK_WINDOW_TICKS {
+                    uplink_hist.pop_front();
+                }
+                if uplink_hist.len() >= UPLINK_WINDOW_TICKS {
+                    if let (Some(&oldest), Some(&current)) = (uplink_hist.front(), uplink_hist.back()) {
+                        if let Some(loss_pct) = window_loss_pct(oldest, current) {
+                            if loss_pct > server.net_check.uplink_loss_abort_pct {
+                                abort_reason = Some(format!(
+                                    "aborted: uplink RTP loss {loss_pct:.1}% over ~{UPLINK_WINDOW_TICKS}s window"
+                                ));
+                                break CallState::Failed;
+                            }
+                        }
                     }
                 }
             }
@@ -923,6 +950,20 @@ fn write_owner_only(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
 mod tests {
     use super::*;
     use crate::config::{Model, NetCheckConfig, VadConfig, RESUME_CUE};
+
+    #[test]
+    fn window_loss_pct_needs_enough_samples_then_reports_windowed_loss() {
+        // Too few packets in the window -> no verdict yet.
+        assert_eq!(window_loss_pct((0, 0), (100, 0)), None);
+        // Clean window -> ~0%.
+        assert_eq!(window_loss_pct((0, 0), (500, 0)), Some(0.0));
+        // Lossy window -> the loss over the window (50 lost of 500).
+        assert_eq!(window_loss_pct((0, 0), (450, 50)), Some(10.0));
+        // Subtracts the window-start baseline (rolling, not cumulative):
+        // 400 recv + 40 lost since baseline -> 40/440 ≈ 9.09%.
+        let p = window_loss_pct((1000, 10), (1400, 50)).unwrap();
+        assert!((p - 9.09).abs() < 0.1, "got {p}");
+    }
 
     /// Build a valid `(ServerConfig, SipConfig)` pair for tests. The SIP config
     /// is bound to loopback so `SipTransport::new` binds offline (no real trunk).

@@ -105,8 +105,9 @@ fn summarize(rtts: &mut Vec<u32>, lost: u32, total: u32) -> NetworkHealth {
     }
     rtts.sort_unstable();
     let p = |q: f32| rtts[((rtts.len() as f32 - 1.0) * q).round() as usize];
-    let mean = rtts.iter().sum::<u32>() as f32 / rtts.len() as f32;
-    let jitter = (rtts.iter().map(|&r| (r as f32 - mean).abs()).sum::<f32>() / rtts.len() as f32) as u32;
+    // Jitter as the p95−p50 RTT spread — percentile-based, robust to outliers
+    // (unlike mean absolute deviation, which a single spike skews).
+    let jitter = p(0.95).saturating_sub(p(0.50));
     NetworkHealth { rtt_p50_ms: p(0.50), rtt_p95_ms: p(0.95), jitter_ms: jitter, loss_pct }
 }
 
@@ -129,6 +130,14 @@ mod tests {
 
         let jittery = NetworkHealth { jitter_ms: 200, ..good };
         assert!(matches!(verdict(&jittery, &cfg), Verdict::Unusable));
+    }
+
+    #[test]
+    fn jitter_is_the_p95_minus_p50_spread() {
+        let mut rtts = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+        let h = summarize(&mut rtts, 0, 10);
+        assert!(h.rtt_p95_ms >= h.rtt_p50_ms);
+        assert_eq!(h.jitter_ms, h.rtt_p95_ms - h.rtt_p50_ms);
     }
 
     #[test]

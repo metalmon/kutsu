@@ -100,12 +100,16 @@ pub struct NetCheckConfig {
     pub max_rtt_ms: u32,
     pub max_jitter_ms: u32,
     pub max_loss_pct: f32,
+    /// Mid-call abort threshold: rolling-window uplink RTP loss (%) over the last
+    /// ~8 s that marks the callee/cellular leg as unusable. Distinct from
+    /// `max_loss_pct` (which gates the pre-dial Gemini-leg ping loss).
+    pub uplink_loss_abort_pct: f32,
 }
 
 impl Default for NetCheckConfig {
     fn default() -> Self {
         // Thresholds tuned for realtime voice (see spec).
-        NetCheckConfig { enabled: true, samples: 10, max_rtt_ms: 300, max_jitter_ms: 50, max_loss_pct: 2.0 }
+        NetCheckConfig { enabled: true, samples: 10, max_rtt_ms: 300, max_jitter_ms: 50, max_loss_pct: 2.0, uplink_loss_abort_pct: 10.0 }
     }
 }
 
