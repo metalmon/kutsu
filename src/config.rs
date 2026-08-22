@@ -540,11 +540,11 @@ mod tests {
     fn scenario_parses_from_json_and_model_defaults() {
         let json = r#"{
             "goal_schema": {"type":"object","required":["disposition"]},
-            "context": {"name":"Ivan"}
+            "context": {"name":"Alex Carter"}
         }"#;
         let sc: ScenarioConfig = serde_json::from_str(json).unwrap();
         assert_eq!(sc.goal_schema["type"], "object");
-        assert_eq!(sc.context.unwrap()["name"], "Ivan");
+        assert_eq!(sc.context.unwrap()["name"], "Alex Carter");
         assert!(sc.prompt_override.is_none());
 
         assert!(matches!(Model::default(), Model::HalfCascade));
@@ -662,14 +662,14 @@ mod tests {
         cfg.language = "ru-RU".into();
         let sc = ScenarioConfig {
             goal_schema: serde_json::json!({"type": "object"}),
-            context: Some(serde_json::json!({"name": "Ivan"})),
+            context: Some(serde_json::json!({"name": "Alex Carter"})),
             prompt_override: Some("You are a debt collector.".into()),
         };
         let sys = cfg.assemble_system_instruction(&sc);
         assert!(sys.starts_with("You are a debt collector."));
         assert!(!sys.contains(BASE_SYSTEM_PROMPT));
         assert!(sys.contains("# Contact context"));
-        assert!(sys.contains("Ivan"));
+        assert!(sys.contains("Alex Carter"));
         assert!(sys.contains("MALE voice"));
         assert!(sys.contains("ru-RU"));
     }

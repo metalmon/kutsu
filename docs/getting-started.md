@@ -65,7 +65,7 @@ context; the persona comes from config:
         "description": "Did the customer confirm the appointment?" }
     }
   },
-  "context": { "name": "Ivan", "appointment": "2026-09-01 14:00" }
+  "context": { "name": "Alex Carter", "appointment": "2026-09-01 14:00" }
 }
 ```
 

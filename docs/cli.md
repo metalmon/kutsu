@@ -51,7 +51,7 @@ minimal default (empty goal schema, no context) is used:
   "goal_schema": { "type": "object", "required": ["disposition"],
     "properties": { "disposition": { "type": "string",
       "description": "Call outcome" } } },
-  "context": { "name": "Ivan" },
+  "context": { "name": "Alex Carter" },
   "prompt_override": null
 }
 ```

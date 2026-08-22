@@ -18,6 +18,6 @@
     },
     "required": ["disposition"]
   },
-  "context": { "name": "Ivan", "city": "Kazan", "appointment": "2026-09-01 14:00" },
+  "context": { "name": "Alex Carter", "city": "Portland", "appointment": "2026-09-01 14:00" },
   "prompt_override": null
 }

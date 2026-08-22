@@ -132,7 +132,7 @@ With context and a one-off persona override:
 {
   "to_number": "+15551234567",
   "goal_schema": { "...": "..." },
-  "context": { "name": "Ivan", "plan": "Pro", "renews_on": "2026-09-01" },
+  "context": { "name": "Alex Carter", "plan": "Pro", "renews_on": "2026-09-01" },
   "prompt_override": "You are a debt collector. Be firm but polite."
 }
 ```
