@@ -115,6 +115,34 @@ pub fn render_prometheus(m: &MetricsSnapshot) -> String {
     );
     g(
         &mut s,
+        "kutsu_calls_voicemail_total",
+        "Calls that ended as voicemail.",
+        "counter",
+        m.voicemail_total.to_string(),
+    );
+    g(
+        &mut s,
+        "kutsu_calls_announcement_total",
+        "Calls that ended as announcement.",
+        "counter",
+        m.announcement_total.to_string(),
+    );
+    g(
+        &mut s,
+        "kutsu_calls_ivr_total",
+        "Calls that ended as IVR.",
+        "counter",
+        m.ivr_total.to_string(),
+    );
+    g(
+        &mut s,
+        "kutsu_calls_hold_total",
+        "Calls that ended as hold.",
+        "counter",
+        m.hold_total.to_string(),
+    );
+    g(
+        &mut s,
         "kutsu_channels_cap",
         "Max concurrent channels.",
         "gauge",
@@ -509,6 +537,42 @@ mod tests {
             "kutsu_calls_rejected_total 3",
             "kutsu_calls_not_found_total 2",
             "kutsu_calls_unavailable_total 1",
+        ] {
+            assert!(s.contains(line), "missing: {line}\n{s}");
+        }
+    }
+
+    #[test]
+    fn disposition_series_present() {
+        let m = MetricsSnapshot {
+            active: 0,
+            queued: 0,
+            placed_total: 0,
+            completed_total: 0,
+            failed_total: 0,
+            cancelled_total: 0,
+            channels_cap: 3,
+            underruns_total: 0,
+            starved_ms_total: 0,
+            quality_aborted_total: 0,
+            uplink_received_total: 0,
+            uplink_lost_total: 0,
+            busy_total: 0,
+            no_answer_total: 0,
+            rejected_total: 0,
+            not_found_total: 0,
+            unavailable_total: 0,
+            voicemail_total: 7,
+            announcement_total: 3,
+            ivr_total: 2,
+            hold_total: 1,
+        };
+        let s = render_prometheus(&m);
+        for line in [
+            "kutsu_calls_voicemail_total 7",
+            "kutsu_calls_announcement_total 3",
+            "kutsu_calls_ivr_total 2",
+            "kutsu_calls_hold_total 1",
         ] {
             assert!(s.contains(line), "missing: {line}\n{s}");
         }

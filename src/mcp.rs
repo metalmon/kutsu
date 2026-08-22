@@ -290,6 +290,7 @@ impl KutsuServer {
             "call_id": rec.call_id, "state": rec.state, "number": rec.number,
             "started_ms": rec.started_ms, "ended_ms": rec.ended_ms,
             "error": rec.error, "queued_position": pos, "quality": rec.quality,
+            "disposition": rec.disposition,
             "server_time_unix": crate::engine::now_ms(),
         });
         Ok(CallToolResult::success(vec![ContentBlock::text(
