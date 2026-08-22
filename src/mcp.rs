@@ -92,7 +92,8 @@ fn call_status_label(rec: &crate::state::CallRecord) -> String {
         CallState::InProgress => "in progress".into(),
         CallState::Ended => rec
             .disposition
-            .map(|d| format!("{d:?}").to_lowercase())
+            .and_then(|d| serde_json::to_value(d).ok())
+            .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_else(|| "ended".into()),
     }
 }
@@ -250,15 +251,42 @@ impl KutsuServer {
                             body.to_string(),
                         )]))
                     }
+                    // Answered calls that ended up talking to a machine/queue
+                    // rather than a human still carry a transcript/goal and
+                    // are a legitimate result, not a failure: the feature's
+                    // thesis is "always return a result" for answered calls.
+                    d @ Some(
+                        Disposition::Voicemail
+                        | Disposition::Announcement
+                        | Disposition::Ivr
+                        | Disposition::Hold,
+                    ) => {
+                        let server_time_unix = crate::engine::now_ms();
+                        let body = rec
+                            .map(|r| {
+                                serde_json::json!({
+                                    "disposition": d, "transcript": r.transcript,
+                                    "goal": r.goal, "server_time_unix": server_time_unix,
+                                })
+                            })
+                            .unwrap_or_else(
+                                || serde_json::json!({ "disposition": d, "server_time_unix": server_time_unix }),
+                            );
+                        Ok(CallToolResult::success(vec![ContentBlock::text(
+                            body.to_string(),
+                        )]))
+                    }
                     Some(Disposition::Cancelled) => Err(TaskExit::Cancelled),
-                    // Every other disposition (technical failure, or an
-                    // answered-but-not-completed AMD/shape verdict such as
-                    // Voicemail/Busy/NoAnswer) surfaces as a task error, same
-                    // as the old blanket CallState::Failed branch.
-                    Some(_) => {
-                        let msg = rec
-                            .and_then(|r| r.error)
-                            .unwrap_or_else(|| "call failed".to_string());
+                    // Everything else is a technical/dial failure (Failed,
+                    // Busy, NoAnswer, Rejected, NotFound, Unavailable).
+                    Some(d) => {
+                        let msg = rec.as_ref().and_then(|r| r.error.clone()).unwrap_or_else(|| {
+                            let name = serde_json::to_value(d)
+                                .ok()
+                                .and_then(|v| v.as_str().map(String::from))
+                                .unwrap_or_else(|| "failed".to_string());
+                            format!("call ended: {name}")
+                        });
                         Err(TaskExit::Error(ErrorData::internal_error(msg, None)))
                     }
                     // watch_call_to_terminal only returns once Ended, which
@@ -567,7 +595,6 @@ mod tests {
                 started_ms: 0,
                 ended_ms: None,
                 quality: Default::default(),
-                outcome: None,
                 disposition,
                 attempt: 1,
                 retry_of: None,

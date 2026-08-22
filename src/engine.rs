@@ -197,7 +197,6 @@ impl Enqueuer {
             started_ms: now_ms(),
             ended_ms: None,
             quality: CallQuality::default(),
-            outcome: None,
             disposition: None,
             attempt,
             retry_of: retry_of.clone(),
@@ -1106,6 +1105,21 @@ async fn run_call(
         ended_by: session_outcome.ended_by,
     };
     let had_abort = abort_reason.is_some();
+    // A quality-abort tick can race a model EndCall that resolves to
+    // Completed (transcript/amd path) even after the abort tick fired. Only
+    // surface the abort reason as the record's `error` when the disposition
+    // this call shape actually resolves to is Failed — otherwise it would
+    // leak a stale "aborted: ..." error into an answered/completed call's
+    // get_call_status JSON and CLI output. Pre-resolving here is cheap and
+    // pure (finalize_call resolves again internally); CallShape is Copy.
+    let error = if abort_reason.is_some() {
+        match crate::state::resolve_disposition(cancelled, amd.as_deref(), None, shape) {
+            Disposition::Failed => abort_reason,
+            _ => None,
+        }
+    } else {
+        None
+    };
     let d = finalize_call(
         &store,
         &counters,
@@ -1115,7 +1129,7 @@ async fn run_call(
         None,
         shape,
         final_goal,
-        abort_reason,
+        error,
         now_ms(),
     );
     // Count the quality abort exactly once here, only if the abort survived
@@ -1482,7 +1496,6 @@ mod tests {
             started_ms: 0,
             ended_ms: None,
             quality: Default::default(),
-            outcome: None,
             disposition: None,
             attempt: 1,
             retry_of: None,

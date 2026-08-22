@@ -80,10 +80,15 @@ pub fn resolve_disposition(
         Some("hold") => Disposition::Hold,
         Some("live") => Disposition::Completed,
         _ => {
-            let fast_disconnect =
-                matches!(shape.ended_by, crate::gemini_live::EndedBy::RemoteClose)
-                    && shape.duration_ms < FAST_DISCONNECT_MAX_MS
-                    && shape.transcript_len == 0;
+            // A carrier announcement can end either by the Gemini WS server
+            // closing first (RemoteClose) or by our teardown hangup after the
+            // callee/carrier drops the call (CallerHangup) — both count.
+            let fast_disconnect = matches!(
+                shape.ended_by,
+                crate::gemini_live::EndedBy::RemoteClose
+                    | crate::gemini_live::EndedBy::CallerHangup
+            ) && shape.duration_ms < FAST_DISCONNECT_MAX_MS
+                && shape.transcript_len == 0;
             if fast_disconnect {
                 Disposition::Announcement
             } else if shape.transcript_len > 0 {
@@ -137,8 +142,6 @@ pub struct CallRecord {
     pub started_ms: u64,
     pub ended_ms: Option<u64>,
     pub quality: CallQuality,
-    /// Structured dial result; None while in-flight.
-    pub outcome: Option<crate::sip::CallOutcome>,
     /// The authoritative terminal result; None while in-flight.
     pub disposition: Option<Disposition>,
     /// 1 for the first dial; incremented per internal busy-retry.
@@ -261,7 +264,6 @@ mod tests {
             started_ms: 1000,
             ended_ms: None,
             quality: CallQuality::default(),
-            outcome: None,
             disposition: None,
             attempt: 1,
             retry_of: None,
@@ -361,8 +363,6 @@ mod tests {
         store.finalize("c1", Disposition::Busy, None, Some("busy".into()), 3000);
         let got = store.get("c1").unwrap();
         assert_eq!(got.disposition, Some(Disposition::Busy));
-        // finalize no longer sets the (deprecated) outcome field.
-        assert_eq!(got.outcome, None);
     }
 
     #[test]
@@ -479,6 +479,17 @@ mod disposition_tests {
     fn fast_disconnect_no_amd_is_announcement() {
         // answered, remote hung up, short, empty transcript.
         let s = shape(true, 4000, 0, EndedBy::RemoteClose);
+        assert_eq!(
+            resolve_disposition(false, None, None, s),
+            Disposition::Announcement
+        );
+    }
+
+    #[test]
+    fn fast_disconnect_via_caller_hangup_is_announcement() {
+        // answered, our teardown hangup fired first (carrier already dropped
+        // the call), short, empty transcript.
+        let s = shape(true, 4000, 0, EndedBy::CallerHangup);
         assert_eq!(
             resolve_disposition(false, None, None, s),
             Disposition::Announcement
