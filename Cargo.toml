@@ -61,6 +61,7 @@ bytesstr = "1"
 ezk-sip-core = "0.9"
 ezk-sip-auth = "0.5"
 ezk-sip-types = "0.6"
+audio_thread_priority = "0.37.0"
 
 [features]
 # Build OpenSSL from source and link it statically instead of relying on a

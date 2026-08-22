@@ -240,6 +240,11 @@ impl SipTransport {
         let join = std::thread::Builder::new()
             .name("kutsu-sip".into())
             .spawn(move || {
+                // Reserve CPU for the realtime-critical RTP path (best-effort;
+                // held for the thread's whole life). Toggle: KUTSU_RT_PRIORITY.
+                let _rt_priority = crate::realtime::promote_current_thread(
+                    crate::realtime::rt_enabled(std::env::var("KUTSU_RT_PRIORITY").ok()),
+                );
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()

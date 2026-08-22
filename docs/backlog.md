@@ -3,6 +3,21 @@
 Deferred work items, most recent first. Not a roadmap; a parking lot so nothing
 is lost. Move an item into an SDD spec/plan when it's picked up.
 
+## Real-time scheduling — v2 (downlink pacer thread)
+
+`realtime::promote_current_thread` currently raises only the `kutsu-sip` OS
+thread (RTP send/recv) via `audio_thread_priority` (MMCSS on Windows, SCHED_FIFO
+/ rtkit on Linux; best-effort, `KUTSU_RT_PRIORITY` toggle, default on). The
+downlink pacer + uplink run as tokio tasks on the shared multi-thread runtime,
+so they can't be individually prioritised. v2: move the pacer onto its own
+dedicated OS thread and promote it too, or run a small dedicated current-thread
+runtime for the audio path. Not urgent — RTP loss is ~0 today.
+
+**Build note (Linux):** `audio_thread_priority`'s default `dbus` feature (rtkit,
+lets Linux get RT priority without CAP_SYS_NICE) needs `libdbus-1-dev` at build
+time. To drop that build dep, disable default features (falls back to
+`sched_setscheduler`, which then needs `CAP_SYS_NICE`/root at runtime).
+
 ## Answering-machine / voicemail detection (AMD)
 
 **Problem:** outbound calls that hit voicemail or a carrier auto-answer are
