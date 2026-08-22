@@ -44,9 +44,12 @@ pub fn binary_metrics(pairs: &[(AmdClass, AmdClass)]) -> BinaryMetrics {
     }
 }
 
+/// Number of classes — the confusion matrix is `N`×`N`.
+pub const N: usize = AmdClass::ALL.len();
+
 /// Confusion counts indexed `[actual][predicted]` over [`AmdClass::ALL`].
-pub fn confusion(pairs: &[(AmdClass, AmdClass)]) -> [[u32; 4]; 4] {
-    let mut m = [[0u32; 4]; 4];
+pub fn confusion(pairs: &[(AmdClass, AmdClass)]) -> [[u32; N]; N] {
+    let mut m = [[0u32; N]; N];
     for (pred, actual) in pairs {
         m[actual.index()][pred.index()] += 1;
     }
@@ -54,7 +57,7 @@ pub fn confusion(pairs: &[(AmdClass, AmdClass)]) -> [[u32; 4]; 4] {
 }
 
 /// Render a confusion matrix (rows = actual, columns = predicted) as text.
-pub fn render_confusion(m: &[[u32; 4]; 4]) -> String {
+pub fn render_confusion(m: &[[u32; N]; N]) -> String {
     let mut s = String::from("confusion (rows=actual, cols=predicted):\n");
     s.push_str(&format!("{:>10}", ""));
     for c in AmdClass::ALL {

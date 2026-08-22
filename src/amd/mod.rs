@@ -23,15 +23,20 @@ pub enum AmdClass {
     Voicemail,
     Ivr,
     Hold,
+    /// Carrier/operator recording ("the subscriber is unavailable / switched
+    /// off") — the call never reached a live person. Action: hang up + retry
+    /// later (subscriber unavailable), unlike voicemail (leave a message).
+    Announcement,
 }
 
 impl AmdClass {
     /// All variants, in a stable order — the axes of the confusion matrix.
-    pub const ALL: [AmdClass; 4] = [
+    pub const ALL: [AmdClass; 5] = [
         AmdClass::Human,
         AmdClass::Voicemail,
         AmdClass::Ivr,
         AmdClass::Hold,
+        AmdClass::Announcement,
     ];
 
     /// The actionable axis: anything that is not a live human is a machine.
@@ -46,6 +51,7 @@ impl AmdClass {
             AmdClass::Voicemail => 1,
             AmdClass::Ivr => 2,
             AmdClass::Hold => 3,
+            AmdClass::Announcement => 4,
         }
     }
 
@@ -56,6 +62,7 @@ impl AmdClass {
             AmdClass::Voicemail => "voicemail",
             AmdClass::Ivr => "ivr",
             AmdClass::Hold => "hold",
+            AmdClass::Announcement => "announcement",
         }
     }
 }
