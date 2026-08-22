@@ -23,6 +23,13 @@ path = "src/lib.rs"
 name = "kutsu"
 path = "src/main.rs"
 
+# Offline AMD evaluation harness (dev only). Built only with `--features
+# amd-eval`; never part of the release `kutsu` binary.
+[[bin]]
+name = "amd-eval"
+path = "src/bin/amd-eval.rs"
+required-features = ["amd-eval"]
+
 [dependencies]
 # The Gemini Live client, developed in its own repo and vendored here as a git
 # submodule (crates/gemini-live). Owns wire/transport/session; kutsu keeps call
