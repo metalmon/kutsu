@@ -115,6 +115,22 @@ pub struct NetCheckConfig {
     /// RTCP receiver reports (our audio -> callee). Best-effort: only active when
     /// the carrier actually sends RR; otherwise no downlink signal and no abort.
     pub downlink_loss_abort_pct: f32,
+    /// Warm-up pings sent (and discarded) before the measured `samples`, so a
+    /// cold first RTT does not inflate jitter. Excluded from rtt/jitter/loss.
+    pub warmup_pings: u32,
+    /// Reconnect-cost gate: max `connect_ms + setup_ms` (WS establish + setup
+    /// handshake). Exceeding it fails preflight. 0 disables this gate.
+    pub max_setup_ms: u32,
+    /// Per-call preflight attempts before failing the call (>=1).
+    pub retry_max: u32,
+    /// Exponential backoff base between preflight attempts:
+    /// `base * 2^(attempt-1)` ms.
+    pub retry_backoff_base_ms: u64,
+    /// Consecutive preflight failures that trip the shared-channel breaker.
+    /// 0 disables the breaker.
+    pub breaker_threshold: u32,
+    /// How long the breaker holds the queue once tripped, in ms.
+    pub cooldown_ms: u64,
 }
 
 impl Default for NetCheckConfig {
@@ -128,6 +144,12 @@ impl Default for NetCheckConfig {
             max_loss_pct: 2.0,
             uplink_loss_abort_pct: 10.0,
             downlink_loss_abort_pct: 10.0,
+            warmup_pings: 1,
+            max_setup_ms: 2500,
+            retry_max: 3,
+            retry_backoff_base_ms: 5000,
+            breaker_threshold: 3,
+            cooldown_ms: 60000,
         }
     }
 }
@@ -738,6 +760,29 @@ mod tests {
         assert_eq!(cfg.server.net_check.downlink_loss_abort_pct, 25.0);
         // other net_check fields keep their defaults
         assert_eq!(cfg.server.net_check.uplink_loss_abort_pct, 10.0);
+    }
+
+    #[test]
+    fn netcheck_resilience_defaults() {
+        let nc = NetCheckConfig::default();
+        assert_eq!(nc.warmup_pings, 1);
+        assert_eq!(nc.max_setup_ms, 2500);
+        assert_eq!(nc.retry_max, 3);
+        assert_eq!(nc.retry_backoff_base_ms, 5000);
+        assert_eq!(nc.breaker_threshold, 3);
+        assert_eq!(nc.cooldown_ms, 60000);
+    }
+
+    #[test]
+    fn netcheck_resilience_parses_from_toml() {
+        let cfg = Config::from_toml_str(
+            "[server.net_check]\nretry_max = 5\ncooldown_ms = 90000\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.server.net_check.retry_max, 5);
+        assert_eq!(cfg.server.net_check.cooldown_ms, 90000);
+        // untouched fields keep defaults
+        assert_eq!(cfg.server.net_check.warmup_pings, 1);
     }
 
     #[test]

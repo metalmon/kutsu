@@ -164,6 +164,18 @@ fn apply_env_overlay(server: &mut ServerConfig, sip: &mut SipConfig) -> anyhow::
         "KUTSU_DOWNLINK_LOSS_ABORT_PCT",
         &mut server.net_check.downlink_loss_abort_pct,
     );
+    over_u32("KUTSU_NETCHECK_WARMUP_PINGS", &mut server.net_check.warmup_pings);
+    over_u32("KUTSU_NETCHECK_MAX_SETUP_MS", &mut server.net_check.max_setup_ms);
+    over_u32("KUTSU_NETCHECK_RETRY_MAX", &mut server.net_check.retry_max);
+    over_u64(
+        "KUTSU_NETCHECK_RETRY_BACKOFF_BASE_MS",
+        &mut server.net_check.retry_backoff_base_ms,
+    );
+    over_u32(
+        "KUTSU_NETCHECK_BREAKER_THRESHOLD",
+        &mut server.net_check.breaker_threshold,
+    );
+    over_u64("KUTSU_NETCHECK_COOLDOWN_MS", &mut server.net_check.cooldown_ms);
 
     // quality.
     over_u32(
