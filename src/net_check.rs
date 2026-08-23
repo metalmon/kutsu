@@ -29,26 +29,39 @@ pub struct NetworkHealth {
     pub rtt_p95_ms: u32,
     pub jitter_ms: u32,
     pub loss_pct: f32,
+    pub connect_ms: u32,
+    pub setup_ms: u32,
 }
 
 impl NetworkHealth {
     pub fn summary(&self) -> String {
         format!(
-            "rtt_p50={}ms rtt_p95={}ms jitter={}ms loss={}%",
-            self.rtt_p50_ms, self.rtt_p95_ms, self.jitter_ms, self.loss_pct
+            "rtt_p50={}ms rtt_p95={}ms jitter={}ms loss={}% connect={}ms setup={}ms",
+            self.rtt_p50_ms, self.rtt_p95_ms, self.jitter_ms, self.loss_pct,
+            self.connect_ms, self.setup_ms
         )
     }
 }
 
 pub fn verdict(h: &NetworkHealth, cfg: &NetCheckConfig) -> Verdict {
+    let setup_bad = cfg.max_setup_ms > 0
+        && h.connect_ms.saturating_add(h.setup_ms) > cfg.max_setup_ms;
     if h.rtt_p95_ms > cfg.max_rtt_ms
         || h.jitter_ms > cfg.max_jitter_ms
         || h.loss_pct > cfg.max_loss_pct
+        || setup_bad
     {
         Verdict::Unusable
     } else {
         Verdict::Ok
     }
+}
+
+/// Exponential backoff (ms) to wait after a failed preflight `attempt` (1-based):
+/// `base * 2^(attempt-1)`. Shift is capped to avoid overflow.
+pub fn retry_backoff_ms(attempt: u32, base_ms: u64) -> u64 {
+    let shift = attempt.saturating_sub(1).min(16);
+    base_ms.saturating_mul(1u64 << shift)
 }
 
 /// Open a real WSS connection to the Gemini endpoint and measure ping/pong RTT.
@@ -62,9 +75,18 @@ pub async fn preflight(server: &ServerConfig, scenario: &ScenarioConfig) -> Resu
         user: p.user.clone(),
         password: p.password.clone(),
     });
+    let connect_started = Instant::now();
     let mut ws = connect_ws(proxy.as_ref(), &url)
         .await
         .map_err(|e| Error::Connect(format!("preflight connect: {e}")))?;
+    let connect_ms = connect_started.elapsed().as_millis() as u32;
+
+    // Warm-up pings: exclude the cold first RTT(s) from the steady-state stats.
+    for i in 0..server.net_check.warmup_pings {
+        let _ = ws.send(Message::Ping(vec![0xff, i as u8])).await;
+        let budget = Duration::from_millis((server.net_check.max_rtt_ms as u64) * 4);
+        let _ = tokio::time::timeout(budget, wait_for_pong(&mut ws)).await;
+    }
 
     let mut rtts: Vec<u32> = Vec::new();
     let mut lost = 0u32;
@@ -88,6 +110,7 @@ pub async fn preflight(server: &ServerConfig, scenario: &ScenarioConfig) -> Resu
     // malformed schema — would pass preflight and then storm reconnects on the
     // live call. Send the exact setup this call will use and require a
     // `setupComplete` before declaring the network usable.
+    let setup_started = Instant::now();
     let setup = crate::gemini_live::build_setup_config(server, scenario);
     ws.send(Message::Text(
         ::gemini_live::wire::build_setup(&setup).to_string(),
@@ -96,9 +119,15 @@ pub async fn preflight(server: &ServerConfig, scenario: &ScenarioConfig) -> Resu
     .map_err(|e| Error::Connect(format!("preflight setup send: {e}")))?;
     let ack_budget = Duration::from_millis((server.net_check.max_rtt_ms as u64 * 4).max(2000));
     let probe = await_setup_ack(&mut ws, ack_budget).await;
+    let setup_ms = setup_started.elapsed().as_millis() as u32;
     let _ = ws.close(None).await;
     match probe {
-        SetupProbe::Ok => Ok(summarize(&mut rtts, lost, n)),
+        SetupProbe::Ok => {
+            let mut health = summarize(&mut rtts, lost, n);
+            health.connect_ms = connect_ms;
+            health.setup_ms = setup_ms;
+            Ok(health)
+        }
         SetupProbe::Rejected(code, reason) => Err(Error::Connect(format!(
             "gemini setup rejected (ws close {code}): {reason}"
         ))),
@@ -188,6 +217,8 @@ fn summarize(rtts: &mut [u32], lost: u32, total: u32) -> NetworkHealth {
             rtt_p95_ms: u32::MAX,
             jitter_ms: u32::MAX,
             loss_pct,
+            connect_ms: 0,
+            setup_ms: 0,
         };
     }
     rtts.sort_unstable();
@@ -200,6 +231,8 @@ fn summarize(rtts: &mut [u32], lost: u32, total: u32) -> NetworkHealth {
         rtt_p95_ms: p(0.95),
         jitter_ms: jitter,
         loss_pct,
+        connect_ms: 0,
+        setup_ms: 0,
     }
 }
 
@@ -216,6 +249,8 @@ mod tests {
             rtt_p95_ms: 120,
             jitter_ms: 15,
             loss_pct: 0.0,
+            connect_ms: 0,
+            setup_ms: 0,
         };
         assert!(matches!(verdict(&good, &cfg), Verdict::Ok));
 
@@ -236,6 +271,44 @@ mod tests {
             ..good
         };
         assert!(matches!(verdict(&jittery, &cfg), Verdict::Unusable));
+    }
+
+    #[test]
+    fn verdict_fails_on_high_setup_cost() {
+        let cfg = NetCheckConfig::default(); // max_setup_ms = 2500
+        let base = NetworkHealth {
+            rtt_p50_ms: 40,
+            rtt_p95_ms: 120,
+            jitter_ms: 15,
+            loss_pct: 0.0,
+            connect_ms: 1500,
+            setup_ms: 1500, // sum 3000 > 2500
+        };
+        assert!(matches!(verdict(&base, &cfg), Verdict::Unusable));
+    }
+
+    #[test]
+    fn verdict_setup_gate_disabled_when_zero() {
+        let cfg = NetCheckConfig {
+            max_setup_ms: 0,
+            ..NetCheckConfig::default()
+        };
+        let h = NetworkHealth {
+            rtt_p50_ms: 40,
+            rtt_p95_ms: 120,
+            jitter_ms: 15,
+            loss_pct: 0.0,
+            connect_ms: 9000,
+            setup_ms: 9000,
+        };
+        assert!(matches!(verdict(&h, &cfg), Verdict::Ok));
+    }
+
+    #[test]
+    fn backoff_is_exponential() {
+        assert_eq!(retry_backoff_ms(1, 5000), 5000);
+        assert_eq!(retry_backoff_ms(2, 5000), 10000);
+        assert_eq!(retry_backoff_ms(3, 5000), 20000);
     }
 
     #[test]
@@ -294,9 +367,13 @@ mod tests {
             rtt_p95_ms: 120,
             jitter_ms: 15,
             loss_pct: 1.5,
+            connect_ms: 200,
+            setup_ms: 300,
         };
         let s = h.summary();
         assert!(s.contains("rtt_p95=120ms"));
         assert!(s.contains("loss=1.5%"));
+        assert!(s.contains("connect=200ms"));
+        assert!(s.contains("setup=300ms"));
     }
 }
