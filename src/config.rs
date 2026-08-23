@@ -268,6 +268,13 @@ pub fn augment_goal_schema(schema: &serde_json::Value) -> serde_json::Value {
     let Some(obj) = s.as_object_mut() else {
         return s;
     };
+    // A top-level `amd` property makes this an OBJECT schema. Gemini's setup
+    // validation rejects `properties` on a schema whose type is not OBJECT
+    // (WS close 1007: "parameters.properties: only allowed for OBJECT type"),
+    // so guarantee `type: object` even when the caller passed a bare `{}` (the
+    // CLI default_scenario) or a schema with properties but no explicit type.
+    obj.entry("type")
+        .or_insert_with(|| serde_json::json!("object"));
     let props = obj
         .entry("properties")
         .or_insert_with(|| serde_json::json!({}));
@@ -807,6 +814,23 @@ mod tests {
     fn augment_goal_schema_leaves_non_object_unchanged() {
         let s = serde_json::json!("not an object");
         assert_eq!(augment_goal_schema(&s), s);
+    }
+
+    #[test]
+    fn augment_goal_schema_forces_object_type() {
+        // Gemini's setup validation rejects `properties` on a schema whose type
+        // is not OBJECT (WS close 1007: "parameters.properties: only allowed
+        // for OBJECT type"). augment always adds `properties`, so it MUST also
+        // guarantee `type: object` — including for a bare `{}` (the CLI's
+        // default_scenario) and a schema that had properties but no type.
+        let aug = augment_goal_schema(&serde_json::json!({}));
+        assert_eq!(aug["type"], "object");
+        assert!(aug["properties"]["amd"].is_object());
+
+        let aug2 = augment_goal_schema(&serde_json::json!({
+            "properties": { "name": { "type": "string" } }
+        }));
+        assert_eq!(aug2["type"], "object");
     }
 
     #[test]

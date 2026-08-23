@@ -216,12 +216,15 @@ fn apply_env_overlay(server: &mut ServerConfig, sip: &mut SipConfig) -> anyhow::
     Ok(())
 }
 
-/// A minimal valid scenario for the CLI: an empty goal schema and no context.
-/// The persona/base prompt comes from the config (`[server.prompts]` /
-/// `KUTSU_SYSTEM_PROMPT`), not from here.
+/// A minimal valid scenario for the CLI: an empty object goal schema and no
+/// context. The schema MUST be typed `object` — Gemini's setup validation
+/// rejects a function-parameters schema that carries `properties` (which
+/// [`augment_goal_schema`](crate::config::augment_goal_schema) always adds)
+/// unless its type is OBJECT. The persona/base prompt comes from the config
+/// (`[server.prompts]` / `KUTSU_SYSTEM_PROMPT`), not from here.
 pub fn default_scenario() -> ScenarioConfig {
     ScenarioConfig {
-        goal_schema: serde_json::json!({}),
+        goal_schema: serde_json::json!({ "type": "object" }),
         context: None,
         prompt_override: None,
     }
