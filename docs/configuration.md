@@ -63,6 +63,8 @@ language = "en-US"              # BCP-47
 max_concurrent_channels = 3
 greet_after_silence_ms = 1000
 max_call_secs = 600
+dead_air_nudge_ms = 25000
+wrap_up_grace_ms = 15000
 # transcript_dir = "./transcripts"
 # dump_uplink_dir = "./uplink-dump"
 # dump_downlink_dir = "./downlink-dump"
@@ -125,6 +127,8 @@ register = false
 | `max_concurrent_channels` | `3` | Simultaneous calls; extras queue. `0` queues everything forever (never dials). |
 | `greet_after_silence_ms` | `1000` | Silence window after answer before the agent greets first. `0` = purely reactive. |
 | `max_call_secs` | `600` | Hard cap on one call's duration. |
+| `dead_air_nudge_ms` | `25000` | Silence on the line after which the model is nudged (via `prompts.end_call_cue`) to wrap up. |
+| `wrap_up_grace_ms` | `15000` | After the dead-air nudge fires, how long the model gets to call `end_call` before the call is force-ended. |
 | `mcp_poll_interval_ms` | `5000` | Base `pollIntervalMs` hint for `place_call` MCP tasks; adapted up at creation when the call is queued behind busy channels. |
 | `mcp_poll_interval_max_ms` | `30000` | Cap for the adapted task poll interval. |
 | `transcript_dir` | *(none)* | Directory for finalized per-call `CallRecord` JSON. |
@@ -195,6 +199,7 @@ All prompt text. Every key has an English-only default; see
 | `goal_preamble` | — |
 | `closing` | — |
 | `greet_cue` | `KUTSU_GREET_CUE` |
+| `end_call_cue` | `KUTSU_END_CALL_CUE` |
 | `resume_cue` | `KUTSU_RESUME_CUE` |
 | `gender_female` / `gender_male` | — |
 | `language_template` | — |
@@ -229,6 +234,8 @@ variables that are set take effect, so the file/default shows through otherwise.
 | `KUTSU_MAX_CONCURRENT_CHANNELS` | `server.max_concurrent_channels` |
 | `KUTSU_GREET_AFTER_SILENCE_MS` | `server.greet_after_silence_ms` |
 | `KUTSU_MAX_CALL_SECS` | `server.max_call_secs` |
+| `KUTSU_DEAD_AIR_NUDGE_MS` | `server.dead_air_nudge_ms` |
+| `KUTSU_WRAP_UP_GRACE_MS` | `server.wrap_up_grace_ms` |
 | `KUTSU_MCP_POLL_INTERVAL_MS` | `server.mcp_poll_interval_ms` |
 | `KUTSU_MCP_POLL_INTERVAL_MAX_MS` | `server.mcp_poll_interval_max_ms` |
 | `KUTSU_TRANSCRIPT_DIR` | `server.transcript_dir` |
@@ -255,6 +262,7 @@ variables that are set take effect, so the file/default shows through otherwise.
 | `KUTSU_AGC_NOISE_FLOOR_RMS` | `server.agc.noise_floor_rms` |
 | `KUTSU_SYSTEM_PROMPT` | `server.prompts.base_system_prompt` |
 | `KUTSU_GREET_CUE` | `server.prompts.greet_cue` |
+| `KUTSU_END_CALL_CUE` | `server.prompts.end_call_cue` |
 | `KUTSU_RESUME_CUE` | `server.prompts.resume_cue` |
 | `KUTSU_SIP_SERVER` | `sip.server` |
 | `KUTSU_SIP_USER` | `sip.username` |

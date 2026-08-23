@@ -184,6 +184,12 @@ pub struct ServerConfig {
     pub dump_downlink_dir: Option<PathBuf>,
     /// Safety cap on a single call's duration (seconds).
     pub max_call_secs: u64,
+    /// Silence on the line (no speech from either party) after which the model
+    /// is nudged with `prompts.end_call_cue` to wrap up (ms).
+    pub dead_air_nudge_ms: u64,
+    /// After the dead-air nudge fires, how long the model gets to call
+    /// `end_call` before the call is force-ended (ms).
+    pub wrap_up_grace_ms: u64,
     /// Base suggested polling interval (ms) returned to task-capable MCP clients
     /// for `place_call` tasks (the `pollIntervalMs` hint). Adapted up at task
     /// creation when the call is queued behind busy channels, capped by
@@ -220,6 +226,8 @@ impl Default for ServerConfig {
             dump_uplink_dir: None,
             dump_downlink_dir: None,
             max_call_secs: 600,
+            dead_air_nudge_ms: 25_000,
+            wrap_up_grace_ms: 15_000,
             mcp_poll_interval_ms: 5_000,
             mcp_poll_interval_max_ms: 30_000,
             quality: QualityConfig::default(),
@@ -552,6 +560,13 @@ pub const CLOSING_INSTRUCTION: &str = "\n\n# Ending the call\n\
 pub const GREET_CUE: &str = "The call has connected and the other party has not \
     spoken yet. Greet them now and begin the conversation as instructed.";
 
+/// Default cue handed to the model when the line has gone quiet for
+/// `dead_air_nudge_ms`, nudging it toward wrapping up via `end_call`. English by
+/// repo convention; operators override it in `[server.prompts]` or via
+/// `KUTSU_END_CALL_CUE`.
+pub const END_CALL_CUE: &str = "The line has gone quiet. If the conversation is \
+    finished, wrap up now and submit the result by calling the end_call tool.";
+
 /// Voice-gender directive for a female voice. English by repo convention and
 /// deliberately language-neutral: operators add language-specific examples (e.g.
 /// gendered verb endings) in their own `[server.prompts]` override.
@@ -612,6 +627,9 @@ pub struct PromptsConfig {
     pub closing: String,
     /// Cue handed to the model to greet a silent callee.
     pub greet_cue: String,
+    /// Cue handed to the model when the line has gone quiet for
+    /// `dead_air_nudge_ms`, nudging it to wrap up via `end_call`.
+    pub end_call_cue: String,
     /// Instruction sent to the model when a session reconnects with lost context.
     pub resume_cue: String,
     /// Voice directive for a female voice.
@@ -631,6 +649,7 @@ impl Default for PromptsConfig {
             goal_preamble: GOAL_PREAMBLE.into(),
             closing: CLOSING_INSTRUCTION.into(),
             greet_cue: GREET_CUE.into(),
+            end_call_cue: END_CALL_CUE.into(),
             resume_cue: RESUME_CUE.into(),
             gender_female: GENDER_FEMALE.into(),
             gender_male: GENDER_MALE.into(),
@@ -776,6 +795,14 @@ mod tests {
         assert_eq!(q.prebuffer_ms, 800);
         assert_eq!(q.resume_ms, 400);
         assert_eq!(q.abort_underruns, 40);
+    }
+
+    #[test]
+    fn wrapup_defaults() {
+        let s = ServerConfig::default();
+        assert_eq!(s.dead_air_nudge_ms, 25_000);
+        assert_eq!(s.wrap_up_grace_ms, 15_000);
+        assert!(!PromptsConfig::default().end_call_cue.is_empty());
     }
 
     #[test]

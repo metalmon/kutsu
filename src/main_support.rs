@@ -127,6 +127,8 @@ fn apply_env_overlay(server: &mut ServerConfig, sip: &mut SipConfig) -> anyhow::
         &mut server.greet_after_silence_ms,
     );
     over_u64("KUTSU_MAX_CALL_SECS", &mut server.max_call_secs);
+    over_u64("KUTSU_DEAD_AIR_NUDGE_MS", &mut server.dead_air_nudge_ms);
+    over_u64("KUTSU_WRAP_UP_GRACE_MS", &mut server.wrap_up_grace_ms);
     over_u64(
         "KUTSU_MCP_POLL_INTERVAL_MS",
         &mut server.mcp_poll_interval_ms,
@@ -202,6 +204,7 @@ fn apply_env_overlay(server: &mut ServerConfig, sip: &mut SipConfig) -> anyhow::
         &mut server.prompts.base_system_prompt,
     );
     over_str("KUTSU_GREET_CUE", &mut server.prompts.greet_cue);
+    over_str("KUTSU_END_CALL_CUE", &mut server.prompts.end_call_cue);
     over_str("KUTSU_RESUME_CUE", &mut server.prompts.resume_cue);
 
     // SIP (password is a secret; the rest may come from TOML or env).

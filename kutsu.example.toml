@@ -41,6 +41,14 @@ greet_after_silence_ms = 1000
 # Safety cap on a single call's duration, seconds.
 max_call_secs = 600
 
+# Silence on the line (neither party speaking) after which the model is
+# nudged via prompts.end_call_cue to wrap up, ms.
+dead_air_nudge_ms = 25000
+
+# After the dead-air nudge fires, how long the model gets to call end_call
+# before the call is force-ended, ms.
+wrap_up_grace_ms = 15000
+
 # Base pollIntervalMs hint returned to task-capable MCP clients for place_call
 # tasks; adapted up at creation when the call is queued behind busy channels,
 # capped by mcp_poll_interval_max_ms.
@@ -122,6 +130,10 @@ noise_floor_rms = 200.0 # below this a frame is silence/noise; gain is held
 
 # Cue handed to the model to greet a silent callee (KUTSU_GREET_CUE).
 # greet_cue = "The call has connected and the other party has not spoken yet. Greet them now and begin the conversation as instructed."
+
+# Cue handed to the model when the line has gone quiet for dead_air_nudge_ms,
+# nudging it to wrap up via end_call (KUTSU_END_CALL_CUE).
+# end_call_cue = "The line has gone quiet. If the conversation is finished, wrap up now and submit the result by calling the end_call tool."
 
 # Instruction sent when a session reconnects with lost context (KUTSU_RESUME_CUE).
 # resume_cue = "The connection dropped briefly ..."

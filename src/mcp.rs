@@ -449,6 +449,8 @@ mod tests {
             dump_uplink_dir: None,
             dump_downlink_dir: None,
             max_call_secs: 600,
+            dead_air_nudge_ms: 25_000,
+            wrap_up_grace_ms: 15_000,
             mcp_poll_interval_ms: 5000,
             mcp_poll_interval_max_ms: 30000,
             quality: crate::config::QualityConfig::default(),
