@@ -73,7 +73,7 @@ pub fn preflight_max_window_ms(nc: &NetCheckConfig) -> u64 {
     let attempts = nc.retry_max.max(1) as u64;
     let backoff_total: u64 = (1..attempts)
         .map(|i| retry_backoff_ms(i as u32, nc.retry_backoff_base_ms))
-        .sum();
+        .fold(0u64, u64::saturating_add);
     let ping_budget = (nc.max_rtt_ms as u64).saturating_mul(4);
     let pings = (nc.samples.saturating_add(nc.warmup_pings)) as u64;
     let ack_budget = ping_budget.max(2000);
