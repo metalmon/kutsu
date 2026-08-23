@@ -301,9 +301,7 @@ impl KutsuServer {
         Ok(CallToolResponse::Task(CreateTaskResult::new(task)))
     }
 
-    #[tool(
-        description = "Get the current state of a call by call_id (lightweight; no transcript)."
-    )]
+    #[tool(description = "Get a call's current state, disposition, and filled goal by call_id.")]
     async fn get_call_status(
         &self,
         Parameters(a): Parameters<CallIdArgs>,
@@ -319,6 +317,7 @@ impl KutsuServer {
             "started_ms": rec.started_ms, "ended_ms": rec.ended_ms,
             "error": rec.error, "queued_position": pos, "quality": rec.quality,
             "disposition": rec.disposition,
+            "goal": rec.goal,
             "server_time_unix": crate::engine::now_ms(),
         });
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -531,6 +530,7 @@ mod tests {
         let status_json = serde_json::from_str::<serde_json::Value>(&first_text(&status)).unwrap();
         assert_eq!(status_json["call_id"], call_id);
         assert!(status_json.get("state").is_some());
+        assert!(status_json.get("goal").is_some());
 
         let tr = srv
             .get_call_transcript(Parameters(CallIdArgs {
