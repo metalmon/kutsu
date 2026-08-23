@@ -188,7 +188,10 @@ pub struct ServerConfig {
     /// is nudged with `prompts.end_call_cue` to wrap up (ms).
     pub dead_air_nudge_ms: u64,
     /// After the dead-air nudge fires, how long the model gets to call
-    /// `end_call` before the call is force-ended (ms).
+    /// `end_call` before the call is force-ended (ms); also the grace window
+    /// given to a late `end_call` after the callee hangs up abruptly. `0`
+    /// disables wrap-up entirely (both the dead-air nudge and the
+    /// abrupt-hangup harvest).
     pub wrap_up_grace_ms: u64,
     /// Base suggested polling interval (ms) returned to task-capable MCP clients
     /// for `place_call` tasks (the `pollIntervalMs` hint). Adapted up at task

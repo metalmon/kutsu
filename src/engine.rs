@@ -1058,7 +1058,11 @@ async fn run_call(
     // Dead-air wrap-up watchdog: nudges the model toward `end_call` after a
     // stretch of silence, then finalizes if it doesn't respond in time.
     // `dead_air_nudge_ms == 0` disables it entirely (never nudge/finalize).
-    let wrap_up_enabled = server.dead_air_nudge_ms > 0;
+    // Grace is intrinsic to wrap-up (the nudge is pointless without time to
+    // respond to it), so `wrap_up_grace_ms == 0` disables the whole feature
+    // too -- both Stage A here and Stage B harvest (which separately checks
+    // `server.wrap_up_grace_ms > 0` at hangup time).
+    let wrap_up_enabled = server.dead_air_nudge_ms > 0 && server.wrap_up_grace_ms > 0;
     let mut wrap_up = WrapUpState::new(server.dead_air_nudge_ms, server.wrap_up_grace_ms);
     wrap_up.on_activity(now_ms());
     // Rolling window of cumulative (uplink_received, uplink_lost) snapshots, one
@@ -1077,15 +1081,16 @@ async fn run_call(
     // late `EndCall` and finalize. `None` until then so the arm below never
     // fires early (guarded on `is_some()`).
     let mut harvest_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
-    // Fuse both hangup sources so a second signal (or a closed channel
-    // returning instantly) can never be polled/matched again once consumed --
-    // otherwise, once harvesting stops the loop from `break`ing on hangup, a
-    // closed `sip_events` (or an already-resolved `bridge_done_rx`) would be
-    // re-selected every iteration with nothing to yield on, busy-spinning the
-    // task for the rest of the grace window. Mirrors the `uplink_running`
-    // fuse pattern in `bridge::run`.
+    // Fuse `sip_events` so a second signal (or a now-closed channel, which
+    // yields `None` instantly forever) can never be polled/matched again
+    // once consumed -- otherwise, once harvesting stops this arm from
+    // `break`ing on hangup, a closed `sip_events` would be re-selected every
+    // iteration with nothing to yield on, busy-spinning the task for the
+    // rest of the grace window. Mirrors the `uplink_running` fuse pattern in
+    // `bridge::run`. `bridge_done_rx` needs no such fuse: every arm of its
+    // match now unconditionally `break`s the loop, so it is never polled a
+    // second time.
     let mut sip_open = true;
-    let mut bridge_done_open = true;
     let end_state = loop {
         tokio::select! {
             ev = events_out_rx.recv(), if events_open => match ev {
@@ -1144,30 +1149,19 @@ async fn run_call(
                     Some(_) => {}
                 }
             },
-            r = &mut bridge_done_rx, if bridge_done_open => {
-                bridge_done_open = false; // fuse: don't re-poll a resolved oneshot
+            r = &mut bridge_done_rx => {
                 match r {
                     Ok(crate::bridge::BridgeEnd::PhoneClosed) => {
-                        if !harvesting {
-                            let eligible = server.wrap_up_grace_ms > 0
-                                && harvest_eligible(
-                                    store.get(&call_id).map(|r| r.transcript.len()).unwrap_or(0),
-                                    goal.is_some(),
-                                );
-                            if eligible {
-                                harvesting = true;
-                                gemini_handle.send_client_text(&server.prompts.end_call_cue).await;
-                                harvest_deadline = Some(Box::pin(tokio::time::sleep(
-                                    Duration::from_millis(server.wrap_up_grace_ms),
-                                )));
-                            } else {
-                                break LoopEnd::HungUp;
-                            }
-                        }
-                        // else: already harvesting via the other hangup arm --
-                        // the bridge's own grace window closing is redundant
-                        // with ours; let our `harvest_deadline` (or a late
-                        // `EndCall`/`GeminiClosed`) decide when to stop.
+                        // Harvest is entered ONLY from the sip_events arm
+                        // (the sole entry point -- see its comment). By the
+                        // time the bridge itself reports PhoneClosed, either
+                        // we're already harvesting (the bridge's own grace
+                        // window has now elapsed too, so the harvest is
+                        // over -- resolves Completed, transcript exists), or
+                        // we never started harvesting (ineligible, or this
+                        // signal simply arrived before sip_events did) and
+                        // this is a plain hang-up.
+                        break if harvesting { LoopEnd::Completed } else { LoopEnd::HungUp };
                     }
                     Ok(crate::bridge::BridgeEnd::GeminiClosed) => {
                         // During harvest the transcript already exists, so
@@ -1244,8 +1238,11 @@ async fn run_call(
                 // silence stretch, then give up and finalize if it doesn't
                 // respond within the grace period. `Event::EndCall` (above)
                 // is the happy path — this is the fallback for a model that
-                // goes silent instead of hanging up cleanly.
-                if wrap_up_enabled {
+                // goes silent instead of hanging up cleanly. Gated on
+                // `!harvesting`: once Stage-B harvest is underway (phone
+                // already gone, cue already injected there), this Stage-A
+                // watchdog must not also fire and inject a second cue.
+                if wrap_up_enabled && !harvesting {
                     match wrap_up.phase(now_ms()) {
                         WrapPhase::Nudge => {
                             mute_downlink_ctrl.store(true, Ordering::Relaxed);

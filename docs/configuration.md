@@ -128,7 +128,7 @@ register = false
 | `greet_after_silence_ms` | `1000` | Silence window after answer before the agent greets first. `0` = purely reactive. |
 | `max_call_secs` | `600` | Hard cap on one call's duration. |
 | `dead_air_nudge_ms` | `25000` | Silence on the line after which the model is nudged (via `prompts.end_call_cue`) to wrap up. |
-| `wrap_up_grace_ms` | `15000` | After the dead-air nudge fires, how long the model gets to call `end_call` before the call is force-ended. |
+| `wrap_up_grace_ms` | `15000` | After the dead-air nudge fires, how long the model gets to call `end_call` before the call is force-ended; also the grace window given to a late `end_call` after the callee hangs up abruptly. `0` disables wrap-up entirely (both the dead-air nudge and the abrupt-hangup harvest). |
 | `mcp_poll_interval_ms` | `5000` | Base `pollIntervalMs` hint for `place_call` MCP tasks; adapted up at creation when the call is queued behind busy channels. |
 | `mcp_poll_interval_max_ms` | `30000` | Cap for the adapted task poll interval. |
 | `transcript_dir` | *(none)* | Directory for finalized per-call `CallRecord` JSON. |
