@@ -122,9 +122,11 @@ impl WrapUpState {
 
     /// Record activity (transcript/turn-complete) at `now_ms`, clearing any
     /// pending wrap-up so a resumed conversation doesn't get finalized.
-    fn on_activity(&mut self, now_ms: u64) {
+    /// Returns whether it cleared an active nudge (i.e. a `Nudge` had fired
+    /// and the downlink was muted) — the caller un-mutes on `true`.
+    fn on_activity(&mut self, now_ms: u64) -> bool {
         self.last_activity_ms = now_ms;
-        self.nudged_at_ms = None;
+        self.nudged_at_ms.take().is_some()
     }
 
     /// What should happen at `now_ms`? See `WrapPhase` for the transitions.
@@ -1053,7 +1055,9 @@ async fn run_call(
                 // is the first Transcript (a proxy for greeting time — true audio-onset
                 // timing would need a bridge-level stamp, deferred).
                 Some(Event::Transcript { role, text, final_ }) => {
-                    wrap_up.on_activity(now_ms());
+                    if wrap_up.on_activity(now_ms()) {
+                        mute_downlink_ctrl.store(false, Ordering::Relaxed);
+                    }
                     if !first_transcript {
                         first_transcript = true;
                         tracing::info!(%call_id, first_transcript_after_answer_ms = now_ms() - answered_at, "first transcript after answer");
@@ -1063,7 +1067,11 @@ async fn run_call(
                     }
                 }
                 Some(Event::EndCall { goal: g }) => { goal = Some(g); break LoopEnd::Completed; }
-                Some(Event::TurnComplete) => { wrap_up.on_activity(now_ms()); }
+                Some(Event::TurnComplete) => {
+                    if wrap_up.on_activity(now_ms()) {
+                        mute_downlink_ctrl.store(false, Ordering::Relaxed);
+                    }
+                }
                 Some(Event::Affect { role, label }) => {
                     store.append_affect(&call_id, crate::gemini_live::AffectEntry { role, label, ts_ms: now_ms() });
                 }
@@ -1311,12 +1319,13 @@ mod tests {
     #[test]
     fn wrapup_state_nudges_then_finalizes() {
         let mut w = WrapUpState::new(25_000, 15_000);
-        w.on_activity(0);
+        assert!(!w.on_activity(0)); // plain reset, no pending nudge -> false
         assert!(matches!(w.phase(10_000), WrapPhase::Idle)); // silence < nudge
         assert!(matches!(w.phase(25_000), WrapPhase::Nudge)); // nudge once
         assert!(matches!(w.phase(30_000), WrapPhase::Idle)); // already nudged, within grace
         assert!(matches!(w.phase(40_000), WrapPhase::Finalize)); // nudge + grace elapsed
-        w.on_activity(41_000); // activity clears wrap-up
+        // activity cancels the active nudge -> true, so the caller un-mutes
+        assert!(w.on_activity(41_000));
         assert!(matches!(w.phase(50_000), WrapPhase::Idle));
     }
 
