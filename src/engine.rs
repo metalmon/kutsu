@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Notify, mpsc, oneshot};
 
+use crate::breaker::{Breaker, Decision};
 use crate::bridge::{self, BridgePorts};
 use crate::config::{QualityConfig, ScenarioConfig, ServerConfig, SipConfig};
 use crate::gemini_live::{self, EndedBy, Event, TranscriptEntry};
@@ -339,6 +340,10 @@ pub struct Engine {
     /// enqueue a call; also cloned into every `run_call` task so Task 8's
     /// busy-retry can requeue without needing `&Engine`.
     enqueuer: Enqueuer,
+    /// Held for future engine-level use (e.g. metrics); the dispatcher and
+    /// every `run_call` task operate on their own `Arc` clone of this.
+    #[allow(dead_code)]
+    breaker: Arc<Breaker>,
     /// The central dispatcher task; aborted on `shutdown`.
     dispatcher: tokio::task::JoinHandle<()>,
 }
@@ -352,6 +357,11 @@ impl Engine {
             Arc::new(Mutex::new(Box::new(MemQueue::new())));
         let running = Arc::new(AtomicUsize::new(0));
         let wake = Arc::new(Notify::new());
+        let breaker = Arc::new(Breaker::new(
+            server.net_check.breaker_threshold,
+            server.net_check.cooldown_ms,
+            wake.clone(),
+        ));
         let cancels = Arc::new(Mutex::new(HashMap::new()));
         let counters = Arc::new(Counters::default());
         let seq = Arc::new(AtomicUsize::new(0));
@@ -372,6 +382,7 @@ impl Engine {
             cancels.clone(),
             counters.clone(),
             enqueuer.clone(),
+            breaker.clone(),
         ));
         Ok(Self {
             sip,
@@ -382,6 +393,7 @@ impl Engine {
             cancels,
             counters,
             enqueuer,
+            breaker,
             dispatcher,
         })
     }
@@ -540,17 +552,28 @@ async fn dispatcher(
     cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     counters: Arc<Counters>,
     enqueuer: Enqueuer,
+    breaker: Arc<Breaker>,
 ) {
     let cap = server.max_concurrent_channels;
     loop {
-        // Drain every currently-eligible entry until the cap is hit or nothing
-        // is eligible. Each iteration takes the queue lock only briefly.
+        let mut breaker_hold: Option<u64> = None;
+        // Drain eligible entries until the cap is hit, nothing is eligible, or
+        // the breaker holds the queue.
         loop {
             let mut q = queue.lock().unwrap();
             if running.load(Ordering::Relaxed) >= cap {
                 break;
             }
-            let entry = match q.pop_eligible(now_ms()) {
+            let now = now_ms();
+            let probe = match breaker.decision(now) {
+                Decision::Dispatch => false,
+                Decision::Probe => true,
+                Decision::Hold(until) => {
+                    breaker_hold = Some(until);
+                    break;
+                }
+            };
+            let entry = match q.pop_eligible(now) {
                 Some(e) => e,
                 None => break,
             };
@@ -572,6 +595,9 @@ async fn dispatcher(
             };
             drop(q);
 
+            if probe {
+                breaker.mark_probe_dispatched(now);
+            }
             store.set_state(&entry.call_id, CallState::Ringing);
 
             let sip = sip.clone();
@@ -580,6 +606,7 @@ async fn dispatcher(
             let cancels = cancels.clone();
             let counters = counters.clone();
             let enqueuer = enqueuer.clone();
+            let breaker = breaker.clone();
             let PendingEntry {
                 call_id,
                 number,
@@ -590,20 +617,25 @@ async fn dispatcher(
             tokio::spawn(async move {
                 let _slot = slot; // released (decrement + wake) on task exit / panic
                 run_call(
-                    sip, store, server, cancels, counters, enqueuer, cancel_rx, scenario, number,
-                    call_id, attempt,
+                    sip, store, server, cancels, counters, enqueuer, breaker, cancel_rx,
+                    scenario, number, call_id, attempt,
                 )
                 .await;
             });
         }
 
-        // Nothing more to dispatch right now. Park until woken (a new enqueue
-        // or a freed slot) or — if we have spare capacity and a future-eligible
-        // entry exists — until that entry becomes eligible.
-        let sleep_until = if running.load(Ordering::Relaxed) < cap {
+        // Park until woken, or until the soonest of {next eligibility, breaker
+        // cooldown expiry}.
+        let next_elig = if running.load(Ordering::Relaxed) < cap {
             queue.lock().unwrap().peek_next_eligible_at()
         } else {
             None
+        };
+        let sleep_until = match (next_elig, breaker_hold) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
         };
         match sleep_until {
             Some(t) => {
@@ -787,6 +819,7 @@ async fn run_call(
     cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     counters: Arc<Counters>,
     enqueuer: Enqueuer,
+    breaker: Arc<Breaker>,
     mut cancel_rx: oneshot::Receiver<()>,
     scenario: ScenarioConfig,
     number: String,
@@ -810,6 +843,7 @@ async fn run_call(
                 let v = crate::net_check::verdict(&health, &server.net_check);
                 tracing::info!(%call_id, health = %health.summary(), verdict = ?v, "network preflight");
                 if v == crate::net_check::Verdict::Unusable {
+                    breaker.on_result(false, now_ms());
                     finalize_call(
                         &store,
                         &counters,
@@ -824,8 +858,10 @@ async fn run_call(
                     );
                     return;
                 }
+                breaker.on_result(true, now_ms());
             }
             Err(e) => {
+                breaker.on_result(false, now_ms());
                 finalize_call(
                     &store,
                     &counters,

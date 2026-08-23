@@ -12,6 +12,7 @@
 
 pub mod amd;
 pub mod audio_file;
+pub mod breaker;
 pub mod bridge;
 pub mod config;
 pub mod engine;
