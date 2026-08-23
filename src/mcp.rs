@@ -120,6 +120,74 @@ async fn watch_call_to_terminal(engine: &Engine, call_id: &str) -> crate::state:
     }
 }
 
+/// Map a finished call's record to the MCP task result: `Ok` with the collected
+/// data for answered calls (`Completed`, or an answering-machine disposition
+/// which still carries a transcript/goal — the "always return a result"
+/// thesis), `Err` for cancellation and technical/dial failures. Pure, so the
+/// disposition → task-result mapping is unit-testable without the task plumbing.
+fn task_result_for(rec: Option<crate::state::CallRecord>) -> Result<CallToolResult, TaskExit> {
+    use crate::state::Disposition;
+    match rec.as_ref().and_then(|r| r.disposition) {
+        Some(Disposition::Completed) => {
+            let server_time_unix = crate::engine::now_ms();
+            let body = rec
+                .map(|r| {
+                    serde_json::json!({
+                        "transcript": r.transcript, "goal": r.goal,
+                        "server_time_unix": server_time_unix,
+                    })
+                })
+                .unwrap_or_else(|| serde_json::json!({ "server_time_unix": server_time_unix }));
+            Ok(CallToolResult::success(vec![ContentBlock::text(
+                body.to_string(),
+            )]))
+        }
+        d @ Some(
+            Disposition::Voicemail
+            | Disposition::Announcement
+            | Disposition::Ivr
+            | Disposition::Hold,
+        ) => {
+            let server_time_unix = crate::engine::now_ms();
+            let body = rec
+                .map(|r| {
+                    serde_json::json!({
+                        "disposition": d, "transcript": r.transcript,
+                        "goal": r.goal, "server_time_unix": server_time_unix,
+                    })
+                })
+                .unwrap_or_else(
+                    || serde_json::json!({ "disposition": d, "server_time_unix": server_time_unix }),
+                );
+            Ok(CallToolResult::success(vec![ContentBlock::text(
+                body.to_string(),
+            )]))
+        }
+        Some(Disposition::Cancelled) => Err(TaskExit::Cancelled),
+        // Everything else is a technical/dial failure (Failed, Busy, NoAnswer,
+        // Rejected, NotFound, Unavailable).
+        Some(d) => {
+            let msg = rec
+                .as_ref()
+                .and_then(|r| r.error.clone())
+                .unwrap_or_else(|| {
+                    let name = serde_json::to_value(d)
+                        .ok()
+                        .and_then(|v| v.as_str().map(String::from))
+                        .unwrap_or_else(|| "failed".to_string());
+                    format!("call ended: {name}")
+                });
+            Err(TaskExit::Error(ErrorData::internal_error(msg, None)))
+        }
+        // watch_call_to_terminal only returns once Ended, which always carries a
+        // disposition.
+        None => Err(TaskExit::Error(ErrorData::internal_error(
+            "call ended with no disposition".to_string(),
+            None,
+        ))),
+    }
+}
+
 #[tool_router]
 impl KutsuServer {
     pub fn new(engine: Arc<Engine>) -> Self {
@@ -235,70 +303,7 @@ impl KutsuServer {
                     }
                 }
 
-                use crate::state::Disposition;
-                let rec = engine.store().get(&cid);
-                match rec.as_ref().and_then(|r| r.disposition) {
-                    Some(Disposition::Completed) => {
-                        let server_time_unix = crate::engine::now_ms();
-                        let body = rec
-                            .map(|r| {
-                                serde_json::json!({
-                                    "transcript": r.transcript, "goal": r.goal,
-                                    "server_time_unix": server_time_unix,
-                                })
-                            })
-                            .unwrap_or_else(
-                                || serde_json::json!({ "server_time_unix": server_time_unix }),
-                            );
-                        Ok(CallToolResult::success(vec![ContentBlock::text(
-                            body.to_string(),
-                        )]))
-                    }
-                    // Answered calls that ended up talking to a machine/queue
-                    // rather than a human still carry a transcript/goal and
-                    // are a legitimate result, not a failure: the feature's
-                    // thesis is "always return a result" for answered calls.
-                    d @ Some(
-                        Disposition::Voicemail
-                        | Disposition::Announcement
-                        | Disposition::Ivr
-                        | Disposition::Hold,
-                    ) => {
-                        let server_time_unix = crate::engine::now_ms();
-                        let body = rec
-                            .map(|r| {
-                                serde_json::json!({
-                                    "disposition": d, "transcript": r.transcript,
-                                    "goal": r.goal, "server_time_unix": server_time_unix,
-                                })
-                            })
-                            .unwrap_or_else(
-                                || serde_json::json!({ "disposition": d, "server_time_unix": server_time_unix }),
-                            );
-                        Ok(CallToolResult::success(vec![ContentBlock::text(
-                            body.to_string(),
-                        )]))
-                    }
-                    Some(Disposition::Cancelled) => Err(TaskExit::Cancelled),
-                    // Everything else is a technical/dial failure (Failed,
-                    // Busy, NoAnswer, Rejected, NotFound, Unavailable).
-                    Some(d) => {
-                        let msg = rec.as_ref().and_then(|r| r.error.clone()).unwrap_or_else(|| {
-                            let name = serde_json::to_value(d)
-                                .ok()
-                                .and_then(|v| v.as_str().map(String::from))
-                                .unwrap_or_else(|| "failed".to_string());
-                            format!("call ended: {name}")
-                        });
-                        Err(TaskExit::Error(ErrorData::internal_error(msg, None)))
-                    }
-                    // watch_call_to_terminal only returns once Ended, which
-                    // always carries a disposition.
-                    None => Err(TaskExit::Error(ErrorData::internal_error(
-                        "call ended with no disposition".to_string(),
-                        None,
-                    ))),
-                }
+                task_result_for(engine.store().get(&cid))
             })
         });
         Ok(CallToolResponse::Task(CreateTaskResult::new(task)))
@@ -636,6 +641,89 @@ mod tests {
         assert!(!is_terminal_state(S::Ringing));
         assert!(!is_terminal_state(S::InProgress));
         assert!(is_terminal_state(S::Ended));
+    }
+
+    #[test]
+    fn task_result_for_maps_each_disposition() {
+        use crate::state::{CallRecord, CallState, Disposition};
+
+        fn rec(disposition: Option<Disposition>, error: Option<String>) -> CallRecord {
+            CallRecord {
+                call_id: "c1".into(),
+                number: "600".into(),
+                state: CallState::Ended,
+                transcript: vec![],
+                affect: vec![],
+                goal: Some(serde_json::json!({ "x": 1 })),
+                error,
+                started_ms: 0,
+                ended_ms: Some(1),
+                quality: Default::default(),
+                disposition,
+                attempt: 1,
+            }
+        }
+
+        // Completed → Ok carrying transcript + goal, no disposition field.
+        let t =
+            first_text(&task_result_for(Some(rec(Some(Disposition::Completed), None))).unwrap());
+        assert!(t.contains("\"goal\"") && t.contains("\"transcript\""));
+        assert!(!t.contains("\"disposition\""));
+
+        // Answering-machine outcomes → Ok, carrying the disposition + goal.
+        for (d, name) in [
+            (Disposition::Voicemail, "voicemail"),
+            (Disposition::Announcement, "announcement"),
+            (Disposition::Ivr, "ivr"),
+            (Disposition::Hold, "hold"),
+        ] {
+            let t = first_text(&task_result_for(Some(rec(Some(d), None))).unwrap());
+            assert!(
+                t.contains(&format!("\"disposition\":\"{name}\"")),
+                "got: {t}"
+            );
+            assert!(t.contains("\"goal\""));
+        }
+
+        // Cancelled → Err(Cancelled).
+        assert!(matches!(
+            task_result_for(Some(rec(Some(Disposition::Cancelled), None))),
+            Err(TaskExit::Cancelled)
+        ));
+
+        // Dial/technical failures → Err(Error); the disposition names the reason
+        // when no explicit error string is present.
+        for (d, name) in [
+            (Disposition::Busy, "busy"),
+            (Disposition::NoAnswer, "no_answer"),
+            (Disposition::NotFound, "not_found"),
+            (Disposition::Unavailable, "unavailable"),
+            (Disposition::Rejected, "rejected"),
+            (Disposition::Failed, "failed"),
+        ] {
+            match task_result_for(Some(rec(Some(d), None))) {
+                Err(TaskExit::Error(e)) => {
+                    assert!(
+                        e.message.contains(name),
+                        "disposition {name}: {}",
+                        e.message
+                    )
+                }
+                other => panic!("expected Err(Error) for {name}, got {other:?}"),
+            }
+        }
+
+        // An explicit error string is preferred over the disposition name.
+        match task_result_for(Some(rec(Some(Disposition::Failed), Some("boom".into())))) {
+            Err(TaskExit::Error(e)) => assert!(e.message.contains("boom")),
+            other => panic!("expected Err(Error), got {other:?}"),
+        }
+
+        // No disposition (defensive) → Err(Error).
+        match task_result_for(None) {
+            Err(TaskExit::Error(e)) => assert!(e.message.contains("no disposition")),
+            other => panic!("expected Err(Error), got {other:?}"),
+        }
     }
 
     /// The pure watcher must return the terminal state a call settles into
