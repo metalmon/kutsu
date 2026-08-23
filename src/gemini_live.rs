@@ -150,6 +150,10 @@ pub(crate) fn build_setup_config(server: &ServerConfig, scenario: &ScenarioConfi
     let native = model.is_native();
     let mut scenario = scenario.clone();
     scenario.goal_schema = crate::config::augment_goal_schema(&scenario.goal_schema);
+    // Gemini's function-parameter Schema subset rejects JSON-Schema keywords a
+    // calling agent may add (e.g. strict-tool `additionalProperties`), closing
+    // the setup with WS 1007. Strip them at this Gemini-specific layer.
+    crate::config::sanitize_gemini_schema(&mut scenario.goal_schema);
     SetupConfig {
         model,
         voice: server.voice.clone(),

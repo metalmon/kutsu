@@ -301,6 +301,48 @@ pub fn augment_goal_schema(schema: &serde_json::Value) -> serde_json::Value {
     s
 }
 
+/// JSON-Schema keywords not in Gemini's function-parameter `Schema` subset.
+/// Removing them is safe: they are validation/metadata Gemini would reject
+/// outright ("Unknown name …" → WS close 1007), not structural type info.
+const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
+    "additionalProperties",
+    "unevaluatedProperties",
+    "patternProperties",
+    "additionalItems",
+    "unevaluatedItems",
+    "$schema",
+    "$id",
+    "$defs",
+    "definitions",
+    "examples",
+];
+
+/// Recursively drop [`GEMINI_UNSUPPORTED_SCHEMA_KEYS`] from every object node of
+/// a JSON Schema so it fits Gemini's function-parameter Schema subset.
+///
+/// Gemini-specific and applied only where the Gemini setup is built (see
+/// `gemini_live::build_setup_config`) — deliberately NOT in the
+/// provider-agnostic [`augment_goal_schema`], since another provider (e.g.
+/// OpenAI strict tools) may *require* the very keys Gemini rejects.
+pub fn sanitize_gemini_schema(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for k in GEMINI_UNSUPPORTED_SCHEMA_KEYS {
+                map.remove(*k);
+            }
+            for child in map.values_mut() {
+                sanitize_gemini_schema(child);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                sanitize_gemini_schema(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Downlink playout pacing thresholds. Tunes the tradeoff between latency
 /// (lower prebuffer/resume = agent speaks sooner) and audible glitching
 /// (higher = more cushion against jitter/underruns).
@@ -831,6 +873,52 @@ mod tests {
             "properties": { "name": { "type": "string" } }
         }));
         assert_eq!(aug2["type"], "object");
+    }
+
+    #[test]
+    fn sanitize_gemini_schema_strips_unsupported_keys_recursively() {
+        // Strict OpenAI-style tool schemas add `additionalProperties`, which
+        // Gemini's Schema subset rejects (WS 1007 "Unknown name"). The Gemini
+        // sanitizer must strip it — including from nested object properties —
+        // while leaving valid structure intact.
+        let mut s = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "properties": {
+                "nested": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": { "x": { "type": "string" } }
+                }
+            },
+            "required": ["nested"]
+        });
+        sanitize_gemini_schema(&mut s);
+        assert!(s.get("additionalProperties").is_none());
+        assert!(s.get("$schema").is_none());
+        assert!(
+            s["properties"]["nested"]
+                .get("additionalProperties")
+                .is_none()
+        );
+        assert_eq!(
+            s["properties"]["nested"]["properties"]["x"]["type"],
+            "string"
+        );
+        assert_eq!(s["type"], "object");
+    }
+
+    #[test]
+    fn augment_goal_schema_stays_provider_agnostic() {
+        // augment must NOT strip provider-specific keys — that belongs to the
+        // Gemini setup layer, so another provider can keep them.
+        let aug = augment_goal_schema(&serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "x": { "type": "string" } }
+        }));
+        assert_eq!(aug["additionalProperties"], false);
     }
 
     #[test]
