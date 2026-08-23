@@ -64,6 +64,26 @@ pub fn retry_backoff_ms(attempt: u32, base_ms: u64) -> u64 {
     base_ms.saturating_mul(1u64 << shift)
 }
 
+/// Upper bound (ms) on how long one call spends in the preflight retry phase
+/// before it reports an outcome: the inter-attempt backoffs plus a per-attempt
+/// ceiling (all ping budgets + the setup-ack budget + a connect margin). The
+/// breaker uses this as its half-open probe wedge-safety deadline, so the bound
+/// tracks the retry config instead of an unrelated cooldown.
+pub fn preflight_max_window_ms(nc: &NetCheckConfig) -> u64 {
+    let attempts = nc.retry_max.max(1) as u64;
+    let backoff_total: u64 = (1..attempts)
+        .map(|i| retry_backoff_ms(i as u32, nc.retry_backoff_base_ms))
+        .sum();
+    let ping_budget = (nc.max_rtt_ms as u64).saturating_mul(4);
+    let pings = (nc.samples.saturating_add(nc.warmup_pings)) as u64;
+    let ack_budget = ping_budget.max(2000);
+    let per_attempt = ping_budget
+        .saturating_mul(pings)
+        .saturating_add(ack_budget)
+        .saturating_add(5_000);
+    backoff_total.saturating_add(attempts.saturating_mul(per_attempt))
+}
+
 /// Open a real WSS connection to the Gemini endpoint and measure ping/pong RTT.
 /// Uses the configured proxy (if any) so the probe traverses the same path the
 /// call will — and the crate's `endpoint_url`/`connect_ws`, so it probes the
@@ -83,9 +103,10 @@ pub async fn preflight(server: &ServerConfig, scenario: &ScenarioConfig) -> Resu
 
     // Warm-up pings: exclude the cold first RTT(s) from the steady-state stats.
     for i in 0..server.net_check.warmup_pings {
-        let _ = ws.send(Message::Ping(vec![0xff, i as u8])).await;
+        let payload = vec![0xff, i as u8];
+        let _ = ws.send(Message::Ping(payload.clone())).await;
         let budget = Duration::from_millis((server.net_check.max_rtt_ms as u64) * 4);
-        let _ = tokio::time::timeout(budget, wait_for_pong(&mut ws)).await;
+        let _ = tokio::time::timeout(budget, wait_for_pong(&mut ws, &payload)).await;
     }
 
     let mut rtts: Vec<u32> = Vec::new();
@@ -99,7 +120,7 @@ pub async fn preflight(server: &ServerConfig, scenario: &ScenarioConfig) -> Resu
             .map_err(|e| Error::Connect(format!("preflight ping: {e}")))?;
         // Wait up to max_rtt*4 for the matching pong.
         let budget = Duration::from_millis((server.net_check.max_rtt_ms as u64) * 4);
-        match tokio::time::timeout(budget, wait_for_pong(&mut ws)).await {
+        match tokio::time::timeout(budget, wait_for_pong(&mut ws, &payload)).await {
             Ok(Ok(())) => rtts.push(sent.elapsed().as_millis() as u32),
             _ => lost += 1,
         }
@@ -194,14 +215,17 @@ fn is_setup_complete(bytes: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-async fn wait_for_pong<S>(ws: &mut S) -> Result<()>
+/// Wait for the pong whose payload matches `expected`. Pongs with other
+/// payloads (e.g. a warm-up pong that arrived after its own timeout) are
+/// skipped, so a stale pong is never counted as this ping's reply.
+async fn wait_for_pong<S>(ws: &mut S, expected: &[u8]) -> Result<()>
 where
     S: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
         + Unpin,
 {
     while let Some(msg) = ws.next().await {
         match msg {
-            Ok(Message::Pong(_)) => return Ok(()),
+            Ok(Message::Pong(p)) if p.as_slice() == expected => return Ok(()),
             Ok(_) => continue,
             Err(e) => return Err(Error::Connect(format!("preflight recv: {e}"))),
         }
@@ -309,6 +333,32 @@ mod tests {
         assert_eq!(retry_backoff_ms(1, 5000), 5000);
         assert_eq!(retry_backoff_ms(2, 5000), 10000);
         assert_eq!(retry_backoff_ms(3, 5000), 20000);
+    }
+
+    #[test]
+    fn preflight_window_covers_retry_budget_and_scales() {
+        let nc = NetCheckConfig::default();
+        // Must comfortably exceed the real worst case: backoffs (5s+10s) plus
+        // per-attempt ping/setup budgets.
+        assert!(preflight_max_window_ms(&nc) >= 15_000 + 3 * 2000);
+        // Scales with retry depth: more attempts -> a longer bound.
+        let deeper = NetCheckConfig {
+            retry_max: 8,
+            ..NetCheckConfig::default()
+        };
+        assert!(preflight_max_window_ms(&deeper) > preflight_max_window_ms(&nc));
+    }
+
+    #[tokio::test]
+    async fn wait_for_pong_skips_unmatched_payload() {
+        // A stale warm-up pong (different payload) must be skipped, not counted
+        // as the measured ping's reply.
+        let frames: Vec<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> = vec![
+            Ok(Message::Pong(vec![0xff, 0])),
+            Ok(Message::Pong(vec![3])),
+        ];
+        let mut s = futures_util::stream::iter(frames);
+        assert!(wait_for_pong(&mut s, &[3u8]).await.is_ok());
     }
 
     #[test]

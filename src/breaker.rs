@@ -62,12 +62,15 @@ impl Breaker {
         Decision::Probe
     }
 
-    /// Record that the half-open probe was spawned at `now`; sets a wedge-safety
-    /// deadline so a probe that never reports cannot block dispatch forever.
-    pub fn mark_probe_dispatched(&self, now: u64) {
+    /// Record that the half-open probe was spawned at `now`, allowing it
+    /// `window_ms` to report before it counts as wedged (so a probe that never
+    /// reports cannot block dispatch forever). `window_ms` is the caller's upper
+    /// bound on the probe's preflight phase, so the deadline tracks the retry
+    /// budget rather than the unrelated cooldown.
+    pub fn mark_probe_dispatched(&self, now: u64, window_ms: u64) {
         let mut s = self.state.lock().unwrap();
         s.probe_in_flight = true;
-        s.probe_deadline_ms = now.saturating_add(self.cooldown_ms.saturating_mul(2));
+        s.probe_deadline_ms = now.saturating_add(window_ms);
     }
 
     /// Report a preflight outcome at `now`. Success closes; failure trips (or
@@ -125,8 +128,8 @@ mod tests {
         let b = br(1, 10_000);
         b.on_result(false, 0); // trips: open_until = 10_000
         assert_eq!(b.decision(10_000), Decision::Probe);
-        b.mark_probe_dispatched(10_000);
-        // probe in flight -> hold until the wedge-safety deadline (now + 2*cooldown)
+        b.mark_probe_dispatched(10_000, 20_000);
+        // probe in flight -> hold until the wedge-safety deadline (now + window)
         assert_eq!(b.decision(10_000), Decision::Hold(30_000));
     }
 
@@ -135,7 +138,7 @@ mod tests {
         let b = br(1, 10_000);
         b.on_result(false, 0);
         let _ = b.decision(10_000);
-        b.mark_probe_dispatched(10_000);
+        b.mark_probe_dispatched(10_000, 20_000);
         b.on_result(true, 11_000);
         assert_eq!(b.decision(11_000), Decision::Dispatch);
     }
@@ -145,7 +148,7 @@ mod tests {
         let b = br(1, 10_000);
         b.on_result(false, 0);
         let _ = b.decision(10_000);
-        b.mark_probe_dispatched(10_000);
+        b.mark_probe_dispatched(10_000, 20_000);
         b.on_result(false, 11_000);
         assert_eq!(b.decision(11_000), Decision::Hold(21_000));
     }
@@ -155,7 +158,7 @@ mod tests {
         let b = br(1, 10_000);
         b.on_result(false, 0);
         let _ = b.decision(10_000);
-        b.mark_probe_dispatched(10_000); // deadline = 30_000
+        b.mark_probe_dispatched(10_000, 20_000); // deadline = 30_000
         assert_eq!(b.decision(30_000), Decision::Probe);
     }
 

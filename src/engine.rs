@@ -591,7 +591,10 @@ async fn dispatcher(
             drop(q);
 
             if probe {
-                breaker.mark_probe_dispatched(now);
+                breaker.mark_probe_dispatched(
+                    now,
+                    crate::net_check::preflight_max_window_ms(&server.net_check),
+                );
             }
             store.set_state(&entry.call_id, CallState::Ringing);
 
