@@ -24,6 +24,11 @@ semantic versioning (pre-1.0: minor = notable/breaking, patch = fixes).
   the `amd-eval` dev binary.
 - **Setup-aware network preflight** — validates the real Gemini setup (not just
   ping RTT) before dialing — and mid-call uplink/downlink RTP-loss abort gates.
+- **Network-preflight resilience**: warm-up ping exclusion plus a separate
+  connect+setup latency gate (`max_setup_ms`); per-call preflight retry with
+  exponential backoff (`retry_max` / `retry_backoff_base_ms`); and a
+  shared-channel circuit breaker (`breaker_threshold` / `cooldown_ms`) that holds
+  the queue during a sustained Gemini-leg outage with a single half-open probe.
 - `attempt` dial count and a configurable, **queue-adaptive `place_call` task
   poll interval** (`mcp_poll_interval_ms` / `mcp_poll_interval_max_ms`).
 - `log`→`tracing` bridge exposing SIP call-progress (`sip_progress` target,

@@ -148,6 +148,12 @@ RTP-loss abort (callee leg).
 | `max_loss_pct` | `2.0` | Fail preflight above this ping-loss %. |
 | `uplink_loss_abort_pct` | `10.0` | Abort a live call above this rolling (~8 s window) uplink RTP loss %. |
 | `downlink_loss_abort_pct` | `10.0` | Abort above this loss % the callee reports via RTCP receiver reports (our audio → callee). Best-effort: only active when the carrier sends RR. |
+| `warmup_pings` | `1` | Warm-up pings sent before sampling; excluded from the RTT/jitter/loss stats. |
+| `max_setup_ms` | `2500` | Max connect+setup latency for the preflight probe (reconnect-cost gate). `0` disables. |
+| `retry_max` | `3` | Preflight attempts for a single call before it fails. |
+| `retry_backoff_base_ms` | `5000` | Backoff before the next preflight retry; doubles each attempt (exponential ×2). |
+| `breaker_threshold` | `3` | Consecutive preflight failures that trip the shared-channel circuit breaker. `0` disables. |
+| `cooldown_ms` | `60000` | How long a tripped breaker holds the call queue before allowing a half-open probe. |
 
 ### `[server.quality]`
 
@@ -247,6 +253,12 @@ variables that are set take effect, so the file/default shows through otherwise.
 | `KUTSU_NETCHECK_MAX_LOSS_PCT` | `server.net_check.max_loss_pct` |
 | `KUTSU_UPLINK_LOSS_ABORT_PCT` | `server.net_check.uplink_loss_abort_pct` |
 | `KUTSU_DOWNLINK_LOSS_ABORT_PCT` | `server.net_check.downlink_loss_abort_pct` |
+| `KUTSU_NETCHECK_WARMUP_PINGS` | `server.net_check.warmup_pings` |
+| `KUTSU_NETCHECK_MAX_SETUP_MS` | `server.net_check.max_setup_ms` |
+| `KUTSU_NETCHECK_RETRY_MAX` | `server.net_check.retry_max` |
+| `KUTSU_NETCHECK_RETRY_BACKOFF_BASE_MS` | `server.net_check.retry_backoff_base_ms` |
+| `KUTSU_NETCHECK_BREAKER_THRESHOLD` | `server.net_check.breaker_threshold` |
+| `KUTSU_NETCHECK_COOLDOWN_MS` | `server.net_check.cooldown_ms` |
 | `KUTSU_QUALITY_PREBUFFER_MS` | `server.quality.prebuffer_ms` |
 | `KUTSU_QUALITY_RESUME_MS` | `server.quality.resume_ms` |
 | `KUTSU_QUALITY_ABORT_UNDERRUNS` | `server.quality.abort_underruns` |
