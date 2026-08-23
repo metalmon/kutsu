@@ -122,6 +122,12 @@ pub struct BridgePorts {
     /// Teardown signal from the engine: when it fires, the bridge stops and
     /// returns [`BridgeEnd::Cancelled`] (replaces aborting the task).
     pub cancel: tokio::sync::oneshot::Receiver<()>,
+    /// When set, the bridge drops model audio instead of playing it to the
+    /// phone: no `downlink.push`, no onset/last_audio bookkeeping, no dl_dump
+    /// write. Used by the wrap-up phase so the model's audio (e.g. a
+    /// re-greeting) never reaches a callee we're about to hang up on.
+    /// Default false = current behavior unchanged.
+    pub mute_downlink: Arc<AtomicBool>,
 }
 
 /// Why the bridge stopped.
@@ -153,6 +159,7 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
         downlink_dump,
         agc_cfg,
         mut cancel,
+        mute_downlink,
     } = ports;
 
     // Uplink: transparent, continuous, never-manipulated forward (spec §2).
@@ -276,21 +283,27 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
             }
             ev = gemini_events.recv() => match ev {
                 Some(Event::OutputAudio(pcm24)) => {
-                    downlink.set_expecting(true);
-                    let now = tokio::time::Instant::now();
-                    if let Some(prev) = last_audio {
-                        let gap = now.duration_since(prev).as_millis() as u64;
-                        if gap > max_gap_ms {
-                            max_gap_ms = gap;
+                    if mute_downlink.load(Ordering::Relaxed) {
+                        // Wrap-up: drop the model's audio entirely -- don't play it,
+                        // don't dump it, and don't let it register as a played turn
+                        // (onset/last_audio bookkeeping stays untouched).
+                    } else {
+                        downlink.set_expecting(true);
+                        let now = tokio::time::Instant::now();
+                        if let Some(prev) = last_audio {
+                            let gap = now.duration_since(prev).as_millis() as u64;
+                            if gap > max_gap_ms {
+                                max_gap_ms = gap;
+                            }
                         }
+                        last_audio = Some(now);
+                        if turn_recv_at.is_none() {
+                            turn_recv_at = Some(now);
+                            turn_onset_logged = false;
+                        }
+                        if let Some(w) = dl_dump24.as_mut() { let _ = w.write(&pcm24); }
+                        downlink.push(&pcm24);
                     }
-                    last_audio = Some(now);
-                    if turn_recv_at.is_none() {
-                        turn_recv_at = Some(now);
-                        turn_onset_logged = false;
-                    }
-                    if let Some(w) = dl_dump24.as_mut() { let _ = w.write(&pcm24); }
-                    downlink.push(&pcm24);
                 }
                 Some(Event::Interrupted) => {
                     downlink.set_expecting(false);
@@ -442,6 +455,7 @@ mod tests {
                     ..Default::default()
                 },
                 cancel,
+                mute_downlink: Arc::new(AtomicBool::new(false)),
             },
             Ends {
                 phone_in_tx,
@@ -584,6 +598,41 @@ mod tests {
             "barge-in must drop the buffered bulk (only a short fade remains), got {loud_frames} loud frames"
         );
 
+        drop(ends);
+        let _ = h.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mute_downlink_drops_output_audio() {
+        let (mut ports, mut ends) = wire(G711Kind::Ulaw);
+        ports.mute_downlink = Arc::new(AtomicBool::new(true));
+        let h = tokio::spawn(run(ports));
+
+        // Discard the ticker's free first tick (fires immediately, on an empty
+        // buffer, before anything is pushed) -- same reasoning as
+        // `downlink_paces_frames_to_phone`.
+        tokio::task::yield_now().await;
+        let _ = ends.phone_out_rx.recv().await.unwrap();
+
+        // Push 200 ms of loud audio while muted -- with the flag false this is
+        // exactly what `downlink_paces_frames_to_phone` proves gets played.
+        ends.gemini_events_tx
+            .send(Event::OutputAudio(vec![8000i16; 480 * 10]))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        // Every frame the phone receives must be silence: the muted audio never
+        // reached the pace buffer, so the pacer has nothing to play.
+        for _ in 0..3 {
+            tokio::time::advance(std::time::Duration::from_millis(20)).await;
+            let frame = ends.phone_out_rx.recv().await.unwrap();
+            let pcm = g711::decode(G711Kind::Ulaw, &frame);
+            assert!(
+                pcm.iter().all(|&s| s.abs() < 64),
+                "expected silence while downlink is muted, got real audio"
+            );
+        }
         drop(ends);
         let _ = h.await;
     }

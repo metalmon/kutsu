@@ -1,7 +1,7 @@
 //! Call engine — drives one call's full lifecycle (dial → bridge → end → finalize).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -912,6 +912,10 @@ async fn run_call(
     let (events_out_tx, mut events_out_rx) = mpsc::channel::<Event>(256);
     let quality = bridge::QualityShared::new();
     let (bridge_cancel_tx, bridge_cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let mute_downlink = Arc::new(AtomicBool::new(false));
+    // Task 4 (wrap-up) will flip this handle to stop the model's audio from
+    // reaching the phone once the closing turn has drained. Unused for now.
+    let _mute_downlink_ctrl = mute_downlink.clone();
     let ports = BridgePorts {
         codec: codec.kind,
         phone_in: audio_in,
@@ -927,6 +931,7 @@ async fn run_call(
         downlink_dump: server.dump_downlink_dir.clone(),
         agc_cfg: server.agc,
         cancel: bridge_cancel_rx,
+        mute_downlink,
     };
     // Run the bridge (downlink pacer + uplink) on a dedicated OS thread with its
     // own current-thread runtime, promoted to real-time priority — so the 20 ms
