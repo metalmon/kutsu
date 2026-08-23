@@ -243,6 +243,9 @@ impl KutsuServer {
         let now = crate::engine::now_ms();
         let eligible = a.schedule_at.filter(|t| *t > now).unwrap_or(now);
         let scheduled = eligible > now;
+        // Kept for the task branch's `model-immediate-response` hint (below);
+        // `a.to_number` is moved into `place_call_at`.
+        let number = a.to_number.clone();
         let call_id = self
             .engine
             .place_call_at(a.to_number, scenario, eligible, 1)
@@ -311,7 +314,28 @@ impl KutsuServer {
                 task_result_for(engine.store().get(&cid))
             })
         });
-        Ok(CallToolResponse::Task(CreateTaskResult::new(task)))
+        // Optional `model-immediate-response` (SEP-1686): the string the host may
+        // hand the model as the tool's immediate result while the task runs.
+        // kutsu knows the call context at this moment (number, call_id, queue
+        // position) — far more useful for the model's reasoning than the host's
+        // generic "task started" fallback. Non-binding; hosts fall back when absent.
+        let queue_hint = match self.engine.queued_position(&call_id) {
+            Some(pos) => format!(", queue position {pos}"),
+            None => String::new(),
+        };
+        let immediate = format!(
+            "Outbound call to {number} placed; call_id={call_id}{queue_hint}. Dialing now — \
+             the outcome (disposition, transcript, and the filled goal) will be reported when \
+             the call completes; poll the task for the result."
+        );
+        let mut meta = rmcp::model::MetaObject::new();
+        meta.insert(
+            "io.modelcontextprotocol/model-immediate-response".to_string(),
+            serde_json::Value::String(immediate),
+        );
+        Ok(CallToolResponse::Task(
+            CreateTaskResult::new(task).with_meta(meta),
+        ))
     }
 
     #[tool(description = "Get a call's current state, disposition, and filled goal by call_id.")]
@@ -784,14 +808,30 @@ mod tests {
         let srv = KutsuServer::new(engine);
 
         let resp = srv.place_call_inner(args("600"), true).await.unwrap();
-        let task = match resp {
-            CallToolResponse::Task(create) => create.task,
+        let create = match resp {
+            CallToolResponse::Task(create) => create,
             other => panic!("expected a Task response, got {other:?}"),
         };
         // TTL is derived from the engine's hard call deadline (600 s here) plus
         // a 30 s teardown/observation margin, not the SDK's 5-min default — so a
         // long-but-valid call is never TTL-swept mid-flight.
-        assert_eq!(task.ttl_ms, Some(600 * 1000 + 30_000));
+        assert_eq!(create.task.ttl_ms, Some(600 * 1000 + 30_000));
+        // The task result carries a `model-immediate-response` hint with the
+        // call context (number + call_id) for the host to hand the model.
+        let imm = create
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("io.modelcontextprotocol/model-immediate-response"))
+            .and_then(|v| v.as_str())
+            .expect("model-immediate-response present in task _meta");
+        assert!(
+            imm.contains("600"),
+            "immediate response names the number: {imm}"
+        );
+        assert!(
+            imm.contains("call-"),
+            "immediate response names the call_id: {imm}"
+        );
 
         // Abort the background watcher task so it stops touching the engine.
         srv.tasks.shutdown();

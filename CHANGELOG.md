@@ -10,6 +10,9 @@ semantic versioning (pre-1.0: minor = notable/breaking, patch = fixes).
 - A call **wrap-up** phase that nudges the model to `end_call` on dead air or
   after an abrupt callee hangup (downlink muted), harvesting the disposition and
   goal; configurable via `dead_air_nudge_ms` and `wrap_up_grace_ms`.
+- A `model-immediate-response` `_meta` hint on the `place_call` task result:
+  task-capable clients get call context (number, call_id, queue position) to hand
+  the model immediately while the task runs, instead of a generic host stub.
 - Unified call **`Disposition`** model (12 outcomes: `completed`, `voicemail`,
   `announcement`, `ivr`, `hold`, `busy`, `no_answer`, `rejected`, `not_found`,
   `unavailable`, `failed`, `cancelled`), resolved from AMD → SIP → call-shape and
