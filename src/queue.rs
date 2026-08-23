@@ -9,7 +9,6 @@ pub struct PendingEntry {
     pub scenario: ScenarioConfig,
     pub eligible_at_ms: u64,
     pub attempt: u32,
-    pub retry_of: Option<String>,
 }
 
 pub trait QueueStore: Send {
@@ -98,7 +97,6 @@ mod tests {
             },
             eligible_at_ms: at,
             attempt: 1,
-            retry_of: None,
         }
     }
     #[test]

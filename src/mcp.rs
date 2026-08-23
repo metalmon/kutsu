@@ -63,9 +63,6 @@ struct PlaceCallArgs {
     /// Optional UTC epoch ms to place the call at. Past/absent = immediate.
     #[serde(default)]
     schedule_at: Option<u64>,
-    /// Optional prior call_id this is a manual retry of.
-    #[serde(default)]
-    retry_of: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -174,7 +171,7 @@ impl KutsuServer {
         let scheduled = eligible > now;
         let call_id = self
             .engine
-            .place_call_at(a.to_number, scenario, eligible, 1, a.retry_of)
+            .place_call_at(a.to_number, scenario, eligible, 1)
             .await;
 
         // Plain clients, and any scheduled call (even for task-capable
@@ -481,7 +478,6 @@ mod tests {
             context: None,
             prompt_override: None,
             schedule_at: None,
-            retry_of: None,
         }
     }
 
@@ -597,7 +593,6 @@ mod tests {
                 quality: Default::default(),
                 disposition,
                 attempt: 1,
-                retry_of: None,
             }
         }
 

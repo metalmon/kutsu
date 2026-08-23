@@ -144,10 +144,8 @@ pub struct CallRecord {
     pub quality: CallQuality,
     /// The authoritative terminal result; None while in-flight.
     pub disposition: Option<Disposition>,
-    /// 1 for the first dial; incremented per internal busy-retry.
+    /// 1 for the first dial; incremented per internal busy-retry (same call_id).
     pub attempt: u32,
-    /// The prior call_id this attempt continues (busy-retry or external retry_of).
-    pub retry_of: Option<String>,
 }
 
 /// Live counts of in-flight calls.
@@ -266,7 +264,6 @@ mod tests {
             quality: CallQuality::default(),
             disposition: None,
             attempt: 1,
-            retry_of: None,
         }
     }
 
@@ -353,11 +350,10 @@ mod tests {
     }
 
     #[test]
-    fn finalize_sets_disposition_and_record_defaults_attempt_and_retry_of() {
+    fn finalize_sets_disposition_and_record_defaults_attempt() {
         let store = CallStore::new();
         let r = rec("c1");
         assert_eq!(r.attempt, 1);
-        assert_eq!(r.retry_of, None);
         assert_eq!(r.disposition, None);
         store.insert(r);
         store.finalize("c1", Disposition::Busy, None, Some("busy".into()), 3000);

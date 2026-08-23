@@ -182,7 +182,6 @@ impl Enqueuer {
         scenario: ScenarioConfig,
         eligible_at_ms: u64,
         attempt: u32,
-        retry_of: Option<String>,
     ) -> String {
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
         let call_id = format!("call-{n}");
@@ -199,7 +198,6 @@ impl Enqueuer {
             quality: CallQuality::default(),
             disposition: None,
             attempt,
-            retry_of: retry_of.clone(),
         });
         self.counters.placed.fetch_add(1, Ordering::Relaxed);
         self.queue.lock().unwrap().push(PendingEntry {
@@ -208,12 +206,36 @@ impl Enqueuer {
             scenario,
             eligible_at_ms,
             attempt,
-            retry_of,
         });
         // Wake the dispatcher so an immediate call dispatches without waiting
         // for its eligibility timer, and a scheduled call re-arms the timer.
         self.wake.notify_one();
         call_id
+    }
+
+    /// Requeue an existing call under the SAME call_id for another attempt
+    /// (auto busy-retry). Resets the record to `Queued` and pushes a fresh
+    /// `PendingEntry` at `attempt`; it does NOT create a new record, so a caller
+    /// polling that call_id follows the retry through to its real outcome
+    /// instead of seeing a terminal `Busy`.
+    fn requeue(
+        &self,
+        call_id: String,
+        number: String,
+        scenario: ScenarioConfig,
+        eligible_at_ms: u64,
+        attempt: u32,
+    ) {
+        self.store.set_state(&call_id, CallState::Queued);
+        self.counters.placed.fetch_add(1, Ordering::Relaxed);
+        self.queue.lock().unwrap().push(PendingEntry {
+            call_id,
+            number,
+            scenario,
+            eligible_at_ms,
+            attempt,
+        });
+        self.wake.notify_one();
     }
 }
 
@@ -321,31 +343,27 @@ impl Engine {
         self.server.max_call_secs
     }
 
-    /// Place an outbound call now: enqueues it as `Queued` (attempt 1, no
-    /// `retry_of`) and wakes the dispatcher. Always succeeds; SIP/other
-    /// failures surface later as `CallState::Ended` with a `Disposition`
-    /// reflecting the failure (e.g. `Failed`, `Busy`, `NoAnswer`).
+    /// Place an outbound call now: enqueues it as `Queued` (attempt 1) and wakes
+    /// the dispatcher. Always succeeds; SIP/other failures surface later as
+    /// `CallState::Ended` with a `Disposition` reflecting the failure (e.g.
+    /// `Failed`, `Busy`, `NoAnswer`).
     pub async fn place_call(&self, number: String, scenario: ScenarioConfig) -> String {
-        self.place_call_at(number, scenario, now_ms(), 1, None)
-            .await
+        self.place_call_at(number, scenario, now_ms(), 1).await
     }
 
     /// Enqueue an outbound call eligible for dispatch at `eligible_at_ms`
-    /// (immediate callers pass `now_ms()`; scheduled/retry callers pass a
-    /// future time). `attempt` is 1 for a first dial; Task 8's busy-retry
-    /// passes the incremented attempt with the prior call's id as `retry_of`.
-    /// Records the call `Queued`, pushes a `PendingEntry`, and notifies the
-    /// dispatcher. Returns the new call_id.
+    /// (immediate callers pass `now_ms()`; scheduled callers pass a future
+    /// time). `attempt` is 1 for a first dial. Records the call `Queued`, pushes
+    /// a `PendingEntry`, and notifies the dispatcher. Returns the new call_id.
     pub async fn place_call_at(
         &self,
         number: String,
         scenario: ScenarioConfig,
         eligible_at_ms: u64,
         attempt: u32,
-        retry_of: Option<String>,
     ) -> String {
         self.enqueuer
-            .place_call_at(number, scenario, eligible_at_ms, attempt, retry_of)
+            .place_call_at(number, scenario, eligible_at_ms, attempt)
             .await
     }
 
@@ -464,14 +482,13 @@ async fn dispatcher(
                 number,
                 scenario,
                 attempt,
-                retry_of,
                 ..
             } = entry;
             tokio::spawn(async move {
                 let _slot = slot; // released (decrement + wake) on task exit / panic
                 run_call(
                     sip, store, server, cancels, counters, enqueuer, cancel_rx, scenario, number,
-                    call_id, attempt, retry_of,
+                    call_id, attempt,
                 )
                 .await;
             });
@@ -658,7 +675,7 @@ async fn ring_wait(
 /// `Ringing` and incremented `running` before spawning us), so there is no
 /// permit to acquire and no cancel-before-permit race — a still-`Queued` call
 /// is cancelled by `end_call` removing it from the queue before it ever
-/// reaches here. `attempt`/`retry_of` are carried for Task 8's busy-retry.
+/// reaches here. `attempt` is carried for busy-retry (same call_id).
 #[allow(clippy::too_many_arguments)]
 async fn run_call(
     sip: SipTransport,
@@ -672,13 +689,12 @@ async fn run_call(
     number: String,
     call_id: String,
     attempt: u32,
-    retry_of: Option<String>,
 ) {
     let _cancel_guard = CancelGuard {
         cancels: cancels.clone(),
         call_id: call_id.clone(),
     };
-    tracing::info!(%call_id, attempt, retry_of = ?retry_of, "dispatching call");
+    tracing::info!(%call_id, attempt, "dispatching call");
 
     // 0. Network preflight (fail-closed): probe the Gemini leg BEFORE dialing so
     // a bad network refuses the call instead of burning a PSTN call on it. Gated
@@ -778,33 +794,31 @@ async fn run_call(
                 // Remote/local hangup before answer is effectively no-answer.
                 _ => (CallOutcome::NoAnswer, format!("{reason:?}")),
             };
-            finalize_call(
-                &store,
-                &counters,
-                &call_id,
-                false,
-                None,
-                Some(outcome),
-                unanswered_shape(),
-                None,
-                Some(detail),
-                now_ms(),
-            );
-            // Busy is the only auto-retried outcome (NoAnswer and all others
-            // finalize terminally here). The finalized record above is linked
-            // forward by the follow-up's `retry_of`; the follow-up gets a fresh
-            // call_id from `place_call_at`, so this record is never
-            // re-finalized (no double-finalize).
+            // Busy is the only auto-retried outcome. Reuse the same call_id for
+            // the retry — the record goes back to `Queued`, never `Ended` — so a
+            // caller polling that id follows the retry to its real outcome. All
+            // other outcomes (and busy once retries are exhausted) finalize here.
             if outcome == CallOutcome::Busy && should_retry_busy(attempt, &server.retry) {
-                enqueuer
-                    .place_call_at(
-                        number.clone(),
-                        scenario.clone(),
-                        now_ms() + server.retry.busy_retry_interval_ms,
-                        attempt + 1,
-                        Some(call_id.clone()),
-                    )
-                    .await;
+                enqueuer.requeue(
+                    call_id,
+                    number,
+                    scenario,
+                    now_ms() + server.retry.busy_retry_interval_ms,
+                    attempt + 1,
+                );
+            } else {
+                finalize_call(
+                    &store,
+                    &counters,
+                    &call_id,
+                    false,
+                    None,
+                    Some(outcome),
+                    unanswered_shape(),
+                    None,
+                    Some(detail),
+                    now_ms(),
+                );
             }
             return;
         }
@@ -1309,7 +1323,7 @@ mod tests {
             .unwrap();
         let future_ms = now_ms() + 200;
         let c = engine2
-            .place_call_at("602".into(), test_scenario(), future_ms, 1, None)
+            .place_call_at("602".into(), test_scenario(), future_ms, 1)
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         assert_eq!(
@@ -1498,7 +1512,6 @@ mod tests {
             quality: Default::default(),
             disposition: None,
             attempt: 1,
-            retry_of: None,
         });
         let counters = Counters::default();
         let d = finalize_call(
@@ -1540,6 +1553,39 @@ mod tests {
         assert!(should_retry_busy(1, &cfg));
         assert!(should_retry_busy(2, &cfg));
         assert!(!should_retry_busy(3, &cfg)); // 3rd attempt is the last; no 4th
+    }
+
+    #[tokio::test]
+    async fn requeue_reuses_call_id_without_new_record() {
+        let enq = Enqueuer {
+            seq: Arc::new(AtomicUsize::new(0)),
+            store: CallStore::new(),
+            queue: Arc::new(Mutex::new(Box::new(MemQueue::new()) as Box<dyn QueueStore>)),
+            wake: Arc::new(Notify::new()),
+            counters: Arc::new(Counters::default()),
+        };
+        let id = enq
+            .place_call_at("100".into(), test_scenario(), now_ms(), 1)
+            .await;
+        // Simulate dispatch: the entry left the queue and the call went live.
+        enq.queue.lock().unwrap().pop_eligible(now_ms() + 1);
+        enq.store.set_state(&id, CallState::Ringing);
+
+        // Busy-retry requeues the SAME id for attempt 2.
+        enq.requeue(id.clone(), "100".into(), test_scenario(), now_ms(), 2);
+
+        // No new call_id was minted, and the record is back to Queued (not Ended).
+        assert!(
+            enq.store.get("call-1").is_none(),
+            "must not mint a new call_id"
+        );
+        assert_eq!(enq.store.get(&id).unwrap().state, CallState::Queued);
+        // The same id is queued again at attempt 2.
+        let mut q = enq.queue.lock().unwrap();
+        assert_eq!(q.len(), 1);
+        let popped = q.pop_eligible(now_ms() + 1).unwrap();
+        assert_eq!(popped.call_id, id);
+        assert_eq!(popped.attempt, 2);
     }
 
     #[tokio::test(start_paused = true)]
