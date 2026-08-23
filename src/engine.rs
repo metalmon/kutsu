@@ -340,10 +340,6 @@ pub struct Engine {
     /// enqueue a call; also cloned into every `run_call` task so Task 8's
     /// busy-retry can requeue without needing `&Engine`.
     enqueuer: Enqueuer,
-    /// Held for future engine-level use (e.g. metrics); the dispatcher and
-    /// every `run_call` task operate on their own `Arc` clone of this.
-    #[allow(dead_code)]
-    breaker: Arc<Breaker>,
     /// The central dispatcher task; aborted on `shutdown`.
     dispatcher: tokio::task::JoinHandle<()>,
 }
@@ -382,7 +378,7 @@ impl Engine {
             cancels.clone(),
             counters.clone(),
             enqueuer.clone(),
-            breaker.clone(),
+            breaker,
         ));
         Ok(Self {
             sip,
@@ -393,7 +389,6 @@ impl Engine {
             cancels,
             counters,
             enqueuer,
-            breaker,
             dispatcher,
         })
     }
