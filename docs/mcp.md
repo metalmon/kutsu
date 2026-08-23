@@ -91,6 +91,13 @@ automatically under the **same `call_id`** (`attempt` increments). For other
 outcomes, call `place_call` again (optionally with `schedule_at`) if you want a
 retry.
 
+**Wrap-up** — If the model falls silent while the callee remains on the line, or
+if the callee hangs up mid-conversation before the model submits the result, kutsu
+injects a cue asking the model to finish via `end_call` (harvesting the disposition
+and goal). The model's audio to the callee is muted during wrap-up. This phase is
+bounded by `wrap_up_grace_ms` and gated by `dead_air_nudge_ms` (0 disables the
+dead-air nudge).
+
 ## Ops endpoints
 
 On the `streamable-http` transport, three unauthenticated endpoints are exposed
