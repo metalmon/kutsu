@@ -143,7 +143,19 @@ pub enum BridgeEnd {
 
 /// Bridge one call until a side ends. Does not hang up or join either side —
 /// the engine owns lifecycle. Cancel-safe at its await points.
-pub async fn run(ports: BridgePorts) -> BridgeEnd {
+///
+/// `harvest_grace_ms`:
+/// - `None` — Stage-A behavior, unchanged: when the uplink task ends (phone
+///   hangs up), the bridge breaks `BridgeEnd::PhoneClosed` immediately.
+/// - `Some(ms)` — wrap-up phase: when the uplink ends, the bridge does NOT
+///   break. It stops treating uplink as an active `select!` arm, mutes and
+///   stops pacing the downlink (the phone is gone), but keeps forwarding
+///   non-audio gemini events (`Transcript`/`TurnComplete`/`EndCall`/
+///   `Warning`/etc.) to `events_out` so a late, post-hangup `EndCall` can
+///   still reach the engine. A grace timer of `ms` then ends the bridge with
+///   `BridgeEnd::PhoneClosed`; `GeminiClosed` still ends it immediately if
+///   the gemini event stream closes first.
+pub async fn run(ports: BridgePorts, harvest_grace_ms: Option<u64>) -> BridgeEnd {
     let BridgePorts {
         codec,
         mut phone_in,
@@ -268,6 +280,18 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
     let mut dl_dump24 = open_dl("24k", 24000);
     let mut dl_dump8 = open_dl("8k", 8000);
 
+    // Fuse for the uplink `select!` arm: once observed complete it must never
+    // be polled again (a completed `JoinHandle` future should not be
+    // re-polled), so this flag gates the arm off for the rest of the loop.
+    let mut uplink_running = true;
+    // Set once the phone side has closed and `harvest_grace_ms` is `Some`:
+    // the bridge has entered the forward-only wrap-up phase. Downlink is
+    // muted and the pacer stops ticking; only non-audio gemini events keep
+    // flowing to `events_out` until the grace deadline elapses.
+    let mut harvesting = false;
+    // Armed on entering the wrap-up phase; elapses to end the bridge.
+    let mut grace_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+
     // Every loop exit goes through `break` so a single `uplink.abort()` below
     // covers every path -- dropping a JoinHandle detaches it (leak) instead of
     // cancelling it, so we must abort explicitly rather than just `return`.
@@ -277,15 +301,39 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
                 // Engine teardown: stop bridging (fires on send() or sender drop).
                 break BridgeEnd::Cancelled;
             }
-            _ = &mut uplink => {
+            _ = &mut uplink, if uplink_running => {
                 // Uplink task ended: the phone stopped feeding us (hang-up).
+                // Fuse this arm immediately -- guarded off for the rest of
+                // the loop so the completed future is never polled again.
+                uplink_running = false;
+                match harvest_grace_ms {
+                    None => break BridgeEnd::PhoneClosed,
+                    Some(ms) => {
+                        // Wrap-up: the phone is gone, but the model may still
+                        // send a post-hangup `EndCall` (or a closing
+                        // `Transcript`). Keep the gemini event path open and
+                        // forwarding non-audio events for up to `ms` so a
+                        // late `EndCall` can still reach the engine; the
+                        // downlink stays muted (see `harvesting` below) and
+                        // the pacer arm is disabled, so nothing plays to the
+                        // now-absent phone.
+                        harvesting = true;
+                        grace_sleep = Some(Box::pin(tokio::time::sleep(
+                            std::time::Duration::from_millis(ms),
+                        )));
+                    }
+                }
+            }
+            _ = async { grace_sleep.as_mut().unwrap().await }, if grace_sleep.is_some() => {
+                // Wrap-up grace window elapsed: end the bridge now.
                 break BridgeEnd::PhoneClosed;
             }
             ev = gemini_events.recv() => match ev {
                 Some(Event::OutputAudio(pcm24)) => {
-                    if mute_downlink.load(Ordering::Relaxed) {
-                        // Wrap-up: drop the model's audio entirely -- don't play it,
-                        // don't dump it, and don't let it register as a played turn
+                    if harvesting || mute_downlink.load(Ordering::Relaxed) {
+                        // Wrap-up (phone gone) or model-audio mute: drop the
+                        // model's audio entirely -- don't play it, don't dump
+                        // it, and don't let it register as a played turn
                         // (onset/last_audio bookkeeping stays untouched).
                     } else {
                         downlink.set_expecting(true);
@@ -330,7 +378,7 @@ pub async fn run(ports: BridgePorts) -> BridgeEnd {
                 }
                 None => break BridgeEnd::GeminiClosed,
             },
-            _ = ticker.tick() => {
+            _ = ticker.tick(), if !harvesting => {
                 let tnow = tokio::time::Instant::now();
                 if let Some(prev) = last_tick {
                     let g = tnow.duration_since(prev).as_millis() as u64;
@@ -413,7 +461,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cancel_signal_ends_the_bridge_as_cancelled() {
         let (ports, ends) = wire(G711Kind::Ulaw);
-        let h = tokio::spawn(run(ports));
+        let h = tokio::spawn(run(ports, None));
         // No side closes; only the engine's teardown signal fires.
         ends.cancel_tx.send(()).unwrap();
         assert_eq!(h.await.unwrap(), BridgeEnd::Cancelled);
@@ -471,7 +519,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn uplink_forwards_every_frame_transparently() {
         let (ports, mut ends) = wire(G711Kind::Ulaw);
-        let h = tokio::spawn(run(ports));
+        let h = tokio::spawn(run(ports, None));
         // Send 5 frames of 160 G.711 silence bytes.
         for _ in 0..5 {
             ends.phone_in_tx
@@ -491,7 +539,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn downlink_paces_frames_to_phone() {
         let (ports, mut ends) = wire(G711Kind::Ulaw);
-        let h = tokio::spawn(run(ports));
+        let h = tokio::spawn(run(ports, None));
 
         // `tokio::time::interval`'s very first `tick()` resolves immediately
         // (no time needs to pass). Force + discard that free tick now, on an
@@ -529,7 +577,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn barge_in_silences_the_phone() {
         let (ports, mut ends) = wire(G711Kind::Ulaw);
-        let h = tokio::spawn(run(ports));
+        let h = tokio::spawn(run(ports, None));
 
         // `tokio::time::interval`'s very first `tick()` resolves immediately (no
         // time needs to pass), independent of any events. Force + discard that
@@ -606,7 +654,7 @@ mod tests {
     async fn mute_downlink_drops_output_audio() {
         let (mut ports, mut ends) = wire(G711Kind::Ulaw);
         ports.mute_downlink = Arc::new(AtomicBool::new(true));
-        let h = tokio::spawn(run(ports));
+        let h = tokio::spawn(run(ports, None));
 
         // Discard the ticker's free first tick (fires immediately, on an empty
         // buffer, before anything is pushed) -- same reasoning as
@@ -640,7 +688,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn non_audio_events_forwarded_to_engine() {
         let (ports, mut ends) = wire(G711Kind::Ulaw);
-        let h = tokio::spawn(run(ports));
+        let h = tokio::spawn(run(ports, None));
         ends.gemini_events_tx
             .send(Event::TurnComplete)
             .await
@@ -658,7 +706,7 @@ mod tests {
         ports.prebuffer_ms = 0; // disable prefill so the test drains deterministically
         ports.resume_ms = 0;
         ports.quality = q.clone();
-        let h = tokio::spawn(run(ports));
+        let h = tokio::spawn(run(ports, None));
         // Model turn starts, one 20 ms chunk, then goes quiet mid-turn (no TurnComplete).
         ends.gemini_events_tx
             .send(Event::OutputAudio(vec![8000i16; 480]))
@@ -686,7 +734,7 @@ mod tests {
         let (mut ports, ends) = wire(G711Kind::Ulaw);
         ports.call_id = "c1".to_string();
         ports.uplink_dump = Some(dir.clone());
-        let h = tokio::spawn(run(ports));
+        let h = tokio::spawn(run(ports, None));
 
         for _ in 0..5 {
             ends.phone_in_tx
@@ -727,7 +775,7 @@ mod tests {
         let (mut ports, ends) = wire(G711Kind::Ulaw);
         ports.call_id = "d1".to_string();
         ports.downlink_dump = Some(dir.clone());
-        let h = tokio::spawn(run(ports));
+        let h = tokio::spawn(run(ports, None));
 
         // Model audio (24k) -> the 24k dump; the 20ms pacer ticks -> the 8k dump.
         for _ in 0..3 {
@@ -759,10 +807,103 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ends_when_gemini_closes() {
         let (ports, ends) = wire(G711Kind::Ulaw);
-        let h = tokio::spawn(run(ports));
+        let h = tokio::spawn(run(ports, None));
         // Drop the gemini events sender -> gemini_events.recv() returns None.
         drop(ends.gemini_events_tx);
         let end = h.await.unwrap();
         assert!(matches!(end, BridgeEnd::GeminiClosed));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_grace_ends_immediately_and_drops_the_event_path_on_phone_close() {
+        // `harvest_grace_ms = None` must be byte-for-byte the Stage-A behavior:
+        // uplink end -> immediate `PhoneClosed`, with the gemini event path
+        // torn down (no forwarding of anything sent afterward).
+        let (ports, mut ends) = wire(G711Kind::Ulaw);
+        let h = tokio::spawn(run(ports, None));
+
+        // Phone hangs up: the RTP receiver closes, so `phone_in` is dropped.
+        drop(ends.phone_in_tx);
+        let end = h.await.unwrap();
+        assert_eq!(end, BridgeEnd::PhoneClosed);
+
+        // The bridge task has exited and dropped both `gemini_events` and
+        // `events_out`. A "late" EndCall has nowhere to go: sending it either
+        // fails outright (receiver gone) or is silently swallowed, and
+        // `events_out` reads back closed either way -- proving nothing from
+        // after the close was, or ever could be, forwarded.
+        let _ = ends
+            .gemini_events_tx
+            .send(Event::EndCall {
+                goal: serde_json::Value::Null,
+            })
+            .await;
+        assert!(
+            ends.events_out_rx.recv().await.is_none(),
+            "events_out must already be closed -- no post-close forwarding without opting in"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn harvest_grace_forwards_a_late_end_call_then_ends_after_the_deadline() {
+        // `harvest_grace_ms = Some(_)`: the phone hanging up must NOT tear
+        // down the gemini event path. A post-hangup `EndCall` -- exactly the
+        // scenario Task 5 exists for -- must still reach `events_out`, model
+        // audio must not be paced to the now-absent phone, and the bridge
+        // must end only once the grace window elapses.
+        let (ports, mut ends) = wire(G711Kind::Ulaw);
+        let h = tokio::spawn(run(ports, Some(500)));
+        tokio::pin!(h);
+
+        // Discard the ticker's free first tick (fires immediately, before
+        // harvesting starts) -- same reasoning as the other pacer tests.
+        tokio::task::yield_now().await;
+        let _ = ends.phone_out_rx.recv().await.unwrap();
+
+        // Phone hangs up: uplink ends, and (with grace set) the bridge enters
+        // the wrap-up phase instead of breaking immediately.
+        drop(ends.phone_in_tx);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // A late EndCall from the model, sent AFTER the phone already hung
+        // up. With `harvest_grace_ms = None` (previous test) this would be
+        // unreachable -- the event path would already be gone. Receiving it
+        // here proves the wrap-up phase is forwarding non-audio events.
+        ends.gemini_events_tx
+            .send(Event::EndCall {
+                goal: serde_json::Value::Null,
+            })
+            .await
+            .unwrap();
+        let got = ends.events_out_rx.recv().await.unwrap();
+        assert!(matches!(got, Event::EndCall { .. }));
+
+        // Model audio arriving during wrap-up must never reach the phone.
+        ends.gemini_events_tx
+            .send(Event::OutputAudio(vec![8000i16; 480]))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            ends.phone_out_rx.try_recv().is_err(),
+            "wrap-up must not pace audio to a hung-up phone"
+        );
+
+        // Still short of the 500 ms grace deadline: the bridge must still be
+        // running (a zero-duration timeout under a paused clock resolves
+        // immediately without advancing time, so this is a non-blocking
+        // "is it done yet" check).
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, &mut h)
+                .await
+                .is_err(),
+            "bridge ended before the grace deadline"
+        );
+
+        // Advance past the grace deadline -> the bridge ends.
+        tokio::time::advance(std::time::Duration::from_millis(500)).await;
+        let end = h.await.unwrap();
+        assert_eq!(end, BridgeEnd::PhoneClosed);
     }
 }

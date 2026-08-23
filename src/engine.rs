@@ -1021,7 +1021,9 @@ async fn run_call(
                 .enable_all()
                 .build()
                 .expect("build bridge runtime");
-            let end = rt.block_on(bridge::run(ports));
+            // Stage-A behavior preserved: no wrap-up grace yet (wired in a
+            // later task once `run_call` can react to a late `EndCall`).
+            let end = rt.block_on(bridge::run(ports, None));
             let _ = bridge_done_tx.send(end);
         })
         .expect("spawn bridge thread");
