@@ -140,15 +140,17 @@ pub(crate) fn map_model(m: crate::config::Model) -> GeminiModel {
 /// half-cascade (native-audio ignores it — the language directive is carried in
 /// the system prompt instead); `resume_handle` is always `None` (kutsu opens a
 /// fresh session per call and lets the crate manage resumption thereafter).
-fn client_config(server: &ServerConfig, scenario: &ScenarioConfig) -> ClientConfig {
+/// Build the crate's `SetupConfig` for a call — the exact setup the live
+/// session sends. Injects kutsu's `amd` field into the goal_schema (both the
+/// prompt, which echoes the schema, and the `end_call` tool params must see the
+/// augmented schema). Shared by [`client_config`] and the `net_check` preflight
+/// so the preflight validates the identical setup the call will use.
+pub(crate) fn build_setup_config(server: &ServerConfig, scenario: &ScenarioConfig) -> SetupConfig {
     let model = map_model(server.model);
     let native = model.is_native();
-    // Inject kutsu's `amd` field so `end_call` always reports what was reached.
-    // Both the prompt (the schema is echoed into it) and the tool params must see
-    // the augmented schema, so assemble from a scenario carrying it.
     let mut scenario = scenario.clone();
     scenario.goal_schema = crate::config::augment_goal_schema(&scenario.goal_schema);
-    let setup = SetupConfig {
+    SetupConfig {
         model,
         voice: server.voice.clone(),
         language: if native {
@@ -158,18 +160,21 @@ fn client_config(server: &ServerConfig, scenario: &ScenarioConfig) -> ClientConf
         },
         system_instruction: server.assemble_system_instruction(&scenario),
         temperature: 0.8,
-        goal_schema: scenario.goal_schema.clone(),
+        goal_schema: scenario.goal_schema,
         resume_handle: None,
-    };
+    }
+}
+
+fn client_config(server: &ServerConfig, scenario: &ScenarioConfig) -> ClientConfig {
     ClientConfig {
-        model,
+        model: map_model(server.model),
         api_key: server.api_key.clone(),
         proxy: server.proxy.as_ref().map(|p| ProxyConfig {
             url: p.url.clone(),
             user: p.user.clone(),
             password: p.password.clone(),
         }),
-        setup,
+        setup: build_setup_config(server, scenario),
         // Unbounded reconnect (backoff caps at 5s); the call-level hangup /
         // max_call_secs is the only give-up gate, matching the old loop.
         max_reconnect_attempts: None,

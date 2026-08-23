@@ -54,7 +54,7 @@ async fn short_live_session_returns_audio_and_ends() {
         ),
     };
 
-    let health = kutsu::net_check::preflight(&server)
+    let health = kutsu::net_check::preflight(&server, &scenario)
         .await
         .expect("preflight");
     assert!(

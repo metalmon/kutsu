@@ -686,7 +686,7 @@ async fn run_call(
     // Gemini leg, not the callee's RTP/cellular leg — see the mid-call RTP abort
     // below and docs/backlog.md.
     if server.net_check.enabled {
-        match crate::net_check::preflight(&server).await {
+        match crate::net_check::preflight(&server, &scenario).await {
             Ok(health) => {
                 let v = crate::net_check::verdict(&health, &server.net_check);
                 tracing::info!(%call_id, health = %health.summary(), verdict = ?v, "network preflight");

@@ -305,7 +305,7 @@ async fn run_live(
 
     // 2. Preflight (fail closed).
     if !no_net_check {
-        let health = kutsu::net_check::preflight(&server).await?;
+        let health = kutsu::net_check::preflight(&server, &scenario).await?;
         eprintln!("net: {}", health.summary());
         if matches!(
             kutsu::net_check::verdict(&health, &server.net_check),

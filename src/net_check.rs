@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use ::gemini_live::transport::{ProxyConfig, connect_ws, endpoint_url};
 
-use crate::config::{NetCheckConfig, ServerConfig};
+use crate::config::{NetCheckConfig, ScenarioConfig, ServerConfig};
 use crate::error::{Error, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,7 +55,7 @@ pub fn verdict(h: &NetworkHealth, cfg: &NetCheckConfig) -> Verdict {
 /// Uses the configured proxy (if any) so the probe traverses the same path the
 /// call will — and the crate's `endpoint_url`/`connect_ws`, so it probes the
 /// exact URL the session opens.
-pub async fn preflight(server: &ServerConfig) -> Result<NetworkHealth> {
+pub async fn preflight(server: &ServerConfig, scenario: &ScenarioConfig) -> Result<NetworkHealth> {
     let url = endpoint_url(crate::gemini_live::map_model(server.model), &server.api_key);
     let proxy = server.proxy.as_ref().map(|p| ProxyConfig {
         url: p.url.clone(),
@@ -82,9 +82,87 @@ pub async fn preflight(server: &ServerConfig) -> Result<NetworkHealth> {
             _ => lost += 1,
         }
     }
+    // Validate the actual session setup, not just transport reachability. The
+    // ping/pong above proves the socket is up but never sends the real `setup`
+    // (tools/goal_schema), so a setup rejection — e.g. WS close 1007 on a
+    // malformed schema — would pass preflight and then storm reconnects on the
+    // live call. Send the exact setup this call will use and require a
+    // `setupComplete` before declaring the network usable.
+    let setup = crate::gemini_live::build_setup_config(server, scenario);
+    ws.send(Message::Text(
+        ::gemini_live::wire::build_setup(&setup).to_string(),
+    ))
+    .await
+    .map_err(|e| Error::Connect(format!("preflight setup send: {e}")))?;
+    let ack_budget = Duration::from_millis((server.net_check.max_rtt_ms as u64 * 4).max(2000));
+    let probe = await_setup_ack(&mut ws, ack_budget).await;
     let _ = ws.close(None).await;
+    match probe {
+        SetupProbe::Ok => Ok(summarize(&mut rtts, lost, n)),
+        SetupProbe::Rejected(code, reason) => Err(Error::Connect(format!(
+            "gemini setup rejected (ws close {code}): {reason}"
+        ))),
+        SetupProbe::Timeout => Err(Error::Connect(
+            "gemini setup not acknowledged (no setupComplete within budget)".into(),
+        )),
+    }
+}
 
-    Ok(summarize(&mut rtts, lost, n))
+/// Outcome of the setup handshake probe.
+#[derive(Debug)]
+enum SetupProbe {
+    /// `setupComplete` received — the session is genuinely usable.
+    Ok,
+    /// The server closed the WS before acknowledging setup. Carries the close
+    /// code + reason (e.g. 1007 "…only allowed for OBJECT type").
+    Rejected(u16, String),
+    /// No `setupComplete` (nor a close) within the budget.
+    Timeout,
+}
+
+/// Read server frames until the session acknowledges `setup` (`setupComplete`),
+/// the server closes (rejection), or `budget` elapses. The caller must have
+/// already sent the setup frame. Generic over the stream so it is unit-testable
+/// with a scripted frame sequence.
+async fn await_setup_ack<S>(ws: &mut S, budget: Duration) -> SetupProbe
+where
+    S: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    let deadline = tokio::time::sleep(budget);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return SetupProbe::Timeout,
+            msg = ws.next() => match msg {
+                None => {
+                    return SetupProbe::Rejected(0, "stream ended before setupComplete".into());
+                }
+                Some(Ok(Message::Close(frame))) => {
+                    let (code, reason) = frame
+                        .map(|f| (u16::from(f.code), f.reason.to_string()))
+                        .unwrap_or((0, "no close frame".into()));
+                    return SetupProbe::Rejected(code, reason);
+                }
+                Some(Ok(Message::Text(t))) if is_setup_complete(t.as_bytes()) => {
+                    return SetupProbe::Ok;
+                }
+                Some(Ok(Message::Binary(b))) if is_setup_complete(&b) => return SetupProbe::Ok,
+                Some(Ok(_)) => continue, // pong / other data frame — keep waiting
+                Some(Err(e)) => return SetupProbe::Rejected(0, e.to_string()),
+            }
+        }
+    }
+}
+
+/// True if a server frame's bytes carry a `setupComplete` acknowledgement.
+fn is_setup_complete(bytes: &[u8]) -> bool {
+    ::gemini_live::wire::parse_server_message(bytes)
+        .map(|evs| {
+            evs.iter()
+                .any(|e| matches!(e, ::gemini_live::types::ServerEvent::SetupComplete))
+        })
+        .unwrap_or(false)
 }
 
 async fn wait_for_pong<S>(ws: &mut S) -> Result<()>
@@ -166,6 +244,47 @@ mod tests {
         let h = summarize(&mut rtts, 0, 10);
         assert!(h.rtt_p95_ms >= h.rtt_p50_ms);
         assert_eq!(h.jitter_ms, h.rtt_p95_ms - h.rtt_p50_ms);
+    }
+
+    #[tokio::test]
+    async fn setup_ack_ok_on_setup_complete() {
+        let frames: Vec<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> = vec![
+            Ok(Message::Pong(vec![])),
+            Ok(Message::Binary(br#"{"setupComplete":{}}"#.to_vec())),
+        ];
+        let mut s = futures_util::stream::iter(frames);
+        assert!(matches!(
+            await_setup_ack(&mut s, Duration::from_secs(1)).await,
+            SetupProbe::Ok
+        ));
+    }
+
+    #[tokio::test]
+    async fn setup_ack_rejected_on_close_carries_code() {
+        use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        let frames: Vec<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> =
+            vec![Ok(Message::Close(Some(CloseFrame {
+                code: CloseCode::from(1007u16),
+                reason: "properties: only allowed for OBJECT type".into(),
+            })))];
+        let mut s = futures_util::stream::iter(frames);
+        match await_setup_ack(&mut s, Duration::from_secs(1)).await {
+            SetupProbe::Rejected(code, _) => assert_eq!(code, 1007),
+            other => panic!("expected Rejected(1007), got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn setup_ack_times_out_when_silent() {
+        // A stream that yields nothing (pends) must hit the budget → Timeout.
+        let mut s = futures_util::stream::pending::<
+            std::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
+        >();
+        assert!(matches!(
+            await_setup_ack(&mut s, Duration::from_millis(50)).await,
+            SetupProbe::Timeout
+        ));
     }
 
     #[test]
