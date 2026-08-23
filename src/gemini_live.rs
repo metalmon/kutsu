@@ -201,6 +201,7 @@ async fn run_driver(
     mut audio_in: mpsc::Receiver<Vec<i16>>,
     events: mpsc::Sender<Event>,
     mut hangup_rx: mpsc::Receiver<()>,
+    mut text_rx: mpsc::Receiver<String>,
 ) -> CallOutcome {
     use std::time::Duration;
 
@@ -234,6 +235,11 @@ async fn run_driver(
     // Latches once the `answered` sender is dropped without ever answering, so
     // the arming arm's guard turns permanently false (no busy-spin).
     let mut answered_closed = false;
+
+    // Latches once the handle's text-cue sender is dropped, so the injection
+    // arm's guard turns permanently false (no busy-spin re-polling a closed
+    // channel). Not wired to any caller yet (see the dead-air wrap-up task).
+    let mut text_channel_open = true;
 
     // Per-call energy VAD over incoming callee audio; the shared `callee_active`
     // flag persists across the call.
@@ -464,6 +470,18 @@ async fn run_driver(
                 }
             }
             _ = hangup_rx.recv() => break (EndedBy::CallerHangup, None),
+            // Ad-hoc text-cue injection (e.g. a dead-air wrap-up nudge), sent
+            // via the split handle's `send_client_text`. Best-effort: a send
+            // failure here does not end the call, mirroring the cue sends
+            // above only in intent, not in error handling.
+            text = text_rx.recv(), if text_channel_open => {
+                match text {
+                    Some(text) => {
+                        let _ = session.send_client_text(&text).await;
+                    }
+                    None => text_channel_open = false,
+                }
+            }
         }
     };
 
@@ -491,6 +509,7 @@ async fn connect_and_drive(
     audio_in: mpsc::Receiver<Vec<i16>>,
     events: mpsc::Sender<Event>,
     hangup_rx: mpsc::Receiver<()>,
+    text_rx: mpsc::Receiver<String>,
 ) -> CallOutcome {
     let cfg = client_config(&server, &scenario);
     tracing::debug!(model = ?server.model, "gemini: connecting");
@@ -505,7 +524,10 @@ async fn connect_and_drive(
             };
         }
     };
-    run_driver(session, &server, answered, audio_in, events, hangup_rx).await
+    run_driver(
+        session, &server, answered, audio_in, events, hangup_rx, text_rx,
+    )
+    .await
 }
 
 /// Connect + drive one call. The event/audio channels stay stable for the life
@@ -522,12 +544,13 @@ pub async fn start(
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<i16>>(64);
     let (event_tx, event_rx) = mpsc::channel::<Event>(256);
     let (hangup_tx, hangup_rx) = mpsc::channel::<()>(1);
+    let (text_tx, text_rx) = mpsc::channel::<String>(4);
 
     let server = server.clone();
     let scenario = scenario.clone();
 
     let join = tokio::spawn(connect_and_drive(
-        server, scenario, answered, audio_rx, event_tx, hangup_rx,
+        server, scenario, answered, audio_rx, event_tx, hangup_rx, text_rx,
     ));
 
     Ok(Session {
@@ -535,6 +558,7 @@ pub async fn start(
         events: event_rx,
         join,
         hangup_tx,
+        text_tx,
     })
 }
 
@@ -544,6 +568,7 @@ pub struct Session {
     pub events: mpsc::Receiver<Event>,
     join: tokio::task::JoinHandle<CallOutcome>,
     hangup_tx: mpsc::Sender<()>,
+    text_tx: mpsc::Sender<String>,
 }
 
 impl Session {
@@ -564,6 +589,7 @@ impl Session {
             SessionHandle {
                 join: self.join,
                 hangup_tx: self.hangup_tx,
+                text_tx: self.text_tx,
             },
             self.audio_in,
             self.events,
@@ -575,6 +601,7 @@ impl Session {
 pub struct SessionHandle {
     join: tokio::task::JoinHandle<CallOutcome>,
     hangup_tx: mpsc::Sender<()>,
+    text_tx: mpsc::Sender<String>,
 }
 
 impl SessionHandle {
@@ -587,6 +614,13 @@ impl SessionHandle {
             goal: None,
             transcript: Vec::new(),
         })
+    }
+
+    /// Inject a client-content text cue mid-call (e.g. a dead-air wrap-up
+    /// nudge). Best-effort: dropped silently if the driver has already ended
+    /// the call. Not wired into `run_call` yet (see the dead-air wrap-up task).
+    pub async fn send_client_text(&self, text: &str) {
+        let _ = self.text_tx.send(text.to_string()).await;
     }
 }
 
@@ -672,6 +706,7 @@ mod tests {
         let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<i16>>(4);
         let (event_tx, event_rx) = mpsc::channel::<Event>(4);
         let (hangup_tx, mut hangup_rx) = mpsc::channel::<()>(1);
+        let (text_tx, mut text_rx) = mpsc::channel::<String>(4);
         let join = tokio::spawn(async {
             CallOutcome {
                 ended_by: EndedBy::RemoteClose,
@@ -684,6 +719,7 @@ mod tests {
             events: event_rx,
             join,
             hangup_tx,
+            text_tx,
         };
 
         let (handle, gemini_in, mut gemini_events) = session.split();
@@ -696,6 +732,8 @@ mod tests {
         ));
         handle.hangup().await;
         assert!(hangup_rx.recv().await.is_some());
+        handle.send_client_text("wrap it up").await;
+        assert_eq!(text_rx.recv().await.as_deref(), Some("wrap it up"));
         let outcome = handle.join().await;
         assert!(matches!(outcome.ended_by, EndedBy::RemoteClose));
     }
@@ -745,9 +783,10 @@ mod tests {
         let (_atx, arx) = mpsc::channel::<Vec<i16>>(8);
         let (etx, mut erx) = mpsc::channel::<Event>(64);
         let (_htx, hrx) = mpsc::channel::<()>(1);
+        let (_ttx, trx) = mpsc::channel::<String>(1);
         let (_answered_tx, answered_rx) = watch::channel(true);
 
-        let outcome = run_driver(session, &server(), answered_rx, arx, etx, hrx).await;
+        let outcome = run_driver(session, &server(), answered_rx, arx, etx, hrx, trx).await;
 
         // First sent frame is the setup message (sent by the crate on connect).
         assert!(sent.lock().unwrap()[0].contains("\"setup\""));
@@ -820,9 +859,10 @@ mod tests {
         let (_atx, arx) = mpsc::channel::<Vec<i16>>(8);
         let (etx, mut erx) = mpsc::channel::<Event>(64);
         let (_htx, hrx) = mpsc::channel::<()>(1);
+        let (_ttx, trx) = mpsc::channel::<String>(1);
         let (_answered_tx, answered_rx) = watch::channel(true);
 
-        let outcome = run_driver(session, &server(), answered_rx, arx, etx, hrx).await;
+        let outcome = run_driver(session, &server(), answered_rx, arx, etx, hrx, trx).await;
 
         // Order matters: the goodbye audio (after end_call) must be emitted, and
         // EndCall must come AFTER it — never before.
@@ -862,12 +902,12 @@ mod tests {
         let (_atx, arx) = mpsc::channel::<Vec<i16>>(8);
         let (etx, _erx) = mpsc::channel::<Event>(64);
         let (_htx, hrx) = mpsc::channel::<()>(1);
+        let (_ttx, trx) = mpsc::channel::<String>(1);
         let (_answered_tx, answered_rx) = watch::channel(false);
 
-        let run =
-            tokio::spawn(
-                async move { run_driver(session, &srv, answered_rx, arx, etx, hrx).await },
-            );
+        let run = tokio::spawn(async move {
+            run_driver(session, &srv, answered_rx, arx, etx, hrx, trx).await
+        });
 
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
@@ -889,12 +929,12 @@ mod tests {
         let (_atx, arx) = mpsc::channel::<Vec<i16>>(8);
         let (etx, _erx) = mpsc::channel::<Event>(64);
         let (_htx, hrx) = mpsc::channel::<()>(1);
+        let (_ttx, trx) = mpsc::channel::<String>(1);
         let (answered_tx, answered_rx) = watch::channel(false);
 
-        let run =
-            tokio::spawn(
-                async move { run_driver(session, &srv, answered_rx, arx, etx, hrx).await },
-            );
+        let run = tokio::spawn(async move {
+            run_driver(session, &srv, answered_rx, arx, etx, hrx, trx).await
+        });
 
         tokio::task::yield_now().await;
         answered_tx.send(true).unwrap();
@@ -924,12 +964,12 @@ mod tests {
         let (atx, arx) = mpsc::channel::<Vec<i16>>(16);
         let (etx, _erx) = mpsc::channel::<Event>(64);
         let (_htx, hrx) = mpsc::channel::<()>(1);
+        let (_ttx, trx) = mpsc::channel::<String>(1);
         let (answered_tx, answered_rx) = watch::channel(false);
 
-        let run =
-            tokio::spawn(
-                async move { run_driver(session, &srv, answered_rx, arx, etx, hrx).await },
-            );
+        let run = tokio::spawn(async move {
+            run_driver(session, &srv, answered_rx, arx, etx, hrx, trx).await
+        });
 
         tokio::task::yield_now().await;
         answered_tx.send(true).unwrap();
@@ -972,10 +1012,11 @@ mod tests {
         let (_atx, arx) = mpsc::channel::<Vec<i16>>(8);
         let (etx, mut erx) = mpsc::channel::<Event>(64);
         let (_htx, hrx) = mpsc::channel::<()>(1);
+        let (_ttx, trx) = mpsc::channel::<String>(1);
         let (_answered_tx, answered_rx) = watch::channel(true);
 
         let run = tokio::spawn(async move {
-            run_driver(session, &server(), answered_rx, arx, etx, hrx).await
+            run_driver(session, &server(), answered_rx, arx, etx, hrx, trx).await
         });
 
         // Wait for the reconnect flush (Interrupted) to arrive, then assert the
@@ -1028,10 +1069,11 @@ mod tests {
         let (_atx, arx) = mpsc::channel::<Vec<i16>>(8);
         let (etx, mut erx) = mpsc::channel::<Event>(64);
         let (_htx, hrx) = mpsc::channel::<()>(1);
+        let (_ttx, trx) = mpsc::channel::<String>(1);
         let (_answered_tx, answered_rx) = watch::channel(true);
 
         let run = tokio::spawn(async move {
-            run_driver(session, &server(), answered_rx, arx, etx, hrx).await
+            run_driver(session, &server(), answered_rx, arx, etx, hrx, trx).await
         });
 
         let mut interrupted = 0;
@@ -1079,10 +1121,11 @@ mod tests {
         let (_atx, arx) = mpsc::channel::<Vec<i16>>(8);
         let (etx, mut erx) = mpsc::channel::<Event>(64);
         let (_htx, hrx) = mpsc::channel::<()>(1);
+        let (_ttx, trx) = mpsc::channel::<String>(1);
         let (_answered_tx, answered_rx) = watch::channel(true);
 
         let run = tokio::spawn(async move {
-            run_driver(session, &server(), answered_rx, arx, etx, hrx).await
+            run_driver(session, &server(), answered_rx, arx, etx, hrx, trx).await
         });
 
         let mut interrupted = 0;
@@ -1123,10 +1166,11 @@ mod tests {
         let (atx, arx) = mpsc::channel::<Vec<i16>>(16);
         let (etx, mut erx) = mpsc::channel::<Event>(64);
         let (_htx, hrx) = mpsc::channel::<()>(1);
+        let (_ttx, trx) = mpsc::channel::<String>(1);
         let (_answered_tx, answered_rx) = watch::channel(true);
 
         let run = tokio::spawn(async move {
-            run_driver(session, &server(), answered_rx, arx, etx, hrx).await
+            run_driver(session, &server(), answered_rx, arx, etx, hrx, trx).await
         });
 
         // The Interrupted flush is emitted synchronously in the reopen handler,
