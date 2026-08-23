@@ -23,10 +23,10 @@ SIP settings and `KUTSU_SIP_PASS` (see [configuration.md](configuration.md)).
 
 | Tool | Arguments | Returns |
 |------|-----------|---------|
-| `place_call` | `to_number`, `goal_schema`, `context?`, `prompt_override?`, `schedule_at?`, `retry_of?` | `call_id` (immediately) |
-| `get_call_status` | `call_id` | Current call state |
-| `get_call_transcript` | `call_id` | Transcript + filled goal |
-| `end_call` | `call_id` | Signals teardown |
+| `place_call` | `to_number`, `goal_schema`, `context?`, `prompt_override?`, `schedule_at?` | `call_id` (immediately) |
+| `get_call_status` | `call_id` | State, disposition, filled goal, attempt count (no transcript) |
+| `get_call_transcript` | `call_id` | Transcript, filled goal, disposition |
+| `end_call` | `call_id` | `{call_id, signalled}` (outcome via `get_call_status`) |
 
 Enumerating all calls is intentionally **not** a tool: the client that placed a
 call holds its `call_id` and polls that one call (mirroring the MCP Tasks
@@ -42,13 +42,13 @@ concern — see [ops endpoints](#ops-endpoints).
 | `context` | object | No | Lead/contact data merged into the prompt. |
 | `prompt_override` | string | No | Replace the base persona for this call only. Absent = the deployment's `base_system_prompt`. |
 | `schedule_at` | epoch ms | No | Place the call at this time; past/absent = immediately. |
-| `retry_of` | string | No | Prior `call_id` this is a manual retry of. |
 
 `place_call` returns a `call_id` immediately — the call runs in the background
 (calls last minutes; a synchronous tool call would time out). For **task-capable
-clients** it runs as an MCP task (poll `tasks/get` for the transcript + goal on
-completion); for plain clients, poll `get_call_status` until terminal, then
-`get_call_transcript`.
+clients** it runs as an MCP task (poll `tasks/get`, which carries a queue-adapted
+`pollIntervalMs` hint, for the result on completion); for plain clients, poll
+`get_call_status` until `ended` — it carries the disposition and filled goal, so
+`get_call_transcript` is only needed for the full transcript.
 
 Example arguments:
 
@@ -69,13 +69,27 @@ Example arguments:
 
 ### Call lifecycle
 
+`state` is the coarse lifecycle; the resolved **`disposition`** (set once the
+call ends) is the actual outcome:
+
 ```
-place_call -> Queued -> Ringing -> InProgress -> Completed | HungUp | Failed | Cancelled
+place_call -> queued -> ringing -> in_progress -> ended
 ```
 
-Poll `get_call_status` until the state is terminal
-(`Completed`/`HungUp`/`Failed`/`Cancelled`), then `get_call_transcript` for the
-transcript and the filled `goal`.
+`get_call_status` returns `state`, `disposition` (null until `ended`), the
+filled `goal`, and the dial `attempt` count. Poll until `state` is `ended`, then
+read `disposition`; fetch `get_call_transcript` only when you need the full
+turn-by-turn transcript.
+
+**Dispositions:** `completed` (talked to a person, goal collected); `voicemail`
+/ `announcement` / `ivr` / `hold` (answered a machine / carrier recording / menu
+/ hold); `busy`, `no_answer`, `rejected`, `not_found`, `unavailable` (dial
+outcomes); `failed` (technical); `cancelled`.
+
+**Retries** are the caller's decision, except `busy` — kutsu retries that
+automatically under the **same `call_id`** (`attempt` increments). For other
+outcomes, call `place_call` again (optionally with `schedule_at`) if you want a
+retry.
 
 ## Ops endpoints
 
@@ -87,7 +101,7 @@ can scrape them without a header):
 |----------|---------|
 | `/health` | Liveness — always `200 ok`. |
 | `/ready` | Readiness — `200 ready`. |
-| `/metrics` | Prometheus exposition (call counts, active/queued, audio quality, uplink RTP). |
+| `/metrics` | Prometheus exposition (call counts incl. per-disposition, active/queued, audio quality, uplink RTP). |
 
 Only `/mcp` is gated by `KUTSU_MCP_TOKEN` (bearer, constant-time compared).
 

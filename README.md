@@ -127,8 +127,8 @@ flowchart LR
 | Tool | What it does |
 |------|--------------|
 | `place_call` | Dial a number with a conversation script; returns `call_id` immediately |
-| `get_call_status` | Poll call state (dialing, in-progress, completed, failed) |
-| `get_call_transcript` | Fetch the running or final transcript |
+| `get_call_status` | Poll lifecycle state + resolved disposition, filled goal, and dial attempt count |
+| `get_call_transcript` | Fetch the running or final transcript (+ goal, disposition) |
 | `end_call` | Force hangup |
 
 ## Call outcomes
