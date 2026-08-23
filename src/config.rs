@@ -264,6 +264,22 @@ impl ServerConfig {
 /// caller's business fields are untouched; kutsu adds a top-level `amd` enum
 /// (and marks it required). A non-object schema is returned unchanged.
 pub fn augment_goal_schema(schema: &serde_json::Value) -> serde_json::Value {
+    // A client may deliver the schema as a JSON *string* — some tool-call
+    // serializers (e.g. strict function-calling over the Responses API)
+    // stringify a free-form object argument. Parse it to an object first, else
+    // it would be forwarded verbatim as an invalid function-parameters value
+    // (Gemini WS 1007 "Invalid value at …parameters"). Provider-agnostic.
+    let owned;
+    let schema = match schema {
+        serde_json::Value::String(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(v) => {
+                owned = v;
+                &owned
+            }
+            Err(_) => schema,
+        },
+        _ => schema,
+    };
     let mut s = schema.clone();
     let Some(obj) = s.as_object_mut() else {
         return s;
@@ -329,6 +345,18 @@ pub fn sanitize_gemini_schema(v: &mut serde_json::Value) {
         serde_json::Value::Object(map) => {
             for k in GEMINI_UNSUPPORTED_SCHEMA_KEYS {
                 map.remove(*k);
+            }
+            // Gemini's Schema wants a single `type` string. Strict-tool
+            // serializers emit `type: [T, "null"]` for optional fields; fold to
+            // `type: T` + `nullable: true` (both accepted by Gemini).
+            if let Some(serde_json::Value::Array(types)) = map.get("type").cloned() {
+                let has_null = types.iter().any(|t| t.as_str() == Some("null"));
+                if let Some(first) = types.into_iter().find(|t| t.as_str() != Some("null")) {
+                    map.insert("type".into(), first);
+                }
+                if has_null {
+                    map.insert("nullable".into(), serde_json::json!(true));
+                }
             }
             for child in map.values_mut() {
                 sanitize_gemini_schema(child);
@@ -919,6 +947,31 @@ mod tests {
             "properties": { "x": { "type": "string" } }
         }));
         assert_eq!(aug["additionalProperties"], false);
+    }
+
+    #[test]
+    fn augment_goal_schema_parses_stringified_schema() {
+        // Some tool-call serializers deliver goal_schema as a JSON string;
+        // augment must parse it, not forward it verbatim (which becomes an
+        // invalid function-parameters value → Gemini WS 1007 "Invalid value at
+        // …parameters").
+        let s = augment_goal_schema(&serde_json::json!(
+            "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}},\"required\":[\"x\"]}"
+        ));
+        assert_eq!(s["type"], "object");
+        assert_eq!(s["properties"]["x"]["type"], "string");
+        assert!(s["properties"]["amd"].is_object());
+    }
+
+    #[test]
+    fn sanitize_gemini_schema_folds_type_array_to_nullable() {
+        let mut s = serde_json::json!({
+            "type": "object",
+            "properties": { "x": { "type": ["string", "null"], "description": "d" } }
+        });
+        sanitize_gemini_schema(&mut s);
+        assert_eq!(s["properties"]["x"]["type"], "string");
+        assert_eq!(s["properties"]["x"]["nullable"], true);
     }
 
     #[test]
