@@ -81,6 +81,74 @@ fn should_retry_busy(attempt: u32, cfg: &crate::config::RetryConfig) -> bool {
     attempt < cfg.busy_max_attempts
 }
 
+/// Dead-air wrap-up phase: what the `qtick` arm of `run_call`'s select loop
+/// should do right now, given how long the call has been silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapPhase {
+    /// Nothing to do: either recent activity, or already nudged and still
+    /// within the grace period waiting for the model to respond.
+    Idle,
+    /// Silence just crossed `nudge_ms`: mute the downlink and send the
+    /// end-call cue. Fires exactly once per silence stretch.
+    Nudge,
+    /// Nudged, and `grace_ms` has since elapsed with no `end_call`: give up
+    /// and finalize the call with whatever transcript exists.
+    Finalize,
+}
+
+/// Dead-air watchdog: tracks how long a call has been silent and decides when
+/// to nudge the model toward `end_call`, then when to give up and finalize.
+/// Pure and unit-tested independent of any live call; `run_call` drives it
+/// with wall-clock `now_ms()` on every activity event and on each `qtick`.
+struct WrapUpState {
+    nudge_ms: u64,
+    grace_ms: u64,
+    last_activity_ms: u64,
+    /// Set the instant `phase()` returns `Nudge`; cleared by `on_activity`.
+    /// Distinguishes "not yet nudged" from "nudged, waiting out the grace
+    /// period" so `Nudge` fires exactly once per silence stretch.
+    nudged_at_ms: Option<u64>,
+}
+
+impl WrapUpState {
+    fn new(nudge_ms: u64, grace_ms: u64) -> Self {
+        Self {
+            nudge_ms,
+            grace_ms,
+            last_activity_ms: 0,
+            nudged_at_ms: None,
+        }
+    }
+
+    /// Record activity (transcript/turn-complete) at `now_ms`, clearing any
+    /// pending wrap-up so a resumed conversation doesn't get finalized.
+    fn on_activity(&mut self, now_ms: u64) {
+        self.last_activity_ms = now_ms;
+        self.nudged_at_ms = None;
+    }
+
+    /// What should happen at `now_ms`? See `WrapPhase` for the transitions.
+    fn phase(&mut self, now_ms: u64) -> WrapPhase {
+        match self.nudged_at_ms {
+            None => {
+                if now_ms.saturating_sub(self.last_activity_ms) >= self.nudge_ms {
+                    self.nudged_at_ms = Some(now_ms);
+                    WrapPhase::Nudge
+                } else {
+                    WrapPhase::Idle
+                }
+            }
+            Some(nudged_at) => {
+                if now_ms.saturating_sub(nudged_at) >= self.grace_ms {
+                    WrapPhase::Finalize
+                } else {
+                    WrapPhase::Idle
+                }
+            }
+        }
+    }
+}
+
 /// Errors from placing a call.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -913,9 +981,9 @@ async fn run_call(
     let quality = bridge::QualityShared::new();
     let (bridge_cancel_tx, bridge_cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let mute_downlink = Arc::new(AtomicBool::new(false));
-    // Task 4 (wrap-up) will flip this handle to stop the model's audio from
-    // reaching the phone once the closing turn has drained. Unused for now.
-    let _mute_downlink_ctrl = mute_downlink.clone();
+    // Flipped by the dead-air wrap-up watchdog (below) to stop the model's
+    // audio from reaching the phone once the closing turn has drained.
+    let mute_downlink_ctrl = mute_downlink.clone();
     let ports = BridgePorts {
         codec: codec.kind,
         phone_in: audio_in,
@@ -964,6 +1032,12 @@ async fn run_call(
     let deadline = tokio::time::sleep(Duration::from_secs(server.max_call_secs));
     tokio::pin!(deadline);
     let mut qtick = tokio::time::interval(Duration::from_secs(1));
+    // Dead-air wrap-up watchdog: nudges the model toward `end_call` after a
+    // stretch of silence, then finalizes if it doesn't respond in time.
+    // `dead_air_nudge_ms == 0` disables it entirely (never nudge/finalize).
+    let wrap_up_enabled = server.dead_air_nudge_ms > 0;
+    let mut wrap_up = WrapUpState::new(server.dead_air_nudge_ms, server.wrap_up_grace_ms);
+    wrap_up.on_activity(now_ms());
     // Rolling window of cumulative (uplink_received, uplink_lost) snapshots, one
     // per quality tick, for the mid-call uplink-RTP-loss gate.
     let mut uplink_hist: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
@@ -979,6 +1053,7 @@ async fn run_call(
                 // is the first Transcript (a proxy for greeting time — true audio-onset
                 // timing would need a bridge-level stamp, deferred).
                 Some(Event::Transcript { role, text, final_ }) => {
+                    wrap_up.on_activity(now_ms());
                     if !first_transcript {
                         first_transcript = true;
                         tracing::info!(%call_id, first_transcript_after_answer_ms = now_ms() - answered_at, "first transcript after answer");
@@ -988,7 +1063,7 @@ async fn run_call(
                     }
                 }
                 Some(Event::EndCall { goal: g }) => { goal = Some(g); break LoopEnd::Completed; }
-                Some(Event::TurnComplete) => {}
+                Some(Event::TurnComplete) => { wrap_up.on_activity(now_ms()); }
                 Some(Event::Affect { role, label }) => {
                     store.append_affect(&call_id, crate::gemini_live::AffectEntry { role, label, ts_ms: now_ms() });
                 }
@@ -1060,6 +1135,21 @@ async fn run_call(
                     }
                 } else {
                     downlink_over_streak = 0;
+                }
+                // Dead-air wrap-up: nudge the model toward `end_call` after a
+                // silence stretch, then give up and finalize if it doesn't
+                // respond within the grace period. `Event::EndCall` (above)
+                // is the happy path — this is the fallback for a model that
+                // goes silent instead of hanging up cleanly.
+                if wrap_up_enabled {
+                    match wrap_up.phase(now_ms()) {
+                        WrapPhase::Nudge => {
+                            mute_downlink_ctrl.store(true, Ordering::Relaxed);
+                            gemini_handle.send_client_text(&server.prompts.end_call_cue).await;
+                        }
+                        WrapPhase::Finalize => break LoopEnd::Completed,
+                        WrapPhase::Idle => {}
+                    }
                 }
             }
         }
@@ -1217,6 +1307,18 @@ fn write_owner_only(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
 mod tests {
     use super::*;
     use crate::config::{Model, NetCheckConfig, VadConfig};
+
+    #[test]
+    fn wrapup_state_nudges_then_finalizes() {
+        let mut w = WrapUpState::new(25_000, 15_000);
+        w.on_activity(0);
+        assert!(matches!(w.phase(10_000), WrapPhase::Idle)); // silence < nudge
+        assert!(matches!(w.phase(25_000), WrapPhase::Nudge)); // nudge once
+        assert!(matches!(w.phase(30_000), WrapPhase::Idle)); // already nudged, within grace
+        assert!(matches!(w.phase(40_000), WrapPhase::Finalize)); // nudge + grace elapsed
+        w.on_activity(41_000); // activity clears wrap-up
+        assert!(matches!(w.phase(50_000), WrapPhase::Idle));
+    }
 
     #[test]
     fn window_loss_pct_needs_enough_samples_then_reports_windowed_loss() {
