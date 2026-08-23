@@ -827,50 +827,73 @@ async fn run_call(
     };
     tracing::info!(%call_id, attempt, "dispatching call");
 
-    // 0. Network preflight (fail-closed): probe the Gemini leg BEFORE dialing so
-    // a bad network refuses the call instead of burning a PSTN call on it. Gated
-    // by net_check.enabled (KUTSU_NETCHECK_ENABLED). Note: this covers only the
-    // Gemini leg, not the callee's RTP/cellular leg — see the mid-call RTP abort
-    // below and docs/backlog.md.
+    // 0. Network preflight (fail-closed) with bounded retry. The shared Gemini
+    // leg floats, so a brief blip is absorbed here rather than surfacing as a
+    // failed call; a sustained outage is caught by the circuit breaker via the
+    // per-outcome report below, which holds the whole queue. The retry window is
+    // cancel-aware so `end_call` still interrupts a call waiting on preflight.
     if server.net_check.enabled {
-        match crate::net_check::preflight(&server, &scenario).await {
-            Ok(health) => {
-                let v = crate::net_check::verdict(&health, &server.net_check);
-                tracing::info!(%call_id, health = %health.summary(), verdict = ?v, "network preflight");
-                if v == crate::net_check::Verdict::Unusable {
-                    breaker.on_result(false, now_ms());
+        let attempts = server.net_check.retry_max.max(1);
+        let mut last_err: Option<String> = None;
+        let mut usable = false;
+        'preflight: for attempt_i in 1..=attempts {
+            let probe = tokio::select! {
+                r = crate::net_check::preflight(&server, &scenario) => r,
+                _ = &mut cancel_rx => {
                     finalize_call(
-                        &store,
-                        &counters,
-                        &call_id,
-                        false,
-                        None,
-                        None,
-                        unanswered_shape(),
-                        None,
-                        Some(format!("network preflight unusable: {}", health.summary())),
-                        now_ms(),
+                        &store, &counters, &call_id, true, None, None,
+                        unanswered_shape(), None, None, now_ms(),
                     );
                     return;
                 }
-                breaker.on_result(true, now_ms());
+            };
+            match probe {
+                Ok(health) => {
+                    let v = crate::net_check::verdict(&health, &server.net_check);
+                    tracing::info!(%call_id, attempt_i, health = %health.summary(), verdict = ?v, "network preflight");
+                    if v == crate::net_check::Verdict::Ok {
+                        usable = true;
+                        break 'preflight;
+                    }
+                    last_err = Some(format!("network preflight unusable: {}", health.summary()));
+                }
+                Err(e) => {
+                    tracing::warn!(%call_id, attempt_i, error = %e, "network preflight attempt failed");
+                    last_err = Some(format!("network preflight failed: {e}"));
+                }
             }
-            Err(e) => {
-                breaker.on_result(false, now_ms());
-                finalize_call(
-                    &store,
-                    &counters,
-                    &call_id,
-                    false,
-                    None,
-                    None,
-                    unanswered_shape(),
-                    None,
-                    Some(format!("network preflight failed: {e}")),
-                    now_ms(),
+            if attempt_i < attempts {
+                let backoff = crate::net_check::retry_backoff_ms(
+                    attempt_i,
+                    server.net_check.retry_backoff_base_ms,
                 );
-                return;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(backoff)) => {}
+                    _ = &mut cancel_rx => {
+                        finalize_call(
+                            &store, &counters, &call_id, true, None, None,
+                            unanswered_shape(), None, None, now_ms(),
+                        );
+                        return;
+                    }
+                }
             }
+        }
+        breaker.on_result(usable, now_ms());
+        if !usable {
+            finalize_call(
+                &store,
+                &counters,
+                &call_id,
+                false,
+                None,
+                None,
+                unanswered_shape(),
+                None,
+                last_err.or_else(|| Some("network preflight failed".into())),
+                now_ms(),
+            );
+            return;
         }
     }
 
