@@ -81,6 +81,18 @@ fn should_retry_busy(attempt: u32, cfg: &crate::config::RetryConfig) -> bool {
     attempt < cfg.busy_max_attempts
 }
 
+/// Stage-B harvest eligibility: after an abrupt hangup (phone closed before
+/// the model called `end_call`), is it worth injecting the end-call cue and
+/// waiting out a grace window for a late `EndCall`? Only when a conversation
+/// actually happened (non-empty transcript) and the goal hasn't already been
+/// captured. A call with no transcript (carrier announcement, immediate
+/// hangup) has nothing to harvest and must fall straight through to the
+/// existing `HungUp`/`Announcement` resolution. Pure and unit-tested
+/// independent of any live call.
+fn harvest_eligible(transcript_len: usize, goal_set: bool) -> bool {
+    transcript_len > 0 && !goal_set
+}
+
 /// Dead-air wrap-up phase: what the `qtick` arm of `run_call`'s select loop
 /// should do right now, given how long the call has been silent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1010,6 +1022,15 @@ async fn run_call(
     // `bridge_done_rx`.
     let (bridge_done_tx, mut bridge_done_rx) =
         tokio::sync::oneshot::channel::<crate::bridge::BridgeEnd>();
+    // Stage B: only arm the bridge's own post-hangup harvest window when the
+    // knob is enabled. Eligibility (did a conversation actually happen, is
+    // the goal already captured) is NOT known at call-start time -- it
+    // depends on the transcript, which only exists once the model has
+    // spoken. So this just tells the bridge "keep forwarding gemini events
+    // for up to this long after phone-close"; `run_call` below enforces the
+    // real eligibility gate at hangup time and reacts to (or ignores) what
+    // the bridge forwards accordingly.
+    let harvest_grace_ms = (server.wrap_up_grace_ms > 0).then_some(server.wrap_up_grace_ms);
     let bridge_thread = std::thread::Builder::new()
         .name("kutsu-bridge".into())
         .spawn(move || {
@@ -1021,9 +1042,7 @@ async fn run_call(
                 .enable_all()
                 .build()
                 .expect("build bridge runtime");
-            // Stage-A behavior preserved: no wrap-up grace yet (wired in a
-            // later task once `run_call` can react to a late `EndCall`).
-            let end = rt.block_on(bridge::run(ports, None));
+            let end = rt.block_on(bridge::run(ports, harvest_grace_ms));
             let _ = bridge_done_tx.send(end);
         })
         .expect("spawn bridge thread");
@@ -1048,6 +1067,25 @@ async fn run_call(
     // Consecutive downlink RR-loss breaches (see `downlink_breach`), reset by any
     // clean/absent sample; abort once it reaches `DOWNLINK_BREACH_TICKS`.
     let mut downlink_over_streak: u32 = 0;
+    // Stage B: set once an abrupt hangup has been judged harvest-eligible
+    // (see `harvest_eligible`) and the end-call cue has been injected. While
+    // true, neither hangup arm below breaks the loop again -- only the
+    // harvest deadline, a late `Event::EndCall`, or the bridge reporting
+    // `GeminiClosed` end it.
+    let mut harvesting = false;
+    // Armed the moment `harvesting` flips true; elapses to give up on the
+    // late `EndCall` and finalize. `None` until then so the arm below never
+    // fires early (guarded on `is_some()`).
+    let mut harvest_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    // Fuse both hangup sources so a second signal (or a closed channel
+    // returning instantly) can never be polled/matched again once consumed --
+    // otherwise, once harvesting stops the loop from `break`ing on hangup, a
+    // closed `sip_events` (or an already-resolved `bridge_done_rx`) would be
+    // re-selected every iteration with nothing to yield on, busy-spinning the
+    // task for the rest of the grace window. Mirrors the `uplink_running`
+    // fuse pattern in `bridge::run`.
+    let mut sip_open = true;
+    let mut bridge_done_open = true;
     let end_state = loop {
         tokio::select! {
             ev = events_out_rx.recv(), if events_open => match ev {
@@ -1080,21 +1118,77 @@ async fn run_call(
                 Some(_) => {} // OutputAudio/Interrupted: consumed by the bridge, not forwarded
                 None => events_open = false, // bridge closed events_out; stop polling (the bridge_task arm ends the call)
             },
-            r = sip_events.recv() => match r {
-                Some(SipEvent::Terminated(_)) | None => break LoopEnd::HungUp,
-                Some(_) => {}
+            r = sip_events.recv(), if sip_open => {
+                sip_open = false; // fuse: a closed mpsc yields None forever
+                match r {
+                    Some(SipEvent::Terminated(_)) | None => {
+                        if !harvesting {
+                            let eligible = server.wrap_up_grace_ms > 0
+                                && harvest_eligible(
+                                    store.get(&call_id).map(|r| r.transcript.len()).unwrap_or(0),
+                                    goal.is_some(),
+                                );
+                            if eligible {
+                                harvesting = true;
+                                gemini_handle.send_client_text(&server.prompts.end_call_cue).await;
+                                harvest_deadline = Some(Box::pin(tokio::time::sleep(
+                                    Duration::from_millis(server.wrap_up_grace_ms),
+                                )));
+                            } else {
+                                break LoopEnd::HungUp;
+                            }
+                        }
+                        // else: already harvesting via the other hangup arm --
+                        // this is the redundant second signal, ignore it.
+                    }
+                    Some(_) => {}
+                }
             },
-            r = &mut bridge_done_rx => break match r {
-                Ok(crate::bridge::BridgeEnd::PhoneClosed) => LoopEnd::HungUp,
-                Ok(crate::bridge::BridgeEnd::GeminiClosed) => LoopEnd::Failed,
-                // Engine-initiated cancel is sent only during teardown (after the
-                // loop), so this arm normally sees Phone/GeminiClosed; treat a
-                // stray Cancelled as a hang-up.
-                Ok(crate::bridge::BridgeEnd::Cancelled) => LoopEnd::HungUp,
-                Err(_) => LoopEnd::Failed, // bridge thread died before sending
+            r = &mut bridge_done_rx, if bridge_done_open => {
+                bridge_done_open = false; // fuse: don't re-poll a resolved oneshot
+                match r {
+                    Ok(crate::bridge::BridgeEnd::PhoneClosed) => {
+                        if !harvesting {
+                            let eligible = server.wrap_up_grace_ms > 0
+                                && harvest_eligible(
+                                    store.get(&call_id).map(|r| r.transcript.len()).unwrap_or(0),
+                                    goal.is_some(),
+                                );
+                            if eligible {
+                                harvesting = true;
+                                gemini_handle.send_client_text(&server.prompts.end_call_cue).await;
+                                harvest_deadline = Some(Box::pin(tokio::time::sleep(
+                                    Duration::from_millis(server.wrap_up_grace_ms),
+                                )));
+                            } else {
+                                break LoopEnd::HungUp;
+                            }
+                        }
+                        // else: already harvesting via the other hangup arm --
+                        // the bridge's own grace window closing is redundant
+                        // with ours; let our `harvest_deadline` (or a late
+                        // `EndCall`/`GeminiClosed`) decide when to stop.
+                    }
+                    Ok(crate::bridge::BridgeEnd::GeminiClosed) => {
+                        // During harvest the transcript already exists, so
+                        // this resolves Completed, not Failed.
+                        break if harvesting { LoopEnd::Completed } else { LoopEnd::Failed };
+                    }
+                    // Engine-initiated cancel is sent only during teardown (after the
+                    // loop), so this arm normally sees Phone/GeminiClosed; treat a
+                    // stray Cancelled as a hang-up.
+                    Ok(crate::bridge::BridgeEnd::Cancelled) => break LoopEnd::HungUp,
+                    Err(_) => break LoopEnd::Failed, // bridge thread died before sending
+                }
             },
             _ = &mut deadline => break LoopEnd::Completed,
             _ = &mut cancel_rx => break LoopEnd::Cancelled,
+            _ = async { harvest_deadline.as_mut().unwrap().await }, if harvest_deadline.is_some() => {
+                // Grace window elapsed with no late EndCall: give up and
+                // finalize. The transcript already exists (that's what made
+                // this eligible), so this resolves Completed at teardown.
+                break LoopEnd::Completed;
+            },
             _ = qtick.tick() => {
                 let downlink = downlink_quality.snapshot();
                 let q = merge_quality(quality.snapshot(), uplink_quality.snapshot(), downlink);
@@ -1696,6 +1790,15 @@ mod tests {
         assert!(should_retry_busy(1, &cfg));
         assert!(should_retry_busy(2, &cfg));
         assert!(!should_retry_busy(3, &cfg)); // 3rd attempt is the last; no 4th
+    }
+
+    #[test]
+    fn harvest_eligible_requires_transcript_and_no_goal() {
+        // true only when transcript_len > 0 && !goal_set
+        assert!(harvest_eligible(1, false));
+        assert!(!harvest_eligible(0, false));
+        assert!(!harvest_eligible(1, true));
+        assert!(!harvest_eligible(0, true));
     }
 
     #[tokio::test]
