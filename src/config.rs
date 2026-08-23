@@ -184,6 +184,13 @@ pub struct ServerConfig {
     pub dump_downlink_dir: Option<PathBuf>,
     /// Safety cap on a single call's duration (seconds).
     pub max_call_secs: u64,
+    /// Base suggested polling interval (ms) returned to task-capable MCP clients
+    /// for `place_call` tasks (the `pollIntervalMs` hint). Adapted up at task
+    /// creation when the call is queued behind busy channels, capped by
+    /// `mcp_poll_interval_max_ms`.
+    pub mcp_poll_interval_ms: u64,
+    /// Upper bound for the adapted `place_call` task poll interval (ms).
+    pub mcp_poll_interval_max_ms: u64,
     /// Downlink audio-quality pacing (prebuffer/resume/abort thresholds).
     pub quality: QualityConfig,
     /// Retry policy for transient dial outcomes (busy, etc).
@@ -213,6 +220,8 @@ impl Default for ServerConfig {
             dump_uplink_dir: None,
             dump_downlink_dir: None,
             max_call_secs: 600,
+            mcp_poll_interval_ms: 5_000,
+            mcp_poll_interval_max_ms: 30_000,
             quality: QualityConfig::default(),
             retry: RetryConfig::default(),
             vad: VadConfig::default(),

@@ -268,7 +268,12 @@ impl KutsuServer {
         // is never swept to `failed`/aborted mid-flight by the SDK's TTL sweeper
         // — the default 5-min TTL is shorter than `max_call_secs` (default 600).
         let ttl_ms = self.engine.max_call_secs() * 1000 + 30_000;
-        let options = TaskOptions::default().with_ttl_ms(Some(ttl_ms));
+        // Suggest a poll cadence adapted to queue depth at creation (rmcp fixes
+        // pollIntervalMs at spawn; no runtime setter). Queued-behind-busy → longer.
+        let poll_ms = self.engine.suggested_poll_interval_ms(&call_id);
+        let options = TaskOptions::default()
+            .with_ttl_ms(Some(ttl_ms))
+            .with_poll_interval_ms(poll_ms);
         let engine = self.engine.clone();
         let cid = call_id.clone();
         // If this session's `TaskManager` is dropped (e.g. an http session ends)
@@ -444,6 +449,8 @@ mod tests {
             dump_uplink_dir: None,
             dump_downlink_dir: None,
             max_call_secs: 600,
+            mcp_poll_interval_ms: 5000,
+            mcp_poll_interval_max_ms: 30000,
             quality: crate::config::QualityConfig::default(),
             retry: crate::config::RetryConfig::default(),
             vad: VadConfig::default(),

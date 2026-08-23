@@ -39,6 +39,8 @@ async fn short_live_session_returns_audio_and_ends() {
         dump_uplink_dir: None,
         dump_downlink_dir: None,
         max_call_secs: 600,
+        mcp_poll_interval_ms: 5000,
+        mcp_poll_interval_max_ms: 30000,
         quality: kutsu::config::QualityConfig::default(),
         retry: kutsu::config::RetryConfig::default(),
         vad: kutsu::config::VadConfig::default(),

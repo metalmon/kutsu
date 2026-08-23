@@ -41,6 +41,12 @@ greet_after_silence_ms = 1000
 # Safety cap on a single call's duration, seconds.
 max_call_secs = 600
 
+# Base pollIntervalMs hint returned to task-capable MCP clients for place_call
+# tasks; adapted up at creation when the call is queued behind busy channels,
+# capped by mcp_poll_interval_max_ms.
+mcp_poll_interval_ms = 5000
+mcp_poll_interval_max_ms = 30000
+
 # Optional output directories (omit to disable). Per-call transcript JSON and
 # raw audio dumps, useful for debugging / offline analysis.
 # transcript_dir = "./transcripts"

@@ -339,6 +339,8 @@ mod tests {
             dump_uplink_dir: None,
             dump_downlink_dir: None,
             max_call_secs: 600,
+            mcp_poll_interval_ms: 5000,
+            mcp_poll_interval_max_ms: 30000,
             quality: crate::config::QualityConfig::default(),
             retry: crate::config::RetryConfig::default(),
             vad: VadConfig::default(),

@@ -125,6 +125,8 @@ register = false
 | `max_concurrent_channels` | `3` | Simultaneous calls; extras queue. `0` queues everything forever (never dials). |
 | `greet_after_silence_ms` | `1000` | Silence window after answer before the agent greets first. `0` = purely reactive. |
 | `max_call_secs` | `600` | Hard cap on one call's duration. |
+| `mcp_poll_interval_ms` | `5000` | Base `pollIntervalMs` hint for `place_call` MCP tasks; adapted up at creation when the call is queued behind busy channels. |
+| `mcp_poll_interval_max_ms` | `30000` | Cap for the adapted task poll interval. |
 | `transcript_dir` | *(none)* | Directory for finalized per-call `CallRecord` JSON. |
 | `dump_uplink_dir` / `dump_downlink_dir` | *(none)* | Per-call WAV dumps for offline analysis. |
 
@@ -227,6 +229,8 @@ variables that are set take effect, so the file/default shows through otherwise.
 | `KUTSU_MAX_CONCURRENT_CHANNELS` | `server.max_concurrent_channels` |
 | `KUTSU_GREET_AFTER_SILENCE_MS` | `server.greet_after_silence_ms` |
 | `KUTSU_MAX_CALL_SECS` | `server.max_call_secs` |
+| `KUTSU_MCP_POLL_INTERVAL_MS` | `server.mcp_poll_interval_ms` |
+| `KUTSU_MCP_POLL_INTERVAL_MAX_MS` | `server.mcp_poll_interval_max_ms` |
 | `KUTSU_TRANSCRIPT_DIR` | `server.transcript_dir` |
 | `KUTSU_DUMP_UPLINK_DIR` / `KUTSU_DUMP_DOWNLINK_DIR` | audio dump dirs |
 | `KUTSU_NETCHECK_ENABLED` | `server.net_check.enabled` |

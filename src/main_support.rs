@@ -127,6 +127,14 @@ fn apply_env_overlay(server: &mut ServerConfig, sip: &mut SipConfig) -> anyhow::
         &mut server.greet_after_silence_ms,
     );
     over_u64("KUTSU_MAX_CALL_SECS", &mut server.max_call_secs);
+    over_u64(
+        "KUTSU_MCP_POLL_INTERVAL_MS",
+        &mut server.mcp_poll_interval_ms,
+    );
+    over_u64(
+        "KUTSU_MCP_POLL_INTERVAL_MAX_MS",
+        &mut server.mcp_poll_interval_max_ms,
+    );
     over_path("KUTSU_TRANSCRIPT_DIR", &mut server.transcript_dir);
     over_path("KUTSU_DUMP_UPLINK_DIR", &mut server.dump_uplink_dir);
     over_path("KUTSU_DUMP_DOWNLINK_DIR", &mut server.dump_downlink_dir);

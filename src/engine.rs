@@ -343,6 +343,27 @@ impl Engine {
         self.server.max_call_secs
     }
 
+    /// Suggested `pollIntervalMs` for a `place_call` MCP task, adapted to queue
+    /// depth at task-creation time (rmcp fixes the value at creation — there is
+    /// no runtime setter). A call that will dispatch right away (a free channel)
+    /// gets the base interval; one queued behind busy channels gets a longer
+    /// interval scaled by how many channel slots it must wait for, capped by
+    /// `mcp_poll_interval_max_ms`, so a client does not poll every few seconds
+    /// while its call merely sits in the queue.
+    pub fn suggested_poll_interval_ms(&self, call_id: &str) -> u64 {
+        let base = self.server.mcp_poll_interval_ms;
+        let max = self.server.mcp_poll_interval_max_ms.max(base);
+        let free = self
+            .server
+            .max_concurrent_channels
+            .saturating_sub(self.running.load(Ordering::Relaxed));
+        let slots_ahead = self
+            .queued_position(call_id)
+            .map(|pos| pos.saturating_sub(free))
+            .unwrap_or(0) as u64;
+        base.saturating_mul(1 + slots_ahead).min(max)
+    }
+
     /// Place an outbound call now: enqueues it as `Queued` (attempt 1) and wakes
     /// the dispatcher. Always succeeds; SIP/other failures surface later as
     /// `CallState::Ended` with a `Disposition` reflecting the failure (e.g.
@@ -1223,6 +1244,8 @@ mod tests {
             dump_uplink_dir: None,
             dump_downlink_dir: None,
             max_call_secs: 600,
+            mcp_poll_interval_ms: 5000,
+            mcp_poll_interval_max_ms: 30000,
             quality: crate::config::QualityConfig::default(),
             retry: crate::config::RetryConfig::default(),
             vad: VadConfig::default(),
@@ -1586,6 +1609,23 @@ mod tests {
         let popped = q.pop_eligible(now_ms() + 1).unwrap();
         assert_eq!(popped.call_id, id);
         assert_eq!(popped.attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn suggested_poll_interval_adapts_to_queue() {
+        // cap=0 parks every call in the queue, so positions are deterministic.
+        let (server, sip_cfg) = test_configs(0);
+        let engine = Engine::new(std::sync::Arc::new(server), &sip_cfg)
+            .await
+            .unwrap();
+        // A call that is not queued (unknown id) gets the base interval.
+        assert_eq!(engine.suggested_poll_interval_ms("nope"), 5000);
+        // Queued behind busy channels → base * (1 + slots_ahead), capped.
+        let a = engine.place_call("600".into(), test_scenario()).await;
+        assert_eq!(engine.suggested_poll_interval_ms(&a), 10_000); // pos 1, 0 free
+        let b = engine.place_call("601".into(), test_scenario()).await;
+        assert_eq!(engine.suggested_poll_interval_ms(&b), 15_000); // pos 2
+        engine.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]
