@@ -91,22 +91,8 @@ can scrape them without a header):
 
 Only `/mcp` is gated by `KUTSU_MCP_TOKEN` (bearer, constant-time compared).
 
-## Local IDE config
+## Client integration
 
-stdio server for a local client (Claude Desktop, Cursor, …):
-
-```json
-{
-  "mcpServers": {
-    "kutsu": {
-      "command": "kutsu",
-      "args": ["mcp"],
-      "env": {
-        "GEMINI_API_KEY": "...",
-        "KUTSU_CONFIG": "/etc/kutsu/kutsu.toml",
-        "KUTSU_SIP_PASS": "..."
-      }
-    }
-  }
-}
-```
+To register kutsu in Claude Code, Claude Desktop, Cursor, VS Code, Windsurf,
+Cline, or a generic MCP client — and to install the `place-call` skill — see
+[mcp-integration.md](mcp-integration.md).
