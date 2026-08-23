@@ -321,6 +321,7 @@ impl KutsuServer {
             "error": rec.error, "queued_position": pos, "quality": rec.quality,
             "disposition": rec.disposition,
             "goal": rec.goal,
+            "attempt": rec.attempt,
             "server_time_unix": crate::engine::now_ms(),
         });
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -532,6 +533,7 @@ mod tests {
         assert_eq!(status_json["call_id"], call_id);
         assert!(status_json.get("state").is_some());
         assert!(status_json.get("goal").is_some());
+        assert_eq!(status_json["attempt"], 1);
 
         let tr = srv
             .get_call_transcript(Parameters(CallIdArgs {
