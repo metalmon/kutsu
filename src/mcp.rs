@@ -159,6 +159,12 @@ impl KutsuServer {
         a: PlaceCallArgs,
         client_supports_tasks: bool,
     ) -> Result<CallToolResponse, ErrorData> {
+        if a.to_number.trim().is_empty() {
+            return Err(ErrorData::invalid_params(
+                "to_number must not be empty".to_string(),
+                None,
+            ));
+        }
         let scenario = ScenarioConfig {
             goal_schema: a.goal_schema,
             context: a.context,
@@ -333,7 +339,7 @@ impl KutsuServer {
             .get(&a.call_id)
             .ok_or_else(|| unknown_call(&a.call_id))?;
         let body = serde_json::json!({
-            "call_id": rec.call_id, "state": rec.state,
+            "call_id": rec.call_id, "state": rec.state, "disposition": rec.disposition,
             "transcript": rec.transcript, "goal": rec.goal, "quality": rec.quality,
         });
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -350,10 +356,8 @@ impl KutsuServer {
             return Err(unknown_call(&a.call_id));
         }
         let signalled = self.engine.end_call(&a.call_id);
-        let state = self.engine.store().get(&a.call_id).map(|r| r.state);
         Ok(CallToolResult::success(vec![ContentBlock::text(
-            serde_json::json!({ "call_id": a.call_id, "signalled": signalled, "state": state })
-                .to_string(),
+            serde_json::json!({ "call_id": a.call_id, "signalled": signalled }).to_string(),
         )]))
     }
 }
@@ -372,9 +376,10 @@ impl ServerHandler for KutsuServer {
                 .build(),
         )
         .with_instructions(
-            "Outbound calling: place_call → poll get_call_status → \
-                 get_call_transcript; end_call to hang up. Task-capable clients \
-                 may instead auto-poll place_call as an MCP task.",
+            "Outbound calling to an AI agent. Tools: place_call (start a call), \
+             get_call_status (state, disposition, filled goal), get_call_transcript \
+             (full transcript), end_call (hang up). Task-capable clients may run \
+             place_call as an MCP task.",
         )
     }
 
@@ -537,7 +542,21 @@ mod tests {
         let tr_json = serde_json::from_str::<serde_json::Value>(&first_text(&tr)).unwrap();
         assert_eq!(tr_json["call_id"], call_id);
         assert!(tr_json.get("transcript").is_some());
+        assert!(tr_json.get("disposition").is_some());
 
+        drop(srv);
+        Arc::into_inner(engine)
+            .expect("only strong ref left")
+            .shutdown()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn place_call_empty_number_is_invalid_params() {
+        let engine = Arc::new(test_engine(1).await);
+        let srv = KutsuServer::new(engine.clone());
+        let err = srv.place_call_inner(args("   "), false).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         drop(srv);
         Arc::into_inner(engine)
             .expect("only strong ref left")
