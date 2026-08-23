@@ -119,6 +119,11 @@ fn main() -> anyhow::Result<()> {
     raise_timer_resolution();
     let cli = Cli::parse();
 
+    // Bridge the `log` facade into `tracing` so ezk-sip-core's `sip_progress`
+    // call-progress patch (emitted via `log::info!`) reaches the subscriber and
+    // the EnvFilter below. Idempotent; ignore the "already set" error.
+    let _ = tracing_log::LogTracer::init();
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let builder = tracing_subscriber::fmt()
