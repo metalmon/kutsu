@@ -12,6 +12,10 @@ downlink-dump/
 /dumps/
 /transcripts/
 
+# Local scratch + synthetic test audio (dev only)
+/scratchpad/
+/synth-test/
+
 # Local AI/agent tooling — not part of the project
 /.claude/
 /.superpowers/
