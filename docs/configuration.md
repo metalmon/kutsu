@@ -207,6 +207,7 @@ All prompt text. Every key has an English-only default; see
 | `closing` | — |
 | `greet_cue` | `KUTSU_GREET_CUE` |
 | `end_call_cue` | `KUTSU_END_CALL_CUE` |
+| `harvest_cue` | `KUTSU_HARVEST_CUE` |
 | `resume_cue` | `KUTSU_RESUME_CUE` |
 | `gender_female` / `gender_male` | — |
 | `language_template` | — |
@@ -277,6 +278,7 @@ variables that are set take effect, so the file/default shows through otherwise.
 | `KUTSU_SYSTEM_PROMPT` | `server.prompts.base_system_prompt` |
 | `KUTSU_GREET_CUE` | `server.prompts.greet_cue` |
 | `KUTSU_END_CALL_CUE` | `server.prompts.end_call_cue` |
+| `KUTSU_HARVEST_CUE` | `server.prompts.harvest_cue` |
 | `KUTSU_RESUME_CUE` | `server.prompts.resume_cue` |
 | `KUTSU_SIP_SERVER` | `sip.server` |
 | `KUTSU_SIP_USER` | `sip.username` |

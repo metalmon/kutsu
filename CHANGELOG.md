@@ -4,7 +4,7 @@ All notable changes to kutsu are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project follows
 semantic versioning (pre-1.0: minor = notable/breaking, patch = fixes).
 
-## [0.2.0] - 2026-08-23
+## [0.2.0] - 2026-08-24
 
 ### Added
 - A call **wrap-up** phase that nudges the model to `end_call` on dead air or

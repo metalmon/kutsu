@@ -78,7 +78,7 @@ ignores the structured language code.
 
 ## Runtime cues
 
-Two prompt strings are sent as user turns *during* a call, not part of the
+Several prompt strings are sent as user turns *during* a call, not part of the
 system instruction:
 
 - **`greet_cue`** — handed to the model when the callee stays silent past
@@ -86,6 +86,12 @@ system instruction:
   itself comes from the persona; the cue only hands over the turn.
 - **`resume_cue`** — sent after a reconnect that lost context mid-exchange, so
   the model asks the other party to repeat.
+- **`end_call_cue`** — the dead-air wrap-up nudge: sent when the line has been
+  silent for `dead_air_nudge_ms` while both parties are still connected, asking
+  the model to finish and submit via `end_call`.
+- **`harvest_cue`** — sent when the callee has *hung up* mid-call (Stage-B
+  harvest): an unconditional instruction to submit whatever was gathered via
+  `end_call`. Distinct from `end_call_cue` because the call is already over.
 
 ## Localization & clean-OSS
 
