@@ -25,6 +25,13 @@ Only call when the task genuinely requires it.
 - `prompt_override` (optional) — per-call persona override.
 - `schedule_at` (optional) — UTC epoch ms to place the call at (past/absent =
   now).
+- `client_ref` (optional, **use it by default**) — an opaque tag echoed back
+  verbatim in `get_call_status`, `get_call_transcript`, and the task result. Set
+  it to your own identifier for this call (lead id, order id, or intent) so you
+  can match each result back to its request **without relying on `call_id`**.
+  Essential when placing several calls at once — especially to the same number
+  with different goals — where `call_id` order is not guaranteed. kutsu never
+  interprets it.
 
 Example `goal_schema`:
 ```json
@@ -44,6 +51,8 @@ Poll `get_call_status(call_id)` until `state` is `ended`:
 - `goal`: the filled goal (collected data); `null` until the agent submits it.
 - `attempt`: how many dials happened (kutsu auto-retries `busy` under the same
   `call_id`).
+- `client_ref`: the tag you passed to `place_call`, echoed back verbatim — match
+  the result to its request by this, not by `call_id` order.
 
 The full turn-by-turn transcript is `get_call_transcript(call_id)` (heavier;
 fetch only when you need it).
