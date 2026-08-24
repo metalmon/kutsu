@@ -246,9 +246,18 @@ fn summarize(rtts: &mut [u32], lost: u32, total: u32) -> NetworkHealth {
         };
     }
     rtts.sort_unstable();
-    let p = |q: f32| rtts[((rtts.len() as f32 - 1.0) * q).round() as usize];
-    // Jitter as the p95−p50 RTT spread — percentile-based, robust to outliers
-    // (unlike mean absolute deviation, which a single spike skews).
+    // Drop the single slowest sample before taking percentiles: one late ping in
+    // ~10 (a lone spike) is absorbed by the downlink jitter buffer and must not
+    // fail preflight — and with ~10 samples that one spike otherwise dominates
+    // BOTH rtt_p95 and jitter=p95−p50. Sustained jitter (two or more slow
+    // samples) still shows through, and loss is unaffected (computed above from
+    // all pings). The full set is kept for very small sample counts.
+    let sample: &[u32] = if rtts.len() > 2 {
+        &rtts[..rtts.len() - 1]
+    } else {
+        rtts
+    };
+    let p = |q: f32| sample[((sample.len() as f32 - 1.0) * q).round() as usize];
     let jitter = p(0.95).saturating_sub(p(0.50));
     NetworkHealth {
         rtt_p50_ms: p(0.50),
@@ -367,6 +376,20 @@ mod tests {
         let h = summarize(&mut rtts, 0, 10);
         assert!(h.rtt_p95_ms >= h.rtt_p50_ms);
         assert_eq!(h.jitter_ms, h.rtt_p95_ms - h.rtt_p50_ms);
+    }
+
+    #[test]
+    fn summarize_ignores_one_slow_outlier_but_not_two() {
+        // 9 flat pings + 1 lone spike: the spike is trimmed, so neither rtt_p95
+        // nor jitter blow up (the jitter buffer absorbs one late packet).
+        let mut one = vec![100, 100, 100, 100, 100, 100, 100, 100, 100, 600];
+        let h = summarize(&mut one, 0, 10);
+        assert_eq!(h.rtt_p95_ms, 100, "lone 600ms spike trimmed from p95");
+        assert_eq!(h.jitter_ms, 0, "bulk is flat, jitter ~0 despite the spike");
+        // Two slow samples still show through (only one is trimmed).
+        let mut two = vec![100, 100, 100, 100, 100, 100, 100, 100, 600, 600];
+        let h2 = summarize(&mut two, 0, 10);
+        assert!(h2.rtt_p95_ms >= 600, "two spikes are not both trimmed");
     }
 
     #[tokio::test]
