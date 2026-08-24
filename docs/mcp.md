@@ -42,6 +42,7 @@ concern — see [ops endpoints](#ops-endpoints).
 | `context` | object | No | Lead/contact data merged into the prompt. |
 | `prompt_override` | string | No | Replace the base persona for this call only. Absent = the deployment's `base_system_prompt`. |
 | `schedule_at` | epoch ms | No | Place the call at this time; past/absent = immediately. |
+| `client_ref` | string | No | Opaque correlation tag echoed back verbatim in `get_call_status`, `get_call_transcript`, and the task result. Use it to map each result to its own intent when placing several calls at once (e.g. all to the same number with different `goal_schema`s) without tracking `call_id`. kutsu never interprets it. |
 
 `place_call` returns a `call_id` immediately — the call runs in the background
 (calls last minutes; a synchronous tool call would time out). For **task-capable

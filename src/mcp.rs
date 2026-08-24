@@ -63,6 +63,13 @@ struct PlaceCallArgs {
     /// Optional UTC epoch ms to place the call at. Past/absent = immediate.
     #[serde(default)]
     schedule_at: Option<u64>,
+    /// Optional opaque correlation tag echoed back verbatim in get_call_status,
+    /// get_call_transcript, and the task result. Use it to map each result to its
+    /// own intent when placing several calls at once (e.g. all to the same number
+    /// with different goal_schemas) without tracking call_id. kutsu never
+    /// interprets it.
+    #[serde(default)]
+    client_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -134,6 +141,7 @@ fn task_result_for(rec: Option<crate::state::CallRecord>) -> Result<CallToolResu
                 .map(|r| {
                     serde_json::json!({
                         "transcript": r.transcript, "goal": r.goal,
+                        "client_ref": r.client_ref,
                         "server_time_unix": server_time_unix,
                     })
                 })
@@ -153,7 +161,8 @@ fn task_result_for(rec: Option<crate::state::CallRecord>) -> Result<CallToolResu
                 .map(|r| {
                     serde_json::json!({
                         "disposition": d, "transcript": r.transcript,
-                        "goal": r.goal, "server_time_unix": server_time_unix,
+                        "goal": r.goal, "client_ref": r.client_ref,
+                        "server_time_unix": server_time_unix,
                     })
                 })
                 .unwrap_or_else(
@@ -246,9 +255,11 @@ impl KutsuServer {
         // Kept for the task branch's `model-immediate-response` hint (below);
         // `a.to_number` is moved into `place_call_at`.
         let number = a.to_number.clone();
+        // Captured for the `model-immediate-response` hint below; moved into the call record.
+        let client_ref = a.client_ref;
         let call_id = self
             .engine
-            .place_call_at(a.to_number, scenario, eligible, 1)
+            .place_call_at(a.to_number, scenario, eligible, 1, client_ref.clone())
             .await;
 
         // Plain clients, and any scheduled call (even for task-capable
@@ -323,10 +334,14 @@ impl KutsuServer {
             Some(pos) => format!(", queue position {pos}"),
             None => String::new(),
         };
+        let ref_hint = client_ref
+            .as_deref()
+            .map(|r| format!(", client_ref={r}"))
+            .unwrap_or_default();
         let immediate = format!(
-            "Outbound call to {number} placed; call_id={call_id}{queue_hint}. Dialing now — \
-             the outcome (disposition, transcript, and the filled goal) will be reported when \
-             the call completes; poll the task for the result."
+            "Outbound call to {number} placed; call_id={call_id}{ref_hint}{queue_hint}. Dialing \
+             now — the outcome (disposition, transcript, and the filled goal) will be reported \
+             when the call completes; poll the task for the result."
         );
         let mut meta = rmcp::model::MetaObject::new();
         meta.insert(
@@ -356,6 +371,7 @@ impl KutsuServer {
             "disposition": rec.disposition,
             "goal": rec.goal,
             "attempt": rec.attempt,
+            "client_ref": rec.client_ref,
             "server_time_unix": crate::engine::now_ms(),
         });
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -376,6 +392,7 @@ impl KutsuServer {
         let body = serde_json::json!({
             "call_id": rec.call_id, "state": rec.state, "disposition": rec.disposition,
             "transcript": rec.transcript, "goal": rec.goal, "quality": rec.quality,
+            "client_ref": rec.client_ref,
         });
         Ok(CallToolResult::success(vec![ContentBlock::text(
             body.to_string(),
@@ -522,6 +539,7 @@ mod tests {
             context: None,
             prompt_override: None,
             schedule_at: None,
+            client_ref: None,
         }
     }
 
@@ -652,6 +670,7 @@ mod tests {
                 quality: Default::default(),
                 disposition,
                 attempt: 1,
+                client_ref: None,
             }
         }
 
@@ -694,6 +713,7 @@ mod tests {
                 quality: Default::default(),
                 disposition,
                 attempt: 1,
+                client_ref: None,
             }
         }
 

@@ -146,6 +146,11 @@ pub struct CallRecord {
     pub disposition: Option<Disposition>,
     /// 1 for the first dial; incremented per internal busy-retry (same call_id).
     pub attempt: u32,
+    /// Opaque caller-supplied correlation tag echoed back in every status /
+    /// transcript / task result, so a client placing several concurrent calls
+    /// (e.g. all to the same number, different goals) maps each result to its own
+    /// intent without tracking `call_id`. kutsu never interprets it.
+    pub client_ref: Option<String>,
 }
 
 /// Live counts of in-flight calls.
@@ -264,6 +269,7 @@ mod tests {
             quality: CallQuality::default(),
             disposition: None,
             attempt: 1,
+            client_ref: None,
         }
     }
 

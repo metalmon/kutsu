@@ -265,6 +265,7 @@ impl Enqueuer {
         scenario: ScenarioConfig,
         eligible_at_ms: u64,
         attempt: u32,
+        client_ref: Option<String>,
     ) -> String {
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
         let call_id = format!("call-{n}");
@@ -281,6 +282,7 @@ impl Enqueuer {
             quality: CallQuality::default(),
             disposition: None,
             attempt,
+            client_ref,
         });
         self.counters.placed.fetch_add(1, Ordering::Relaxed);
         self.queue.lock().unwrap().push(PendingEntry {
@@ -458,22 +460,25 @@ impl Engine {
     /// `CallState::Ended` with a `Disposition` reflecting the failure (e.g.
     /// `Failed`, `Busy`, `NoAnswer`).
     pub async fn place_call(&self, number: String, scenario: ScenarioConfig) -> String {
-        self.place_call_at(number, scenario, now_ms(), 1).await
+        self.place_call_at(number, scenario, now_ms(), 1, None).await
     }
 
     /// Enqueue an outbound call eligible for dispatch at `eligible_at_ms`
     /// (immediate callers pass `now_ms()`; scheduled callers pass a future
-    /// time). `attempt` is 1 for a first dial. Records the call `Queued`, pushes
-    /// a `PendingEntry`, and notifies the dispatcher. Returns the new call_id.
+    /// time). `attempt` is 1 for a first dial. `client_ref` is an opaque caller
+    /// tag echoed back in status/result (see [`CallRecord::client_ref`]). Records
+    /// the call `Queued`, pushes a `PendingEntry`, and notifies the dispatcher.
+    /// Returns the new call_id.
     pub async fn place_call_at(
         &self,
         number: String,
         scenario: ScenarioConfig,
         eligible_at_ms: u64,
         attempt: u32,
+        client_ref: Option<String>,
     ) -> String {
         self.enqueuer
-            .place_call_at(number, scenario, eligible_at_ms, attempt)
+            .place_call_at(number, scenario, eligible_at_ms, attempt, client_ref)
             .await
     }
 
@@ -1630,7 +1635,7 @@ mod tests {
             .unwrap();
         let future_ms = now_ms() + 200;
         let c = engine2
-            .place_call_at("602".into(), test_scenario(), future_ms, 1)
+            .place_call_at("602".into(), test_scenario(), future_ms, 1, None)
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         assert_eq!(
@@ -1819,6 +1824,7 @@ mod tests {
             quality: Default::default(),
             disposition: None,
             attempt: 1,
+            client_ref: None,
         });
         let counters = Counters::default();
         let d = finalize_call(
@@ -1872,6 +1878,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn place_call_at_stores_client_ref() {
+        let enq = Enqueuer {
+            seq: Arc::new(AtomicUsize::new(0)),
+            store: CallStore::new(),
+            queue: Arc::new(Mutex::new(Box::new(MemQueue::new()) as Box<dyn QueueStore>)),
+            wake: Arc::new(Notify::new()),
+            counters: Arc::new(Counters::default()),
+        };
+        let id = enq
+            .place_call_at(
+                "100".into(),
+                test_scenario(),
+                now_ms(),
+                1,
+                Some("order-7".into()),
+            )
+            .await;
+        assert_eq!(
+            enq.store.get(&id).unwrap().client_ref.as_deref(),
+            Some("order-7"),
+            "client_ref must round-trip onto the call record"
+        );
+    }
+
+    #[tokio::test]
     async fn requeue_reuses_call_id_without_new_record() {
         let enq = Enqueuer {
             seq: Arc::new(AtomicUsize::new(0)),
@@ -1881,7 +1912,7 @@ mod tests {
             counters: Arc::new(Counters::default()),
         };
         let id = enq
-            .place_call_at("100".into(), test_scenario(), now_ms(), 1)
+            .place_call_at("100".into(), test_scenario(), now_ms(), 1, None)
             .await;
         // Simulate dispatch: the entry left the queue and the call went live.
         enq.queue.lock().unwrap().pop_eligible(now_ms() + 1);

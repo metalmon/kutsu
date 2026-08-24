@@ -13,6 +13,10 @@ semantic versioning (pre-1.0: minor = notable/breaking, patch = fixes).
 - A `model-immediate-response` `_meta` hint on the `place_call` task result:
   task-capable clients get call context (number, call_id, queue position) to hand
   the model immediately while the task runs, instead of a generic host stub.
+- An optional **`client_ref`** on `place_call`, echoed back verbatim in
+  `get_call_status`, `get_call_transcript`, and the task result — so a client
+  placing several calls at once (even all to the same number, with different
+  `goal_schema`s) maps each result to its own intent without tracking `call_id`.
 - Unified call **`Disposition`** model (12 outcomes: `completed`, `voicemail`,
   `announcement`, `ivr`, `hold`, `busy`, `no_answer`, `rejected`, `not_found`,
   `unavailable`, `failed`, `cancelled`), resolved from AMD → SIP → call-shape and
@@ -57,6 +61,12 @@ semantic versioning (pre-1.0: minor = notable/breaking, patch = fixes).
 - `announcement` disposition for a carrier fast-disconnect that hangs up first
   (caller-hangup), and a stale abort-reason error on calls that raced to
   `completed`.
+- The model no longer reads the goal schema/fields aloud to the callee at
+  wrap-up: the goal preamble now marks the schema a silent, tool-only report and
+  explicitly forbids reading it aloud (the schema still informs collection).
+- Preflight RTT/jitter is robust to a single slow ping: the lone slowest sample
+  is dropped before percentiles, so one late packet (absorbed by the downlink
+  jitter buffer) no longer fails a call, while sustained jitter still does.
 - **Stage-B wrap-up now actually harvests on a real callee hangup.** Three
   coupled defects are fixed: harvest eligibility is judged from live transcript
   activity (the stored transcript is only filled at teardown, so it read empty at
