@@ -270,12 +270,20 @@ async fn run_mcp(
     // would otherwise leave a zombie holding the port, so the next spawn fails
     // its bind (EADDRINUSE) and the tools go "unknown". A teardown that hangs
     // must not keep the process alive, so cap it and then exit unconditionally.
-    tracing::info!("mcp transport closed — tearing down (<=5s) then exiting");
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        kutsu::mcp_http::graceful_teardown(engine),
-    )
-    .await;
+    // The MCP client disconnected (stdio EOF) or a shutdown signal fired. Signal
+    // any live calls to hang up (best-effort), give them a brief moment to send
+    // their BYEs, then exit IMMEDIATELY. We deliberately do NOT run the engine's
+    // blocking SIP-thread join here: it waits for the SIP runtime thread to
+    // terminate and can hang if that thread is mid-call, which is exactly what
+    // used to leave the process alive as a zombie holding the fixed SIP port and
+    // blocking the next spawn. `process::exit` reclaims the socket and threads
+    // anyway, so a fast exit is both correct and what the host expects — no
+    // multi-second wait.
+    tracing::info!("mcp transport closed — hanging up live calls, then exiting");
+    for rec in engine.store().list() {
+        engine.end_call(&rec.call_id);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     std::process::exit(0)
 }
 
