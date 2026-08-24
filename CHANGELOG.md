@@ -13,6 +13,11 @@ semantic versioning (pre-1.0: minor = notable/breaking, patch = fixes).
 - A `model-immediate-response` `_meta` hint on the `place_call` task result:
   task-capable clients get call context (number, call_id, queue position) to hand
   the model immediately while the task runs, instead of a generic host stub.
+- A bounded in-memory **call history** (`max_call_history`, default 1000;
+  `KUTSU_MAX_CALL_HISTORY`): the oldest ended call records over the cap are
+  evicted on finalize (in-flight calls never), so a long-running server no longer
+  grows unbounded. `0` keeps the previous unlimited behavior; `transcript_dir`
+  persists durable history to disk.
 - An optional **`client_ref`** on `place_call`, echoed back verbatim in
   `get_call_status`, `get_call_transcript`, and the task result — so a client
   placing several calls at once (even all to the same number, with different

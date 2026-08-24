@@ -122,6 +122,7 @@ fn apply_env_overlay(server: &mut ServerConfig, sip: &mut SipConfig) -> anyhow::
         "KUTSU_MAX_CONCURRENT_CHANNELS",
         &mut server.max_concurrent_channels,
     );
+    over_usize("KUTSU_MAX_CALL_HISTORY", &mut server.max_call_history);
     over_u64(
         "KUTSU_GREET_AFTER_SILENCE_MS",
         &mut server.greet_after_silence_ms,

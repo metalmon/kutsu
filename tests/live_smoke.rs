@@ -34,6 +34,7 @@ async fn short_live_session_returns_audio_and_ends() {
         language: "ru-RU".into(),
         net_check,
         max_concurrent_channels: 3,
+        max_call_history: 0,
         greet_after_silence_ms: kutsu::config::DEFAULT_GREET_AFTER_SILENCE_MS,
         transcript_dir: None,
         dump_uplink_dir: None,

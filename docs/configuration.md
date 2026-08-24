@@ -125,6 +125,7 @@ register = false
 | `voice_gender` | `female` | Grammatical gender the agent refers to itself in — `male`/`female`/`neutral`. Match it to the voice. |
 | `language` | `en-US` | Spoken language, BCP-47. Also pinned into the prompt (see [prompts.md](prompts.md)). |
 | `max_concurrent_channels` | `3` | Simultaneous calls; extras queue. `0` queues everything forever (never dials). |
+| `max_call_history` | `1000` | Max ended call records kept in memory; oldest ended evicted on finalize (in-flight never evicted). `0` = unlimited. Set `transcript_dir` for durable on-disk history. |
 | `greet_after_silence_ms` | `1000` | Silence window after answer before the agent greets first. `0` = purely reactive. |
 | `max_call_secs` | `600` | Hard cap on one call's duration. |
 | `dead_air_nudge_ms` | `25000` | Silence on the line after which the model is nudged (via `prompts.end_call_cue`) to wrap up. |
@@ -238,6 +239,7 @@ variables that are set take effect, so the file/default shows through otherwise.
 | `KUTSU_VOICE_GENDER` | `server.voice_gender` |
 | `KUTSU_LANGUAGE` | `server.language` |
 | `KUTSU_MAX_CONCURRENT_CHANNELS` | `server.max_concurrent_channels` |
+| `KUTSU_MAX_CALL_HISTORY` | `server.max_call_history` |
 | `KUTSU_GREET_AFTER_SILENCE_MS` | `server.greet_after_silence_ms` |
 | `KUTSU_MAX_CALL_SECS` | `server.max_call_secs` |
 | `KUTSU_DEAD_AIR_NUDGE_MS` | `server.dead_air_nudge_ms` |

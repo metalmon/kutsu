@@ -164,11 +164,36 @@ pub struct StateCounts {
 #[derive(Clone, Default)]
 pub struct CallStore {
     inner: Arc<Mutex<HashMap<String, CallRecord>>>,
+    /// Max ENDED records kept in memory; `0` = unlimited. On finalize, the oldest
+    /// ended records over this cap are evicted (in-flight records are never
+    /// evicted). Bounds memory under high call volume; durable history, if
+    /// wanted, lives in the transcript dir on disk. Copied on clone — every
+    /// handle shares the same cap and the same `inner`.
+    max_history: usize,
+}
+
+/// The monotonic sequence number embedded in a `call-N` id, for age ordering.
+/// Unparseable ids sort oldest (evicted first).
+fn call_seq(call_id: &str) -> u64 {
+    call_id
+        .strip_prefix("call-")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
 }
 
 impl CallStore {
+    /// Unbounded store (no history cap). Used in tests.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Store that keeps at most `max_history` ended records in memory (`0` =
+    /// unlimited), evicting oldest-first on finalize.
+    pub fn with_history_cap(max_history: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            max_history,
+        }
     }
 
     pub fn insert(&self, rec: CallRecord) {
@@ -209,12 +234,37 @@ impl CallStore {
         error: Option<String>,
         ended_ms: u64,
     ) {
-        if let Some(r) = self.inner.lock().unwrap().get_mut(call_id) {
+        let mut m = self.inner.lock().unwrap();
+        if let Some(r) = m.get_mut(call_id) {
             r.state = CallState::Ended;
             r.disposition = Some(disposition);
             r.goal = goal;
             r.error = error;
             r.ended_ms = Some(ended_ms);
+        }
+        // A call just became terminal — bound in-memory growth.
+        Self::evict_ended_over_cap(&mut m, self.max_history);
+    }
+
+    /// When more than `max_history` ENDED records are held, drop the oldest ended
+    /// ones (by call_id sequence). In-flight records are never evicted;
+    /// `max_history == 0` disables the cap. Called under the store lock.
+    fn evict_ended_over_cap(m: &mut HashMap<String, CallRecord>, max_history: usize) {
+        if max_history == 0 {
+            return;
+        }
+        let mut ended: Vec<(u64, String)> = m
+            .iter()
+            .filter(|(_, r)| r.state == CallState::Ended)
+            .map(|(k, _)| (call_seq(k), k.clone()))
+            .collect();
+        if ended.len() <= max_history {
+            return;
+        }
+        ended.sort_unstable_by_key(|(n, _)| *n);
+        let drop_count = ended.len() - max_history;
+        for (_, k) in ended.into_iter().take(drop_count) {
+            m.remove(&k);
         }
     }
 
@@ -271,6 +321,49 @@ mod tests {
             attempt: 1,
             client_ref: None,
         }
+    }
+
+    #[test]
+    fn finalize_evicts_oldest_ended_over_cap() {
+        let store = CallStore::with_history_cap(2);
+        for i in 0..4 {
+            store.insert(rec(&format!("call-{i}")));
+        }
+        for i in 0..4 {
+            store.finalize(&format!("call-{i}"), Disposition::Completed, None, None, 1);
+        }
+        // Only the 2 newest ended records survive; the 2 oldest are evicted.
+        assert!(store.get("call-0").is_none());
+        assert!(store.get("call-1").is_none());
+        assert!(store.get("call-2").is_some());
+        assert!(store.get("call-3").is_some());
+    }
+
+    #[test]
+    fn eviction_counts_only_ended_never_in_flight() {
+        let store = CallStore::with_history_cap(1);
+        store.insert(rec("call-0")); // Ringing (in-flight) per rec()
+        store.insert(rec("call-1")); // Ringing (in-flight)
+        store.insert(rec("call-2"));
+        store.insert(rec("call-3"));
+        store.finalize("call-2", Disposition::Completed, None, None, 1);
+        store.finalize("call-3", Disposition::Completed, None, None, 1);
+        // cap=1 on ENDED: the older ended (call-2) is evicted, call-3 kept; the
+        // two in-flight calls are never counted or evicted.
+        assert!(store.get("call-0").is_some(), "in-flight never evicted");
+        assert!(store.get("call-1").is_some(), "in-flight never evicted");
+        assert!(store.get("call-2").is_none());
+        assert!(store.get("call-3").is_some());
+    }
+
+    #[test]
+    fn unlimited_store_never_evicts() {
+        let store = CallStore::new(); // cap 0 = unlimited
+        for i in 0..50 {
+            store.insert(rec(&format!("call-{i}")));
+            store.finalize(&format!("call-{i}"), Disposition::Completed, None, None, 1);
+        }
+        assert_eq!(store.list().len(), 50);
     }
 
     #[test]

@@ -193,6 +193,11 @@ pub struct ServerConfig {
     pub language: String,
     pub net_check: NetCheckConfig,
     pub max_concurrent_channels: usize,
+    /// Max ENDED call records kept in memory (`0` = unlimited). The oldest ended
+    /// records over this cap are evicted on finalize, bounding memory under high
+    /// call volume; in-flight calls are never evicted. Durable history, if
+    /// needed, lives in `transcript_dir` on disk.
+    pub max_call_history: usize,
     /// Outbound greeting: if the callee produces nothing within this many ms,
     /// the agent greets first (words come from the system prompt). `0` disables
     /// the proactive greeting entirely (purely reactive — wait for the callee).
@@ -246,6 +251,7 @@ impl Default for ServerConfig {
             language: "en-US".into(),
             net_check: NetCheckConfig::default(),
             max_concurrent_channels: 3,
+            max_call_history: 1000,
             greet_after_silence_ms: DEFAULT_GREET_AFTER_SILENCE_MS,
             transcript_dir: None,
             dump_uplink_dir: None,

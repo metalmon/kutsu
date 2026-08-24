@@ -485,6 +485,7 @@ mod tests {
             language: "en-US".into(),
             net_check: NetCheckConfig::default(),
             max_concurrent_channels: cap,
+            max_call_history: 0,
             greet_after_silence_ms: 4000,
             transcript_dir: None,
             dump_uplink_dir: None,

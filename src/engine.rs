@@ -350,7 +350,7 @@ impl Engine {
     /// Build the engine (binds the SIP transport) and spawn the dispatcher.
     pub async fn new(server: Arc<ServerConfig>, sip_cfg: &SipConfig) -> Result<Self, EngineError> {
         let sip = SipTransport::new(sip_cfg).await?;
-        let store = CallStore::new();
+        let store = CallStore::with_history_cap(server.max_call_history);
         let queue: Arc<Mutex<Box<dyn QueueStore>>> =
             Arc::new(Mutex::new(Box::new(MemQueue::new())));
         let running = Arc::new(AtomicUsize::new(0));
@@ -1526,6 +1526,7 @@ mod tests {
             language: "en-US".into(),
             net_check: NetCheckConfig::default(),
             max_concurrent_channels: cap,
+            max_call_history: 0,
             greet_after_silence_ms: 4000,
             transcript_dir: None,
             dump_uplink_dir: None,

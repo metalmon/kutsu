@@ -34,6 +34,12 @@ language = "en-US"
 # forever (never dials) - raise it to enable calls.
 max_concurrent_channels = 3
 
+# Max ENDED call records kept in memory (0 = unlimited). Oldest ended records
+# over this cap are evicted on finalize (in-flight calls are never evicted), so
+# a long-running server does not grow unbounded. Set transcript_dir for durable
+# history on disk.
+max_call_history = 1000
+
 # If the callee is silent this many ms after answer, the agent greets first.
 # 0 disables the proactive greeting (purely reactive).
 greet_after_silence_ms = 1000
