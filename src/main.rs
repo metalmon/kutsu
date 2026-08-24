@@ -263,9 +263,20 @@ async fn run_mcp(
     // call, then best-effort shut the engine's SIP transport down. Extracted
     // to `mcp_http::graceful_teardown` so it's unit-testable — see
     // `mcp_http::tests::graceful_teardown_cancels_live_calls`.
-    kutsu::mcp_http::graceful_teardown(engine).await;
-
-    Ok(())
+    //
+    // Bounded, then force-exit: when the MCP client disconnects (stdio EOF) the
+    // process MUST release its resources — especially the fixed SIP port — and
+    // exit promptly. A host that churns MCP connections (spawn, probe, close)
+    // would otherwise leave a zombie holding the port, so the next spawn fails
+    // its bind (EADDRINUSE) and the tools go "unknown". A teardown that hangs
+    // must not keep the process alive, so cap it and then exit unconditionally.
+    tracing::info!("mcp transport closed — tearing down (<=5s) then exiting");
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        kutsu::mcp_http::graceful_teardown(engine),
+    )
+    .await;
+    std::process::exit(0)
 }
 
 #[allow(clippy::too_many_arguments)]
