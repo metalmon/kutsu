@@ -19,9 +19,8 @@ semantic versioning (pre-1.0: minor = notable/breaking, patch = fixes).
   surfaced on `get_call_status`, `get_call_transcript`, the `place_call` task
   result, and per-disposition Prometheus counters.
 - In-session **prompt AMD** (answering-machine detection): an `amd` field is
-  injected into the goal schema so the agent reports what it reached; plus an
-  offline AMD harness, a Silero neural-VAD backend (`amd-silero` feature), and
-  the `amd-eval` dev binary.
+  injected into the goal schema so the agent reports what it reached (voicemail /
+  announcement / IVR / hold), and hangs up early on a non-live answer.
 - **Setup-aware network preflight** — validates the real Gemini setup (not just
   ping RTT) before dialing — and mid-call uplink/downlink RTP-loss abort gates.
 - **Network-preflight resilience**: warm-up ping exclusion plus a separate

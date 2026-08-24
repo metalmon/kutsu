@@ -10,7 +10,6 @@
 //! for the intended build phases (SIP spike, Gemini Live client, audio
 //! bridge, call engine, MCP layer).
 
-pub mod amd;
 pub mod audio_file;
 pub mod breaker;
 pub mod bridge;
