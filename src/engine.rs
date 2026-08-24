@@ -1332,7 +1332,10 @@ async fn run_call(
     // up — otherwise BYE + stopping the bridge truncate the model's last words.
     // The bridge keeps pacing while we wait. Bounded so a buffer that never
     // drains can't hang teardown; every other exit path tears down immediately.
-    if goal.is_some() {
+    // Skipped during Stage-B harvest: the phone is already gone, so there is no
+    // goodbye to drain — and the bridge has stopped pacing (freezing
+    // `downlink_active`), so the loop would spin the full cap for nothing.
+    if goal.is_some() && !harvesting {
         // Cap covers a full closing turn played at real time (~5 s) plus slack;
         // it only bites if the downlink never goes idle. Normally the wait ends
         // the moment the goodbye finishes and the buffer drains.
