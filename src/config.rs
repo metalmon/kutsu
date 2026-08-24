@@ -266,11 +266,13 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     /// Assemble the full system instruction for a call: the base persona (or the
-    /// call's `prompt_override`), the objective (goal-preamble + the per-call
-    /// `goal_schema` JSON, so the model knows what to gather — not just how to
-    /// shape `end_call`), optional contact context, then the standard protocol
-    /// layer (voice-gender + closing + language). This is the text handed to the
-    /// crate as `SetupConfig::system_instruction`.
+    /// call's `prompt_override`), the objective (goal-preamble only), optional
+    /// contact context, then the standard protocol layer (voice-gender, closing,
+    /// language). The per-call `goal_schema` is deliberately NOT dumped into the
+    /// prompt: the model learns the fields (names and descriptions) from the
+    /// `end_call` tool's parameter schema and fills them via the tool call, so it
+    /// no longer reads the raw schema aloud to the callee. This is the text handed
+    /// to the crate as `SetupConfig::system_instruction`.
     pub fn assemble_system_instruction(&self, scenario: &ScenarioConfig) -> String {
         let p = &self.prompts;
         let mut s = scenario
@@ -279,10 +281,6 @@ impl ServerConfig {
             .unwrap_or_else(|| p.base_system_prompt.clone());
 
         s.push_str(&p.goal_preamble);
-        s.push_str(
-            &serde_json::to_string_pretty(&scenario.goal_schema)
-                .unwrap_or_else(|_| scenario.goal_schema.to_string()),
-        );
 
         if let Some(ctx) = &scenario.context {
             s.push_str("\n\n# Contact context\n");
@@ -559,15 +557,18 @@ pub const BASE_SYSTEM_PROMPT: &str = "You are a helpful voice agent making a \
     phone call. Speak naturally and conversationally, keep your replies short, \
     and stay on task.";
 
-/// Preamble that introduces the per-call `goal_schema` inside the system prompt
-/// so the model knows what to steer the conversation toward and collect — not
-/// only how to shape the final `end_call` payload. The schema JSON is appended
-/// right after this text by [`ServerConfig::assemble_system_instruction`].
+/// Preamble that tells the model what to steer the conversation toward and
+/// collect. The concrete fields (names + descriptions) reach the model through
+/// the `end_call` tool's parameter schema, NOT the prompt, so the raw JSON is no
+/// longer appended here — the model fills the fields by calling the tool and must
+/// not read them aloud (see the directive below).
 pub const GOAL_PREAMBLE: &str = "\n\n# Your objective\nDuring this call, pursue \
-    and gather the information described by the schema below, steering the \
-    conversation toward it naturally. When the objective is met (or clearly \
-    cannot be), submit your findings by calling the `end_call` tool with a value \
-    matching this JSON Schema:\n";
+    and gather the information the `end_call` tool asks for (its fields and their \
+    descriptions), steering the conversation toward it naturally. When the \
+    objective is met (or clearly cannot be), submit your findings by calling the \
+    `end_call` tool. Those fields are a private report to the system: fill them \
+    ONLY through the tool call, and NEVER read the field names, the schema, or \
+    their values aloud to the other party.";
 
 /// Call-closing directive appended to every system prompt so the model closes
 /// deterministically via the tool (fixes the double-goodbye). English by repo
@@ -889,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn assemble_injects_base_prompt_goal_schema_and_layers() {
+    fn assemble_injects_base_prompt_objective_and_layers() {
         let cfg = ServerConfig::default(); // Female, en-US
         let sys = cfg.assemble_system_instruction(&scenario(serde_json::json!({
             "type": "object",
@@ -897,10 +898,12 @@ mod tests {
         })));
         // base persona first
         assert!(sys.starts_with(BASE_SYSTEM_PROMPT));
-        // objective section carries the schema so the model knows what to gather
+        // objective section present, but the raw goal_schema is NOT dumped into
+        // the prompt — the model gets the fields via the end_call tool params, so
+        // it can't read the schema aloud. The field description must be absent.
         assert!(sys.contains("# Your objective"));
-        assert!(sys.contains("disposition"));
-        assert!(sys.contains("call outcome"));
+        assert!(!sys.contains("call outcome"));
+        assert!(sys.contains("NEVER read the field names"));
         // protocol layer
         assert!(sys.contains("FEMALE voice"));
         assert!(sys.contains("end_call"));
