@@ -26,7 +26,12 @@ pub enum Verdict {
 #[derive(Clone, Copy, Debug)]
 pub struct NetworkHealth {
     pub rtt_p50_ms: u32,
+    /// p95 used by the gate — computed after dropping the single slowest ping.
     pub rtt_p95_ms: u32,
+    /// p95 over ALL pings (nothing dropped). Observability only, never gated on:
+    /// when this is much larger than `rtt_p95_ms`, the drop-one-max trim hid a
+    /// real spike — so we can tell "genuinely clean net" from "trim masked it".
+    pub rtt_p95_raw_ms: u32,
     pub jitter_ms: u32,
     pub loss_pct: f32,
     pub connect_ms: u32,
@@ -36,9 +41,9 @@ pub struct NetworkHealth {
 impl NetworkHealth {
     pub fn summary(&self) -> String {
         format!(
-            "rtt_p50={}ms rtt_p95={}ms jitter={}ms loss={}% connect={}ms setup={}ms",
-            self.rtt_p50_ms, self.rtt_p95_ms, self.jitter_ms, self.loss_pct,
-            self.connect_ms, self.setup_ms
+            "rtt_p50={}ms rtt_p95={}ms rtt_p95_raw={}ms jitter={}ms loss={}% connect={}ms setup={}ms",
+            self.rtt_p50_ms, self.rtt_p95_ms, self.rtt_p95_raw_ms, self.jitter_ms,
+            self.loss_pct, self.connect_ms, self.setup_ms
         )
     }
 }
@@ -239,6 +244,7 @@ fn summarize(rtts: &mut [u32], lost: u32, total: u32) -> NetworkHealth {
         return NetworkHealth {
             rtt_p50_ms: u32::MAX,
             rtt_p95_ms: u32::MAX,
+            rtt_p95_raw_ms: u32::MAX,
             jitter_ms: u32::MAX,
             loss_pct,
             connect_ms: 0,
@@ -246,6 +252,9 @@ fn summarize(rtts: &mut [u32], lost: u32, total: u32) -> NetworkHealth {
         };
     }
     rtts.sort_unstable();
+    // p95 over the FULL set (nothing dropped) — observability only, so a masked
+    // spike is visible in the log next to the trimmed, gated rtt_p95.
+    let rtt_p95_raw = rtts[((rtts.len() as f32 - 1.0) * 0.95).round() as usize];
     // Drop the single slowest sample before taking percentiles: one late ping in
     // ~10 (a lone spike) is absorbed by the downlink jitter buffer and must not
     // fail preflight — and with ~10 samples that one spike otherwise dominates
@@ -262,6 +271,7 @@ fn summarize(rtts: &mut [u32], lost: u32, total: u32) -> NetworkHealth {
     NetworkHealth {
         rtt_p50_ms: p(0.50),
         rtt_p95_ms: p(0.95),
+        rtt_p95_raw_ms: rtt_p95_raw,
         jitter_ms: jitter,
         loss_pct,
         connect_ms: 0,
@@ -280,6 +290,7 @@ mod tests {
         let good = NetworkHealth {
             rtt_p50_ms: 40,
             rtt_p95_ms: 120,
+            rtt_p95_raw_ms: 120,
             jitter_ms: 15,
             loss_pct: 0.0,
             connect_ms: 0,
@@ -312,6 +323,7 @@ mod tests {
         let base = NetworkHealth {
             rtt_p50_ms: 40,
             rtt_p95_ms: 120,
+            rtt_p95_raw_ms: 120,
             jitter_ms: 15,
             loss_pct: 0.0,
             connect_ms: 1500,
@@ -329,6 +341,7 @@ mod tests {
         let h = NetworkHealth {
             rtt_p50_ms: 40,
             rtt_p95_ms: 120,
+            rtt_p95_raw_ms: 120,
             jitter_ms: 15,
             loss_pct: 0.0,
             connect_ms: 9000,
@@ -386,6 +399,10 @@ mod tests {
         let h = summarize(&mut one, 0, 10);
         assert_eq!(h.rtt_p95_ms, 100, "lone 600ms spike trimmed from p95");
         assert_eq!(h.jitter_ms, 0, "bulk is flat, jitter ~0 despite the spike");
+        assert_eq!(
+            h.rtt_p95_raw_ms, 600,
+            "raw p95 still exposes the trimmed spike (observability)"
+        );
         // Two slow samples still show through (only one is trimmed).
         let mut two = vec![100, 100, 100, 100, 100, 100, 100, 100, 600, 600];
         let h2 = summarize(&mut two, 0, 10);
@@ -438,6 +455,7 @@ mod tests {
         let h = NetworkHealth {
             rtt_p50_ms: 40,
             rtt_p95_ms: 120,
+            rtt_p95_raw_ms: 120,
             jitter_ms: 15,
             loss_pct: 1.5,
             connect_ms: 200,
