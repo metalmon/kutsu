@@ -180,6 +180,12 @@ pub async fn run(ports: BridgePorts, harvest_grace_ms: Option<u64>) -> BridgeEnd
     // `call_id` is moved into the uplink `async move` below; keep a copy for
     // the downlink dump filenames on this task.
     let call_id_dl = call_id.clone();
+    // Keep the Gemini uplink channel alive for the whole bridge lifetime. The
+    // uplink task below owns a clone and drops it the moment the phone hangs up;
+    // if that were the last sender, the Gemini session would close, killing the
+    // post-hangup harvest window before the model can answer the end-call cue.
+    // This retained clone holds the session open until the bridge returns.
+    let _gemini_in_keepalive = gemini_in.clone();
     let uplink = tokio::spawn(async move {
         let mut dump8 = uplink_dump.as_ref().and_then(|dir| {
             let path = dir.join(format!("{call_id}-uplink-8k.wav"));
@@ -307,7 +313,10 @@ pub async fn run(ports: BridgePorts, harvest_grace_ms: Option<u64>) -> BridgeEnd
                 // the loop so the completed future is never polled again.
                 uplink_running = false;
                 match harvest_grace_ms {
-                    None => break BridgeEnd::PhoneClosed,
+                    None => {
+                        tracing::info!(call_id = %call_id_dl, "bridge: uplink ended (phone hangup), no grace -> PhoneClosed");
+                        break BridgeEnd::PhoneClosed;
+                    }
                     Some(ms) => {
                         // Wrap-up: the phone is gone, but the model may still
                         // send a post-hangup `EndCall` (or a closing
@@ -316,16 +325,21 @@ pub async fn run(ports: BridgePorts, harvest_grace_ms: Option<u64>) -> BridgeEnd
                         // late `EndCall` can still reach the engine; the
                         // downlink stays muted (see `harvesting` below) and
                         // the pacer arm is disabled, so nothing plays to the
-                        // now-absent phone.
-                        harvesting = true;
-                        grace_sleep = Some(Box::pin(tokio::time::sleep(
-                            std::time::Duration::from_millis(ms),
-                        )));
+                        // now-absent phone. Skip if the downlink-send-fail path
+                        // already armed the grace for this same hangup.
+                        if !harvesting {
+                            tracing::info!(call_id = %call_id_dl, grace_ms = ms, "bridge: uplink ended (phone hangup), forward-only grace armed");
+                            harvesting = true;
+                            grace_sleep = Some(Box::pin(tokio::time::sleep(
+                                std::time::Duration::from_millis(ms),
+                            )));
+                        }
                     }
                 }
             }
             _ = async { grace_sleep.as_mut().unwrap().await }, if grace_sleep.is_some() => {
                 // Wrap-up grace window elapsed: end the bridge now.
+                tracing::info!(call_id = %call_id_dl, "bridge: forward-only grace elapsed -> PhoneClosed");
                 break BridgeEnd::PhoneClosed;
             }
             ev = gemini_events.recv() => match ev {
@@ -376,7 +390,10 @@ pub async fn run(ports: BridgePorts, harvest_grace_ms: Option<u64>) -> BridgeEnd
                         // Engine dropped its event receiver; keep bridging audio.
                     }
                 }
-                None => break BridgeEnd::GeminiClosed,
+                None => {
+                    tracing::info!(call_id = %call_id_dl, harvesting, "bridge: gemini events closed -> GeminiClosed");
+                    break BridgeEnd::GeminiClosed;
+                }
             },
             _ = ticker.tick(), if !harvesting => {
                 let tnow = tokio::time::Instant::now();
@@ -415,7 +432,25 @@ pub async fn run(ports: BridgePorts, harvest_grace_ms: Option<u64>) -> BridgeEnd
                 });
                 quality.set_downlink_active(downlink.pending() || recent_audio);
                 if phone_out.send(Bytes::from(payload)).await.is_err() {
-                    break BridgeEnd::PhoneClosed;
+                    match harvest_grace_ms {
+                        None => {
+                            tracing::info!(call_id = %call_id_dl, "bridge: phone_out send failed (phone gone), no grace -> PhoneClosed");
+                            break BridgeEnd::PhoneClosed;
+                        }
+                        Some(ms) => {
+                            // Phone gone mid-turn (callee hung up while the model was
+                            // speaking): enter the same forward-only harvest grace as
+                            // the uplink-end path so a late EndCall can still land,
+                            // instead of tearing down before the model can respond.
+                            if !harvesting {
+                                tracing::info!(call_id = %call_id_dl, grace_ms = ms, "bridge: phone_out send failed (phone gone), forward-only grace armed");
+                                harvesting = true;
+                                grace_sleep = Some(Box::pin(tokio::time::sleep(
+                                    std::time::Duration::from_millis(ms),
+                                )));
+                            }
+                        }
+                    }
                 }
             }
         }

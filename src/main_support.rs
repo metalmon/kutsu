@@ -217,6 +217,7 @@ fn apply_env_overlay(server: &mut ServerConfig, sip: &mut SipConfig) -> anyhow::
     );
     over_str("KUTSU_GREET_CUE", &mut server.prompts.greet_cue);
     over_str("KUTSU_END_CALL_CUE", &mut server.prompts.end_call_cue);
+    over_str("KUTSU_HARVEST_CUE", &mut server.prompts.harvest_cue);
     over_str("KUTSU_RESUME_CUE", &mut server.prompts.resume_cue);
 
     // SIP (password is a secret; the rest may come from TOML or env).

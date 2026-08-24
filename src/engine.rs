@@ -1107,6 +1107,12 @@ async fn run_call(
     // 7. Orchestration loop.
     let mut goal = None;
     let mut first_transcript = false;
+    // Live count of transcript events (final AND non-final) seen this call. The
+    // store's transcript holds only FINAL entries and is authoritatively filled
+    // only at teardown (`set_transcript`), so it lags/reads empty mid-call —
+    // unusable for the Stage-B harvest eligibility check at hangup time. This
+    // counter reflects "a conversation actually happened" the moment it does.
+    let mut transcript_events = 0usize;
     let mut events_open = true;
     let mut abort_reason: Option<String> = None;
     let deadline = tokio::time::sleep(Duration::from_secs(server.max_call_secs));
@@ -1157,6 +1163,7 @@ async fn run_call(
                 // is the first Transcript (a proxy for greeting time — true audio-onset
                 // timing would need a bridge-level stamp, deferred).
                 Some(Event::Transcript { role, text, final_ }) => {
+                    transcript_events += 1;
                     if wrap_up.on_activity(now_ms()) {
                         mute_downlink_ctrl.store(false, Ordering::Relaxed);
                     }
@@ -1168,7 +1175,11 @@ async fn run_call(
                         store.append_transcript(&call_id, TranscriptEntry { role, text, ts_ms: now_ms() });
                     }
                 }
-                Some(Event::EndCall { goal: g }) => { goal = Some(g); break LoopEnd::Completed; }
+                Some(Event::EndCall { goal: g }) => {
+                    tracing::info!(%call_id, harvesting, "end_call received (goal submitted)");
+                    goal = Some(g);
+                    break LoopEnd::Completed;
+                }
                 Some(Event::TurnComplete) => {
                     if wrap_up.on_activity(now_ms()) {
                         mute_downlink_ctrl.store(false, Ordering::Relaxed);
@@ -1184,19 +1195,19 @@ async fn run_call(
                 sip_open = false; // fuse: a closed mpsc yields None forever
                 match r {
                     Some(SipEvent::Terminated(_)) | None => {
+                        tracing::info!(%call_id, transcript_events, goal_set = goal.is_some(), harvesting, "stage-b: sip terminated (phone hangup) observed");
                         if !harvesting {
                             let eligible = server.wrap_up_grace_ms > 0
-                                && harvest_eligible(
-                                    store.get(&call_id).map(|r| r.transcript.len()).unwrap_or(0),
-                                    goal.is_some(),
-                                );
+                                && harvest_eligible(transcript_events, goal.is_some());
                             if eligible {
                                 harvesting = true;
-                                gemini_handle.send_client_text(&server.prompts.end_call_cue).await;
+                                tracing::info!(%call_id, grace_ms = server.wrap_up_grace_ms, "stage-b: harvest armed via sip, injecting harvest cue");
+                                gemini_handle.send_client_text(&server.prompts.harvest_cue).await;
                                 harvest_deadline = Some(Box::pin(tokio::time::sleep(
                                     Duration::from_millis(server.wrap_up_grace_ms),
                                 )));
                             } else {
+                                tracing::info!(%call_id, "stage-b: hangup not harvest-eligible, ending HungUp");
                                 break LoopEnd::HungUp;
                             }
                         }
@@ -1207,6 +1218,7 @@ async fn run_call(
                 }
             },
             r = &mut bridge_done_rx => {
+                tracing::info!(%call_id, harvesting, bridge_end = ?r.as_ref().ok(), "stage-b: bridge_done observed");
                 match r {
                     Ok(crate::bridge::BridgeEnd::PhoneClosed) => {
                         // Harvest is entered ONLY from the sip_events arm
@@ -1238,6 +1250,7 @@ async fn run_call(
                 // Grace window elapsed with no late EndCall: give up and
                 // finalize. The transcript already exists (that's what made
                 // this eligible), so this resolves Completed at teardown.
+                tracing::info!(%call_id, goal_set = goal.is_some(), "stage-b: harvest grace elapsed (no late end_call), ending Completed");
                 break LoopEnd::Completed;
             },
             _ = qtick.tick() => {

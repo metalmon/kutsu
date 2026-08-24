@@ -135,6 +135,11 @@ noise_floor_rms = 200.0 # below this a frame is silence/noise; gain is held
 # nudging it to wrap up via end_call (KUTSU_END_CALL_CUE).
 # end_call_cue = "The line has gone quiet. If the conversation is finished, wrap up now and submit the result by calling the end_call tool."
 
+# Cue injected when the callee HANGS UP mid-call (Stage-B harvest). Unlike
+# end_call_cue (dead air, still connected), this is unconditional: the call is
+# over, so the model must submit whatever it has via end_call (KUTSU_HARVEST_CUE).
+# harvest_cue = "The other party has hung up; the call is over and they can no longer hear you. Do not try to say anything else. Submit your result now by calling the end_call tool with whatever information you gathered so far. If the objective was not completed, still call end_call and note in the summary that the callee hung up before it finished."
+
 # Instruction sent when a session reconnects with lost context (KUTSU_RESUME_CUE).
 # resume_cue = "The connection dropped briefly ..."
 

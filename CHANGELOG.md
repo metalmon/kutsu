@@ -58,6 +58,15 @@ semantic versioning (pre-1.0: minor = notable/breaking, patch = fixes).
 - `announcement` disposition for a carrier fast-disconnect that hangs up first
   (caller-hangup), and a stale abort-reason error on calls that raced to
   `completed`.
+- **Stage-B wrap-up now actually harvests on a real callee hangup.** Three
+  coupled defects are fixed: harvest eligibility is judged from live transcript
+  activity (the stored transcript is only filled at teardown, so it read empty at
+  hangup and harvest never armed); the bridge honors the grace window when the
+  hangup is detected on the downlink-send path (callee hangs up mid-utterance),
+  not only on the uplink path; and the Gemini uplink channel is kept alive during
+  the grace so the session survives the hangup and a post-hangup `end_call` can
+  land. A dedicated `harvest_cue` (`KUTSU_HARVEST_CUE`) makes the model submit the
+  result unconditionally after a hangup, distinct from the dead-air `end_call_cue`.
 
 ## [0.1.0]
 

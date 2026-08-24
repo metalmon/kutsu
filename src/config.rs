@@ -592,6 +592,17 @@ pub const GREET_CUE: &str = "The call has connected and the other party has not 
 pub const END_CALL_CUE: &str = "The line has gone quiet. If the conversation is \
     finished, wrap up now and submit the result by calling the end_call tool.";
 
+/// Cue injected when the callee has hung up (Stage-B harvest). Unlike
+/// [`END_CALL_CUE`] (dead air, still connected), this is unconditional: the call
+/// is already over, so the model must submit whatever it has via `end_call`
+/// rather than deciding whether the conversation is "finished". English by repo
+/// convention; override in `[server.prompts]` or via `KUTSU_HARVEST_CUE`.
+pub const HARVEST_CUE: &str = "The other party has hung up; the call is over and \
+    they can no longer hear you. Do not try to say anything else. Submit your \
+    result now by calling the end_call tool with whatever information you \
+    gathered so far. If the objective was not completed, still call end_call and \
+    note in the summary that the callee hung up before it finished.";
+
 /// Voice-gender directive for a female voice. English by repo convention and
 /// deliberately language-neutral: operators add language-specific examples (e.g.
 /// gendered verb endings) in their own `[server.prompts]` override.
@@ -655,6 +666,9 @@ pub struct PromptsConfig {
     /// Cue handed to the model when the line has gone quiet for
     /// `dead_air_nudge_ms`, nudging it to wrap up via `end_call`.
     pub end_call_cue: String,
+    /// Cue injected when the callee hangs up mid-call (Stage-B harvest): an
+    /// unconditional instruction to submit the result via `end_call`.
+    pub harvest_cue: String,
     /// Instruction sent to the model when a session reconnects with lost context.
     pub resume_cue: String,
     /// Voice directive for a female voice.
@@ -675,6 +689,7 @@ impl Default for PromptsConfig {
             closing: CLOSING_INSTRUCTION.into(),
             greet_cue: GREET_CUE.into(),
             end_call_cue: END_CALL_CUE.into(),
+            harvest_cue: HARVEST_CUE.into(),
             resume_cue: RESUME_CUE.into(),
             gender_female: GENDER_FEMALE.into(),
             gender_male: GENDER_MALE.into(),
@@ -851,6 +866,7 @@ mod tests {
         assert_eq!(s.dead_air_nudge_ms, 25_000);
         assert_eq!(s.wrap_up_grace_ms, 15_000);
         assert!(!PromptsConfig::default().end_call_cue.is_empty());
+        assert!(!PromptsConfig::default().harvest_cue.is_empty());
     }
 
     #[test]
