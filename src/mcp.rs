@@ -186,7 +186,14 @@ fn task_result_for(rec: Option<crate::state::CallRecord>) -> Result<CallToolResu
                         .unwrap_or_else(|| "failed".to_string());
                     format!("call ended: {name}")
                 });
-            Err(TaskExit::Error(ErrorData::internal_error(msg, None)))
+            // Carry the call's identity in the error `data` so a caller seeing
+            // only the failed task (e.g. a fresh session polling an old task)
+            // can tell which call it was — mirrors the client_ref on the
+            // success branches above.
+            let data = rec.as_ref().map(|r| {
+                serde_json::json!({ "call_id": r.call_id, "client_ref": r.client_ref })
+            });
+            Err(TaskExit::Error(ErrorData::internal_error(msg, data)))
         }
         // watch_call_to_terminal only returns once Ended, which always carries a
         // disposition.
@@ -714,7 +721,7 @@ mod tests {
                 quality: Default::default(),
                 disposition,
                 attempt: 1,
-                client_ref: None,
+                client_ref: Some("ref-42".into()),
             }
         }
 
@@ -761,7 +768,15 @@ mod tests {
                         e.message.contains(name),
                         "disposition {name}: {}",
                         e.message
-                    )
+                    );
+                    // The failed task must self-identify the call.
+                    let data = e.data.as_ref().expect("error carries identity data");
+                    assert_eq!(data["call_id"].as_str(), Some("c1"), "call_id in {name}");
+                    assert_eq!(
+                        data["client_ref"].as_str(),
+                        Some("ref-42"),
+                        "client_ref in {name}"
+                    );
                 }
                 other => panic!("expected Err(Error) for {name}, got {other:?}"),
             }
